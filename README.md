@@ -15,6 +15,39 @@ node patch.js revert       put the original app.asar and claude.exe back
 node selfcheck.js          compile + wiring + leak check, touches nothing
 ```
 
+## See it
+
+![the whole window: task rail, usage meters, the dashboard, and the transcript restyled](docs/media/tour.gif)
+
+[Full-resolution MP4](docs/media/tour.mp4). Rendered from [`demo/`](demo) — a
+Remotion mock of the app that pulls the plugins' real stylesheets straight out
+of `src/plugins`, so what you are looking at is the shipped CSS, not a redrawn
+approximation. What is scripted and what is real is spelled out in
+[demo/README.md](demo/README.md).
+
+**task-rail** — rows fade in as the agent creates tasks, and a status flip
+re-fades the row and re-tweens the box. Bottom edge stays flush with the
+composer.
+
+![the task rail through two status flips](docs/media/crop-task-rail.gif)
+
+**usage-bar** — context from the CLI's own reply, the plan percentage off disk,
+the compaction mark drawn where the CLI says it fires.
+
+![context and rate-limit meters in the composer footer](docs/media/crop-usage-bar.gif)
+
+**dashboard** — Insert. The composer footer stays in shot: the setting lands in
+the running app as the switch is flipped, and the frames beside the panel are a
+1:1 before/after of the same control.
+
+![the settings overlay, with before and after preview frames](docs/media/crop-dashboard.gif)
+
+**thinking-style / transcript-type** — the app's own muted italic first, then the
+same block restyled, both driven through claude.ai's own font tokens rather than
+by forcing a font on the subtree.
+
+![thinking blocks and transcript typography being restyled](docs/media/crop-transcript.gif)
+
 ## What ships
 
 | plugin | what it does |

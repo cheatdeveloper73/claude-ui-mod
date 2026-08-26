@@ -18,3 +18,6 @@ node_modules/
 
 # scratch probe plugins (temporary, per-debug-session)
 src/plugins/zprobe/
+
+# demo renders (the committed output lives in docs/media)
+demo/out/
