@@ -1,0 +1,23 @@
+{
+  "name": "claude-ui-mod",
+  "version": "1.0.0",
+  "description": "Hot-reloadable plugin runtime injected into the Claude Desktop app on Windows: task rail, usage meters, transcript typography and a settings dashboard.",
+  "license": "MIT",
+  "private": false,
+  "engines": { "node": ">=18" },
+  "os": ["win32"],
+  "main": "patch.js",
+  "bin": { "claude-ui-mod": "patch.js" },
+  "files": ["lib/", "src/", "patch.js", "watch.js", "selfcheck.js", "install.ps1", "docs/"],
+  "scripts": {
+    "check": "node selfcheck.js",
+    "status": "node patch.js status",
+    "apply": "node patch.js apply",
+    "revert": "node patch.js revert",
+    "watch": "node watch.js"
+  },
+  "keywords": ["claude", "claude-desktop", "claude-code", "electron", "asar", "plugin", "ui-mod", "windows"],
+  "repository": { "type": "git", "url": "git+https://github.com/cheatdeveloper73/claude-ui-mod.git" },
+  "bugs": { "url": "https://github.com/cheatdeveloper73/claude-ui-mod/issues" },
+  "homepage": "https://github.com/cheatdeveloper73/claude-ui-mod#readme"
+}

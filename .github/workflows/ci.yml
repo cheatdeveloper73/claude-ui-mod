@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selfcheck:
+    name: selfcheck (node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No dependencies by design, so there is nothing to install.
+      # selfcheck compiles the whole hot tree, constructs the host against a
+      # fake Electron and asserts no timer/watcher leaks. The asar payload stage
+      # is skipped automatically when no Claude Desktop install is present.
+      - run: node selfcheck.js
+
+  patcher:
+    name: patcher smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: modules load and CLI reports usage
+        run: |
+          node -e "require('./lib/asar'); require('./patch'); console.log('modules ok')"
+          node patch.js status

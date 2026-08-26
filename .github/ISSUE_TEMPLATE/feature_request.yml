@@ -1,0 +1,39 @@
+name: Plugin or feature idea
+description: Propose a new plugin, or a change to the runtime.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What should it do
+      description: Describe it from the user's side first — what appears, where, and when.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: What shape is it
+      options:
+        - a new plugin (src/plugins/<name>/)
+        - a change to an existing plugin
+        - a change to the hot runtime (host.js / bridge.js)
+        - a change to the patcher or update watcher
+        - a change to one of the two baked loaders
+    validations:
+      required: true
+
+  - type: textarea
+    id: data
+    attributes:
+      label: Where does the data come from
+      description: |
+        On-disk file, the app's own eipc surface, the DOM, or something else? If
+        it needs app state that is not already reachable, say what you found —
+        `docs/internals.md` records where the known sources are, and which paths
+        are already known to be dead ends.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else

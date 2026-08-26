@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in the mod misbehaves, or the app does after patching.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [docs/troubleshooting.md](../blob/main/docs/troubleshooting.md) first — the
+        common failures (app dies at boot, "Claude is running" when it isn't, an
+        edit that seems not to apply) each have a known cause listed there.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Claude Desktop version
+      description: Help → About in the app, or the `app-<version>` directory name.
+      placeholder: "1.26832.0"
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      placeholder: "node -v"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `node patch.js status`
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: selfcheck
+    attributes:
+      label: Output of `node selfcheck.js`
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Which plugin
+      options:
+        - not plugin-specific (patcher / watcher / runtime)
+        - dashboard
+        - task-rail
+        - usage-bar
+        - thinking-default
+        - thinking-style
+        - transcript-type
+        - a plugin of my own
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        If the app fails to start, say whether `node patch.js revert` fixes it.
+        If a plugin misbehaves, evidence from a probe plugin (`.probe/`) is worth
+        far more than a description — see docs/troubleshooting.md.
