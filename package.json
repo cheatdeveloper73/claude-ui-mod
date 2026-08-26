@@ -17,7 +17,7 @@
     "watch": "node watch.js"
   },
   "keywords": ["claude", "claude-desktop", "claude-code", "electron", "asar", "plugin", "ui-mod", "windows"],
-  "repository": { "type": "git", "url": "git+https://github.com/cheatdeveloper73/claude-ui-mod.git" },
-  "bugs": { "url": "https://github.com/cheatdeveloper73/claude-ui-mod/issues" },
-  "homepage": "https://github.com/cheatdeveloper73/claude-ui-mod#readme"
+  "repository": { "type": "git", "url": "git+https://gitlab.com/blockshooter/claude-ui-mod.git" },
+  "bugs": { "url": "https://gitlab.com/blockshooter/claude-ui-mod/-/issues" },
+  "homepage": "https://gitlab.com/blockshooter/claude-ui-mod#readme"
 }

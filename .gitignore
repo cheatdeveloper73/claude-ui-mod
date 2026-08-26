@@ -21,3 +21,4 @@ src/plugins/zprobe/
 
 # demo renders (the committed output lives in docs/media)
 demo/out/
+demo/node_modules/

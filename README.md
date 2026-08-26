@@ -79,7 +79,7 @@ Claude Desktop must be fully quit — Windows keeps `app.asar` memory-mapped
 while it runs, and the running version cannot be replaced.
 
 ```bash
-git clone https://github.com/cheatdeveloper73/claude-ui-mod
+git clone https://gitlab.com/blockshooter/claude-ui-mod
 cd claude-ui-mod
 node patch.js apply
 ```

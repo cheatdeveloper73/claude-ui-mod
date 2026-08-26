@@ -6,7 +6,7 @@ restart: drop a directory into `src/plugins/` and the running app picks it up.
 ## Setup
 
 ```bash
-git clone https://github.com/cheatdeveloper73/claude-ui-mod
+git clone https://gitlab.com/blockshooter/claude-ui-mod
 cd claude-ui-mod
 node patch.js apply      # Claude Desktop must be fully quit
 node selfcheck.js        # should print SELFCHECK PASS
