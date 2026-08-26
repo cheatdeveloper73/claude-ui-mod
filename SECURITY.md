@@ -63,9 +63,13 @@ All of it stays on disk, on your machine.
 
 ## Reporting a vulnerability
 
-Open a GitHub issue for anything that is not itself exploitable, and use
-GitHub's private vulnerability reporting (Security → Report a vulnerability) for
-anything that is.
+Open an issue for anything that is not itself exploitable.
+
+For anything that is, tick **Confidential** on the new-issue form before you
+submit it — the checkbox sits just under the description box. A confidential
+issue is readable only by you and the project members, so a working exploit
+against a tool that patches a signed binary does not go public before there is
+a fix for it.
 
 Report to Anthropic instead, not here, if you find a flaw in Claude Desktop
 itself. This project is unofficial and unaffiliated; nothing in it should be

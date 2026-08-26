@@ -44,8 +44,8 @@ Two more that matter for review:
 
 - **Keep `src/main-hook.js` and `src/preload-hook.js` dumb.** They are baked
   into the asar and cost every user a re-patch and a restart to change. Feature
-  logic goes in `src/runtime/host.js` or in a plugin. A PR that adds a feature
-  to a baked file will be asked to move it.
+  logic goes in `src/runtime/host.js` or in a plugin. A merge request that adds
+  a feature to a baked file will be asked to move it.
 - **Do not hardcode the eipc build uuid.** It changes per build. `patch.js`
   lifts it out of the shipped preload; compose channels with
   `cuimod.eipc(ns, iface, method)`.
@@ -62,9 +62,36 @@ the non-obvious facts in this codebase cost real debugging to establish; if you
 establish another one, write it into `docs/internals.md` with the app version
 you verified it against.
 
-## Pull requests
+## Where this lives, and what your commits carry
 
-- One change per PR.
+The canonical home is <https://gitlab.com/blockshooter/claude-ui-mod>. Clone from
+there; a copy on any other host is a mirror and may be behind.
+
+New commits here are authored as
+`blockshooter <41701748-blockshooter@users.noreply.gitlab.com>`. Commits predating
+the move to GitLab carry the old `cheatdeveloper73` GitHub no-reply address.
+
+Do not put a personal mailbox in a commit you send here. The author line is
+permanent, it is served to everyone who clones, and correcting it after the fact
+means rewriting every commit from that point on and force-pushing over a
+protected branch. GitLab issues every account a no-reply address for exactly
+this, shaped `<id>-<username>@users.noreply.gitlab.com`, listed under
+Settings -> Profile -> Commit email.
+
+Set it on the clone rather than with `--global`:
+
+```bash
+git config user.name  your-handle
+git config user.email <id>-your-handle@users.noreply.gitlab.com
+```
+
+Local, because a global identity follows you into every other repository you
+touch, and because git's fallback when you never set one is `user@MACHINE-NAME`
+— which publishes your computer's hostname to anyone who reads the log.
+
+## Merge requests
+
+- One change per merge request.
 - Say which app version you tested against (`node patch.js status`, or Help →
   About in the app).
 - Paste the `selfcheck.js` output.
