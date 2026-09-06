@@ -17,6 +17,31 @@
 | `::-webkit-scrollbar` rules do nothing | claude.ai sets `scrollbar-color`, which inherits into shadow trees and switches Chromium to standard scrollbar rendering. | Put `scrollbar-color: auto` on the scroller first, then style the pseudo-elements. |
 | UI never appears when the window is minimised | A hidden window never fires `requestAnimationFrame`, so anything parked at `opacity: 0` waiting for a frame stays there. | Drive layout from an interval directly, flush with a forced reflow, and re-place on `visibilitychange`. |
 | Overlay drops the app to ~18 fps | `backdrop-filter` re-blurs the whole backdrop every frame, and the transcript behind is always moving. | Use a flat `rgba(0,0,0,.62)`. Masks and large box-shadows measured as free. |
+| A model in the picker answers as Claude under its own label | Nothing claimed it, so it fell through to the Anthropic passthrough. | `GET /healthz`: the model must appear under `compatible.providers` or under `adapters.loaded`. A catalogue entry with no `backend` block is picker-only and routes nowhere. |
+| A provider adapter is silently absent | It failed to load and the router carried on without it, by design. | `GET /healthz` → `adapters.errors` names it and why. The startup log line lists the loaded set. |
+| A subagent dies with "model may not exist" while the same model works at top level | The Agent tool validates against `/v1/models` before spawning, and the id is not in that list. | An adapter's `models[]` supplies the id and its `:effort` spellings; `modelIds()` supplies live ones. A backend that is down contributes nothing, so the subagent fails while a direct request still works. |
+| A provider's traffic shows as unpriced in the usage dashboard | No rate is registered for `provider/model`. Unpriced is deliberate — it reads as a gap in the bill rather than as free traffic. | Call `registerRates()` from `router/pricing.mjs` at adapter module scope. |
+
+## Fresh chats wait exactly 30 seconds at "Starting Claude Code"
+
+Check `[CCD start-timing]` in `%APPDATA%/Claude/logs/main.log`. If `init`
+accounts for the delay while `preflight`, `mcp`, and `query` are short, inspect
+the CLI startup log (`--debug-file <local-file>`), not just the router log.
+The first model request can be waiting behind an MCP initialization timeout.
+
+On Desktop 1.26832.0 / CLI 2.1.222, the home-directory `.mcp.json` loaded
+`godot-mcp` into unrelated projects. Its server awaited an editor WebSocket
+connection on port 9080 before starting MCP stdio. With no editor running,
+the CLI waited 30,000 ms for the MCP handshake, then sent the first request.
+The fix in the local `godot-mcp` repository starts MCP immediately and uses
+the existing `sendCommand()` connection-on-demand path. Tools remain available;
+no global timeout, routing, credential, or permission change is needed.
+
+Two fresh-chat recovery runs reduced CLI initialization from 32.5 seconds to
+4.9 and 3.7 seconds. Model generation time is separate from this startup delay.
+The regression test in that repository launches the real stdio
+server and verifies initialization, tool discovery, and resource discovery
+without contacting an editor.
 
 ## Reading state when there is no console
 

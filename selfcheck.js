@@ -57,6 +57,18 @@ try {
     const info = host.dispatch('host.info', {});
     Promise.resolve(info).then((i) => {
         ok('host.info -> ' + i.methods.length + ' methods, plugins=[' + i.plugins.join(',') + ']');
+
+        // A plugin whose main.js THROWS at load is caught by the host by design,
+        // so every other plugin still loads. That is right at runtime and wrong
+        // here: it means a plugin can be completely dead while selfcheck reports
+        // PASS, which is exactly how provider-picker shipped with a deleted
+        // constant. Compiling the file is not enough -- the throw happens when the
+        // module is called, not when it is parsed.
+        const withMain = fs.readdirSync(pluginsDir)
+            .filter((n) => fs.existsSync(path.join(pluginsDir, n, 'main.js')));
+        if (i.pluginsFailed && i.pluginsFailed.length) fail('plugin(s) failed to load: ' + i.pluginsFailed.join(', '));
+        else ok('every plugin with a main.js loaded (' + withMain.length + ')');
+
         return host.dispatch('host.rendererBundle', {});
     }).then((b) => {
         if (!b.bridge || !b.bridge.length) fail('rendererBundle: empty bridge');

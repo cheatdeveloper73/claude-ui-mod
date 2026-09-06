@@ -1,0 +1,154 @@
+[
+    {
+        "id": "gpt-6-astra",
+        "name": "GPT-6-Astra",
+        "contextNote": "Window carried over from the 5.6 series, which shares this slug's cache profile. The Codex catalog advertises 272k with an 872k maximum; those are client-side compaction budgets, and this bridge does not run inside that client. A large-context validation is pending.",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "medium",
+        "priority": 1,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6-Sol",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "low",
+        "priority": 2,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.6-terra",
+        "name": "GPT-5.6-Terra",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "medium",
+        "priority": 3,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.6-luna",
+        "name": "GPT-5.6-Luna",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "medium",
+        "priority": 4,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.5",
+        "name": "GPT-5.5",
+        "contextNote": "1M is the configured client window, not a verified subscription limit. The current Codex catalog advertises a 272k maximum for GPT-5.5. A large-context validation is pending.",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+        ],
+        "defaultEffort": "medium",
+        "priority": 7,
+        "context": 1000000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.4",
+        "name": "GPT-5.4",
+        "contextNote": "Experimental 1M context is documented for GPT-5.4 in Codex and advertised by the current subscription model catalog.",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+        ],
+        "defaultEffort": "medium",
+        "priority": 16,
+        "context": 1000000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "claude-opus-4-6-thinking",
+        "name": "Claude Opus 4.6",
+        "efforts": [
+            "low",
+            "medium",
+            "high"
+        ],
+        "defaultEffort": "medium",
+        "context": 250000,
+        "maxOutput": 64000,
+        "provider": "claude"
+    },
+    {
+        "id": "muse-spark-1.3",
+        "name": "Muse Spark 1.3",
+        "efforts": [],
+        "provider": "meta",
+        "backend": {
+            "protocol": "anthropic-messages",
+            "baseUrl": "https://api.meta.ai/v1",
+            "apiKeyHeader": "authorization",
+            "secret": "meta"
+        },
+        "context": 1048576
+    },
+    {
+        "id": "muse-spark-1.3-contributor",
+        "name": "Muse Spark 1.3 Contributor",
+        "contextNote": "Contributor tier: Meta may train on prompts and completions. 100 RPM / 3M TPM.",
+        "efforts": [],
+        "provider": "meta",
+        "backend": {
+            "protocol": "anthropic-messages",
+            "baseUrl": "https://api.meta.ai/v1",
+            "apiKeyHeader": "authorization",
+            "secret": "meta"
+        },
+        "context": 1048576
+    },
+    {
+        "id": "glm-5.3-flash",
+        "name": "GLM 5.3 Flash",
+        "upstreamId": "z-ai/glm-5.3-flash",
+        "efforts": [],
+        "provider": "nanogpt",
+        "backend": {
+            "protocol": "anthropic-messages",
+            "baseUrl": "https://nano-gpt.com/api/v1",
+            "apiKeyHeader": "authorization",
+            "secret": "nanogpt"
+        },
+        "context": 1048576,
+        "maxOutput": 131072
+    }
+]

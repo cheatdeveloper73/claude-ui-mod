@@ -141,9 +141,24 @@ const api = {
     // runtime dev surface
     rpc: boot.rpc,
     appInvoke: boot.appInvoke,
+    contextCountInfo(usage) {
+        const u = usage?.apiUsage;
+        const counts = u ? [u.input_tokens, u.cache_read_input_tokens || 0, u.cache_creation_input_tokens || 0] : [];
+        const reported = counts.length && counts.every(n => Number.isFinite(n) && n >= 0)
+            ? counts.reduce((sum, n) => sum + n, 0) : 0;
+        const exact = reported > 0 && reported === usage?.totalTokens;
+        return { exact, description: exact
+            ? 'Provider-reported input for the latest model call, including cached input. Category breakdown is estimated.'
+            : 'Estimated context before provider usage is available.' };
+    },
     appOn: boot.appOn,
     eipc: boot.eipc,
     tap: boot.tap,
+    // The tap is a 300-entry ring, so a plugin that must not MISS a call cannot
+    // poll it — a burst of app IPC evicts the entry before the next tick. This
+    // is the same hook the session resolver uses, exposed so a plugin can react
+    // to one of the app's own outgoing calls at the moment it is made.
+    observeInvoke: boot.observeInvoke,
     errors,
     log: boot.log,
     reload: () => boot.reload('manual'),

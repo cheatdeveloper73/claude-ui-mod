@@ -52,7 +52,8 @@ module.exports = function (ctx) {
         if (!values || typeof values !== 'object') throw new Error('values required');
         const s = read();
         s[plugin] = { ...(s[plugin] || {}), ...values };
-        schedule();
+        if (p.immediate === true) { if (timer) clearTimeout(timer); flush(); }
+        else schedule();
         return true;
     });
 
@@ -61,11 +62,18 @@ module.exports = function (ctx) {
         const s = read();
         if (typeof plugin === 'string' && plugin) delete s[plugin];
         else for (const k of Object.keys(s)) delete s[k];
-        schedule();
+        if (p && p.immediate === true) { if (timer) clearTimeout(timer); flush(); }
+        else schedule();
         return true;
     });
 
     ctx.method('path', () => file);
+
+    // The store is authoritative in memory once read, so anything that replaces
+    // settings.json underneath it -- `git checkout .state/settings.json`, or an
+    // edit by hand -- is overwritten by the next save unless the store is
+    // dropped first. Call this, then host.rendererReload.
+    ctx.method('reload', () => { store = null; return true; });
 
     // Clipboard goes through main: navigator.clipboard.readText() needs a
     // permission the isolated world does not get prompted for, and silently

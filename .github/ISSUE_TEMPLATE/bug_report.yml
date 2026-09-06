@@ -56,12 +56,22 @@ body:
       label: Which plugin
       options:
         - not plugin-specific (patcher / watcher / runtime)
+        - the router or the Usage Atlas dashboard
+        - context-pill
         - dashboard
+        - goal
+        - hide-usage-band
+        - plan-usage-capture
+        - provider-picker
+        - provider-routing
+        - queue
+        - subagents
         - task-rail
-        - usage-bar
+        - throughput
         - thinking-default
         - thinking-style
         - transcript-type
+        - usage-bar
         - a plugin of my own
     validations:
       required: true

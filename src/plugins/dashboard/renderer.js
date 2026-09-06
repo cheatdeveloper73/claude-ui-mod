@@ -15,6 +15,14 @@
  * Keying the registry by plugin name means a hot reload replaces a spec rather
  * than stacking a second copy, whichever order the plugins happen to load in.
  *
+ * A control of type 'custom' hands rendering back to the plugin: node(values)
+ * returns a DOM element and the panel only places it. The plugin is expected to
+ * return the SAME element across renders and to patch it in place, because
+ * renderMain() runs again on every edit and a fresh node is a node whose CSS
+ * animations have never run — and, for a live readout, one whose contents have
+ * just been thrown away mid-poll. Pair it with wide: true, which gives the row
+ * the full column instead of a label/control split.
+ *
  * A spec may also carry a preview:
  *
  *   preview: { title, node(which), css(values, selector, which),
@@ -57,13 +65,36 @@ function applyAll() { for (const spec of REG.specs.values()) applySpec(spec); }
 
 function save(plugin) {
     clearTimeout(saveTimers.get(plugin));
-    saveTimers.set(plugin, setTimeout(() => {
-        cuimod.rpc('dashboard.save', { plugin, values: stored[plugin] || {} })
+    const immediate = REG.specs.get(plugin)?.immediateSave === true;
+    const persist = () => {
+        cuimod.rpc('dashboard.save', { plugin, values: stored[plugin] || {}, immediate })
             .then(() => flashSaved())
             .catch((e) => cuimod.log('dashboard: save failed: ' + (e && e.message)));
-    }, 200));
+    };
+    if (immediate) { saveTimers.delete(plugin); persist(); }
+    else saveTimers.set(plugin, setTimeout(persist, 200));
 }
 ctx.onDispose(() => { for (const t of saveTimers.values()) clearTimeout(t); });
+
+// A plugin whose own UI can change one of its settings (the queue rail's
+// auto-send pill) has to write through here, not straight to disk: the overlay
+// holds `stored` in memory, and a direct write would be invisible to it until a
+// reload — the next edit would then re-apply the stale value and the plugin's
+// own control would appear to snap back.
+REG.set = function (plugin, key, value) {
+    const spec = REG.specs.get(plugin);
+    if (!spec) return false;
+    setValue(spec, key, value);
+    if (open && current === plugin) renderMain();
+    return true;
+};
+// A sibling renderer needs the dashboard's authoritative in-memory copy before
+// extending a nested setting. Returning a shallow merged copy prevents it from
+// retaining or mutating dashboard state behind setValue().
+REG.get = function (plugin) {
+    const spec = REG.specs.get(plugin);
+    return spec ? merged(spec) : null;
+};
 
 function setValue(spec, key, value) {
     if (!stored[spec.plugin]) stored[spec.plugin] = {};
@@ -115,6 +146,7 @@ const CSS = `
      * almost the same and is free. */
     background: rgba(0,0,0,.62);
     font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    user-select: none; -webkit-user-select: none;
     opacity: 0; transition: opacity var(--d2) var(--e-out);
 }
 .wrap.show { opacity: 1; }
@@ -127,6 +159,7 @@ const CSS = `
     background: hsl(var(--bg-100, 0 0% 8%));
     color: hsl(var(--text-100, 60 14% 97%));
     border: 1px solid color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 13%, transparent);
+    user-select: none; -webkit-user-select: none;
     box-shadow: 0 24px 70px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
     transform: translateY(10px) scale(.985);
     opacity: .4;
@@ -148,8 +181,70 @@ const CSS = `
 .side-hd { padding: 17px 16px 12px; }
 .side-hd h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
 .side-hd p { margin: 3px 0 0; font-size: 11px; color: hsl(var(--text-400, 48 5% 57%)); }
-.side-list { flex: 1 1 auto; overflow-y: auto; padding: 4px 8px 8px; position: relative;
-             scrollbar-gutter: stable; }
+/* The list scrolls now that the plugin count passed what a 700px panel holds,
+ * and there is no room in a 200px column for a bar that reads as its own object.
+ * A rail inside the list sat 8px from .side's 1px divider and made two parallel
+ * vertical lines doing similar jobs: any alpha that made the rail useful put it
+ * in competition with the divider, and any alpha that stayed out of the way made
+ * it lint. It also cost 7px of gutter, which is label width in a column where
+ * titles were already truncating.
+ *
+ * So there is no scrollbar. The divider itself carries the position: .side-mark
+ * sits ON that line and brightens the stretch you are looking at. One line, no
+ * gutter, and the top/bottom dissolves keep saying there is more.
+ *
+ * Those dissolves are overlays on a wrapper rather than a mask on the scroller,
+ * which is how .scroll does it — a mask covers the scrollbar too. Kept as
+ * overlays because the marker must not be masked either. The gradient can be
+ * opaque: the column is a flat fill with nothing behind it to match.
+ *
+ * overscroll-behavior stops the wheel from chaining to the transcript behind the
+ * overlay once the list hits an end. Nothing else was holding it. */
+.side-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
+.side-list { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto;
+             padding: 4px 8px 8px; position: relative;
+             overscroll-behavior: contain; scrollbar-width: none; }
+.side-list::-webkit-scrollbar { width: 0; height: 0; display: none; }
+/* right: -1px puts the marker's own last pixel over .side's border, so what you
+ * see is a segment of the divider lit up rather than a second line beside it.
+ *
+ * Accent rather than white, because the sidebar already has exactly one colour —
+ * the row dots and the active indicator — and a neutral grey segment on a neutral
+ * grey line reads as chrome that wandered in. The ends are masked instead of
+ * capped: a rounded 2px bar has a start and a stop, which makes it an object
+ * lying on the divider, and 8px of fade at each end makes it the divider itself
+ * warming over a stretch. */
+.side-mark {
+    position: absolute; right: -1px; width: 2px;
+    pointer-events: none; z-index: 3; opacity: 0;
+    background: color-mix(in srgb, hsl(var(--cui-accent, 14 62% 60%)) 30%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 8px,
+        #000 calc(100% - 8px), transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 8px,
+        #000 calc(100% - 8px), transparent 100%);
+    transition: opacity var(--d2) var(--e-out), background var(--d1) var(--e-out);
+}
+/* Visible while the list is moving, and while the pointer is anywhere in the
+ * column — the 2px line is far too small to be its own hover target. */
+.side-mark.on, .side-wrap:hover .side-mark.can {
+    opacity: 1;
+}
+.side-wrap:hover .side-mark.can {
+    background: color-mix(in srgb, hsl(var(--cui-accent, 14 62% 60%)) 44%, transparent);
+}
+.side-wrap::before, .side-wrap::after {
+    content: ''; position: absolute; left: 0; right: 0; height: 26px;
+    pointer-events: none; z-index: 2;
+    transition: opacity var(--d1) var(--e-out);
+}
+/* opacity reads --o-t/--o-b directly. Routing both through a shared --o that
+ * each pseudo redefined looked tidier and did not work: Chromium resolved the
+ * inner variable but left opacity at its initial value, so the fades sat on the
+ * wrong ends. One level of substitution only. */
+.side-wrap::before { top: 0; opacity: var(--o-t, 0);
+    background: linear-gradient(to bottom, hsl(var(--bg-200, 0 0% 6.7%)) 22%, transparent); }
+.side-wrap::after { bottom: 0; opacity: var(--o-b, 0);
+    background: linear-gradient(to top, hsl(var(--bg-200, 0 0% 6.7%)) 22%, transparent); }
 /* One indicator that travels, instead of a background that blinks between rows. */
 .nav-ind {
     position: absolute; left: 8px; right: 8px; border-radius: 9px; pointer-events: none;
@@ -167,7 +262,11 @@ const CSS = `
     cursor: pointer; user-select: none; border: 1px solid transparent;
     position: relative; z-index: 1;
     animation: navIn var(--d2) var(--e-out) both;
-    animation-delay: calc(var(--i, 0) * 26ms);
+    /* Capped, not per-row: at 26ms each, nineteen plugins put the last entrance
+     * half a second after the first, and the rows past the fold were still
+     * playing theirs as you scrolled onto them. The cap keeps the stagger a
+     * gesture across the visible rows and lands the rest with it. */
+    animation-delay: calc(min(var(--i, 0) * 22ms, 240ms));
     transition: color var(--d1) var(--e-out), transform var(--d1) var(--e-out),
                 background var(--d1) var(--e-out);
 }
@@ -233,14 +332,14 @@ const CSS = `
  * clipping, so content dissolves instead of being cut mid-row — the same trick
  * the task rail uses on its list. --ft/--fb are written from JS to the depth that
  * is genuinely hidden, so an edge with nothing past it is not fogged. */
-.scroll, .frames, .side-list {
+.scroll, .frames {
     -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--ft, 0px),
         #000 calc(100% - var(--fb, 0px)), transparent 100%);
     mask-image: linear-gradient(to bottom, transparent 0, #000 var(--ft, 0px),
         #000 calc(100% - var(--fb, 0px)), transparent 100%);
 }
 .scroll { flex: 1 1 auto; overflow-y: auto; padding: 18px 20px 30px; scrollbar-color: auto;
-          scrollbar-gutter: stable; }
+          overscroll-behavior: contain; scrollbar-gutter: stable; }
 .scroll::-webkit-scrollbar { width: 11px; }
 .scroll::-webkit-scrollbar-track { background: transparent; }
 .scroll::-webkit-scrollbar-thumb {
@@ -251,6 +350,25 @@ const CSS = `
     background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 26%, transparent);
     background-clip: padding-box;
 }
+
+/* A custom control brings its own DOM, and anything scrollable inside one gets
+ * the OS bar unless the panel says otherwise — which is how the transcript
+ * sample ended up with a stock Windows scrollbar in the middle of a styled card.
+ * .scroll's treatment as a class, so a plugin node can opt in with one word.
+ * Chaining is deliberately left alone here: running off the end of an inner
+ * block and continuing down the settings page is the behaviour you want. */
+.cui-scroll { scrollbar-color: auto; }
+.cui-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.cui-scroll::-webkit-scrollbar-track { background: transparent; }
+.cui-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 16%, transparent);
+    border-radius: 7px; border: 3px solid transparent; background-clip: padding-box;
+}
+.cui-scroll::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 26%, transparent);
+    background-clip: padding-box;
+}
+.cui-scroll::-webkit-scrollbar-corner { background: transparent; }
 
 .sect {
     animation: rowIn var(--d2) var(--e-out) both;
@@ -279,6 +397,9 @@ const CSS = `
 .row .lab span { display: block; margin-top: 2px; font-size: 11px; line-height: 1.35;
                  color: hsl(var(--text-500, 48 5% 57%)); }
 .row .ctl { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+.row.wide { flex-direction: column; align-items: stretch; gap: 8px; }
+.row.wide .lab { flex: 0 0 auto; }
+.row.wide .ctl { flex: 1 1 auto; display: block; }
 
 /* ---- controls ---- */
 .sw { width: 40px; height: 24px; border-radius: 12px; cursor: pointer; position: relative;
@@ -348,7 +469,8 @@ input[type=color]:hover { transform: scale(1.08); }
 }
 @keyframes popIn { from { opacity: 0; transform: translateY(-4px) scale(.985); } to { opacity: 1; transform: none; } }
 .pop, .pop:focus, .pop:focus-visible, .opt:focus, .opt:focus-visible { outline: none; }
-.pop.list { padding: 5px; max-height: 270px; overflow-y: auto; scrollbar-color: auto; }
+.pop.list { padding: 5px; max-height: 270px; overflow-y: auto; overscroll-behavior: contain;
+           scrollbar-color: auto; }
 .pop.list::-webkit-scrollbar { width: 9px; }
 .pop.list::-webkit-scrollbar-thumb {
     background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 18%, transparent);
@@ -416,6 +538,7 @@ input[type=text], input[type=number] {
     background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 7%, transparent);
     color: hsl(var(--text-100, 60 14% 97%));
     border: 1px solid color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 12%, transparent);
+    user-select: text; -webkit-user-select: text;
 }
 input[type=color] {
     -webkit-appearance: none; appearance: none; width: 30px; height: 26px; padding: 0;
@@ -431,7 +554,7 @@ input[type=color]::-webkit-color-swatch { border: none; border-radius: 5px; }
  * 1:1 stage cannot live in a column that is narrower than the sample. */
 .frames {
     display: flex; flex-direction: column; gap: 14px;
-    max-height: 88vh; overflow-y: auto; overflow-x: hidden;
+    max-height: 88vh; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
     /* Reserve the scrollbar. Without this the frames gain ~15px the moment a
      * scrollbar appears, and .wrap re-centres by half of it — which read as the
      * panel nudging sideways while the overlay was still fading in. */
@@ -499,7 +622,8 @@ input[type=color]::-webkit-color-swatch { border: none; border-radius: 5px; }
 `;
 
 // ------------------------------------------------------------------ overlay
-let host = null, shadow = null, wrap = null, sideList = null, mainHd = null,
+let host = null, shadow = null, wrap = null, sideList = null, sideWrap = null,
+    sideMark = null, mainHd = null,
     scroll = null, savedTag = null, frames = null, pvStyle = null, popups = null, open = false;
 
 let previewOpen = localStorage.getItem('cuimod.dash.preview') !== '0';
@@ -625,11 +749,55 @@ function fadeEdges(node) {
 }
 
 let fadeRaf = 0;
+// The sidebar's fades are overlays rather than a mask, so what varies is their
+// opacity. Ramping it over the same depth the mask used keeps the dissolve
+// proportional to how much is actually hidden, and leaves the bar untouched.
+// Both edge dissolves and the position marker come off the same measurement, so
+// they are one pass.
+const MARK_MIN = 26;
+function fadeSide() {
+    if (!sideWrap || !sideList) return;
+    const view = sideList.clientHeight;
+    const full = sideList.scrollHeight;
+    const above = sideList.scrollTop;
+    const below = full - view - above;
+    const t = Math.min(1, Math.max(0, above / FADE)).toFixed(2);
+    const b = Math.min(1, Math.max(0, below / FADE)).toFixed(2);
+    if (sideWrap.style.getPropertyValue('--o-t') !== t) sideWrap.style.setProperty('--o-t', t);
+    if (sideWrap.style.getPropertyValue('--o-b') !== b) sideWrap.style.setProperty('--o-b', b);
+    if (!sideMark) return;
+    const room = full - view;
+    if (room < 1 || view < 1) { sideMark.classList.remove('can', 'on'); return; }
+    sideMark.classList.add('can');
+    // Strictly proportional, with only a floor. A shorter marker has further to
+    // travel over the same scroll — the gain is exactly view/full, and only when
+    // the length is proportional — so any ceiling on it makes the marker outrun
+    // the list. Capping at 40% of the track for legibility turned 111px of
+    // scroll into 351px of travel: a three-line nudge threw it a third of the way
+    // down the column. This is why real scrollbars are sized this way.
+    const h = Math.max(MARK_MIN, Math.round(view * view / full));
+    const top = Math.round((above / room) * (view - h));
+    sideMark.style.height = h + 'px';
+    sideMark.style.top = top + 'px';
+}
+
+// The marker is a readout, not a control: it shows itself while the list is
+// moving and gets out of the way once it stops. Hover keeps it up via CSS.
+let markTimer = 0;
+function markActive() {
+    if (!sideMark || !sideMark.classList.contains('can')) return;
+    sideMark.classList.add('on');
+    clearTimeout(markTimer);
+    markTimer = setTimeout(() => { if (sideMark) sideMark.classList.remove('on'); }, 900);
+}
+ctx.onDispose(() => clearTimeout(markTimer));
+
 function refreshFades() {
     if (fadeRaf || !shadow) return;
     fadeRaf = requestAnimationFrame(() => {
         fadeRaf = 0;
-        for (const n of [scroll, frames, sideList]) fadeEdges(n);
+        for (const n of [scroll, frames]) fadeEdges(n);
+        fadeSide();
     });
 }
 ctx.onDispose(() => { if (fadeRaf) cancelAnimationFrame(fadeRaf); });
@@ -637,12 +805,24 @@ ctx.onDispose(() => { if (fadeRaf) cancelAnimationFrame(fadeRaf); });
 function watchFade(node) {
     if (!node) return;
     node.addEventListener('scroll', refreshFades, { passive: true });
+    if (node === sideList) node.addEventListener('scroll', markActive, { passive: true });
     // Content height changes on tab switch, on a frame resize, and while a
     // slider is being dragged — all of which move the clipping edges.
     const ro = new ResizeObserver(refreshFades);
     ro.observe(node);
-    if (node.firstElementChild) ro.observe(node.firstElementChild);
-    fadeObservers.push(ro);
+    // The box itself only resizes with the window; what actually moves the
+    // clipping edges is content. Re-point at whatever the current children are
+    // every time they change, rather than at the one child that happened to
+    // exist at build time — every rebuild detaches that node and the fade then
+    // stops tracking anything.
+    const kids = () => {
+        for (const c of node.children) { try { ro.observe(c); } catch (_) {} }
+        refreshFades();
+    };
+    const mo = new MutationObserver(kids);
+    mo.observe(node, { childList: true });
+    kids();
+    fadeObservers.push(ro, mo);
 }
 const fadeObservers = [];
 ctx.onDispose(() => { for (const ro of fadeObservers) { try { ro.disconnect(); } catch (_) {} } fadeObservers.length = 0; });
@@ -676,9 +856,12 @@ function build() {
     sub.append('toggle with ', el('span', 'kbd', 'Insert'));
     sideHd.append(el('h1', null, 'Plugin dashboard'), sub);
     sideList = el('div', 'side-list');
+    sideWrap = el('div', 'side-wrap');
+    sideMark = el('div', 'side-mark');
+    sideWrap.append(sideList, sideMark);
     const sideFt = el('div', 'side-ft', 'settings.json');
     cuimod.rpc('dashboard.path').then((p) => { sideFt.textContent = p; }).catch(() => {});
-    side.append(sideHd, sideList, sideFt);
+    side.append(sideHd, sideWrap, sideFt);
 
     const main = el('div', 'main');
     mainHd = el('div', 'main-hd');
@@ -694,6 +877,25 @@ function build() {
 
     // Clicking the dim area closes; clicking the panel must not.
     wrap.addEventListener('mousedown', (e) => { if (e.target === wrap) hide(); });
+    // A wheel over the dim area, the header, or any other non-scrolling part of
+    // the overlay reached the document and scrolled the transcript underneath —
+    // the panel sat still while the app moved behind it. The scrollers keep
+    // their own wheel (and stop chaining at their ends via overscroll-behavior);
+    // everything else is swallowed here.
+    const SCROLLERS = '.scroll, .side-list, .frames, .pop.list, .pv-stage';
+    wrap.addEventListener('wheel', (e) => {
+        for (const n of e.composedPath()) {
+            if (n === wrap) break;
+            if (n.closest && n.closest(SCROLLERS)) return;
+        }
+        e.preventDefault();
+    }, { passive: false });
+    // Prevent dragging / highlighting text across the dashboard UI (keep inputs selectable).
+    wrap.addEventListener('selectstart', (e) => {
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+        e.preventDefault();
+    });
     // The app binds its shortcuts on the document. While the overlay owns the
     // keyboard, they must not fire underneath it.
     panel.addEventListener('keydown', (e) => { if (e.key !== 'Insert' && e.key !== 'Escape') e.stopPropagation(); });
@@ -757,7 +959,7 @@ function showPop(node, rect, opts) {
     if (!popups) return null;
     node.style.visibility = 'hidden';
     popups.append(node);
-    openPop = { node, onClose: o.onClose };
+    openPop = { node, owner: o.owner || null, onClose: o.onClose };
 
     const w = node.offsetWidth, h = node.offsetHeight, pad = 8;
     let x = o.alignRight ? rect.right - w : rect.left;
@@ -775,7 +977,9 @@ function popGuards() {
     shadow.addEventListener('pointerdown', (e) => {
         if (!openPop) return;
         const path = e.composedPath ? e.composedPath() : [];
-        if (path.indexOf(openPop.node) === -1) closePop();
+        if (path.indexOf(openPop.node) === -1 && (!openPop.owner || path.indexOf(openPop.owner) === -1)) {
+            closePop();
+        }
     }, true);
     shadow.addEventListener('keydown', (e) => {
         if (openPop && e.key === 'Escape') { e.stopPropagation(); closePop(); }
@@ -842,7 +1046,8 @@ function comboControl(spec, c, values) {
     const lbl = el('span', 'lbl', labelOf(cur));
     trig.append(lbl, el('span', 'arw', '▼'));
 
-    trig.addEventListener('click', () => {
+    trig.addEventListener('click', (e) => {
+        e.stopPropagation();
         if (openPop && openPop.owner === trig) { closePop(); return; }
         const list = el('div', 'pop list');
         list.tabIndex = -1;
@@ -850,7 +1055,8 @@ function comboControl(spec, c, values) {
         const rows = (c.options || []).map((o, i) => {
             const row = el('div', 'opt' + (String(o.value) === String(cur) ? ' on' : ''));
             row.append(el('span', 'tick', '✓'), el('span', null, o.label));
-            row.addEventListener('click', () => {
+            row.addEventListener('click', (ev) => {
+                ev.stopPropagation();
                 cur = o.value;
                 lbl.textContent = o.label;
                 setValue(spec, c.key, o.value);
@@ -872,8 +1078,7 @@ function comboControl(spec, c, values) {
         });
 
         trig.classList.add('open');
-        showPop(list, trig.getBoundingClientRect(), { onClose: () => trig.classList.remove('open') });
-        if (openPop) openPop.owner = trig;
+        showPop(list, trig.getBoundingClientRect(), { owner: trig, onClose: () => trig.classList.remove('open') });
         list.style.minWidth = trig.offsetWidth + 'px';
         setCursor(cursor);
         list.focus();
@@ -896,7 +1101,8 @@ function colorControl(spec, c, values) {
         if (!live) replay(hexLbl, 'bump');
     };
 
-    sw.addEventListener('click', () => {
+    sw.addEventListener('click', (e) => {
+        e.stopPropagation();
         if (openPop && openPop.owner === sw) { closePop(); return; }
         const hsv = hexToHsv(hex);
         const box = el('div', 'pop pick');
@@ -937,8 +1143,7 @@ function colorControl(spec, c, values) {
         });
 
         sw.classList.add('open');
-        showPop(box, sw.getBoundingClientRect(), { alignRight: true, onClose: () => sw.classList.remove('open') });
-        if (openPop) openPop.owner = sw;
+        showPop(box, sw.getBoundingClientRect(), { owner: sw, alignRight: true, onClose: () => sw.classList.remove('open') });
         paint(true);
     });
 
@@ -976,6 +1181,21 @@ function colorControl(spec, c, values) {
 
 function control(spec, c, values) {
     const v = values[c.key];
+
+    if (c.type === 'custom') {
+        let node = null;
+        try { node = c.node(values); }
+        catch (e) { node = el('div', 'empty', 'render failed: ' + (e && e.message)); }
+        return node ? [node] : [];
+    }
+
+    if (c.type === 'prompt-policy') return promptPolicyControl(spec, c, values);
+
+    if (c.type === 'info') {
+        const text = el('span', null, c.text || '');
+        text.style.cssText = 'font-size:12px;line-height:1.45;color:hsl(var(--text-400));max-width:240px;text-align:right;white-space:normal;';
+        return [text];
+    }
 
     if (c.type === 'toggle') {
         const sw = el('div', 'sw' + (v ? ' on' : ''));
@@ -1211,6 +1431,8 @@ function select(name) {
     current = name;
     for (const n of sideList.querySelectorAll('.nav')) {
         n.classList.toggle('on', n.dataset.plugin === name);
+        // A row picked while half under a fade should come out from under it.
+        if (n.dataset.plugin === name) n.scrollIntoView({ block: 'nearest' });
     }
     moveIndicator();
 
@@ -1267,7 +1489,7 @@ function renderMain() {
         box.style.setProperty('--i', String(gi + 1));
         gi += 2;
         for (const c of list) {
-            const row = el('div', 'row');
+            const row = el('div', 'row' + (c.wide ? ' wide' : ''));
             const lab = el('div', 'lab');
             lab.append(el('b', null, c.label || c.key));
             if (c.hint) lab.append(el('span', null, c.hint));
@@ -1300,7 +1522,7 @@ function armReset(btn, spec) {
         clearTimeout(t);
         disarm();
         delete stored[spec.plugin];
-        cuimod.rpc('dashboard.reset', { plugin: spec.plugin }).then(flashSaved).catch(() => {});
+        cuimod.rpc('dashboard.reset', { plugin: spec.plugin, immediate: spec.immediateSave === true }).then(flashSaved).catch(() => {});
         applySpec(spec);
         renderMain();
     });
@@ -1334,7 +1556,8 @@ function hide() {
     setTimeout(() => {
         if (open || !host) return;
         try { host.remove(); } catch (_) {}
-        host = null; shadow = null; wrap = null; sideList = null; mainHd = null;
+        host = null; shadow = null; wrap = null; sideList = null; sideWrap = null;
+        sideMark = null; mainHd = null;
         scroll = null; savedTag = null; frames = null; pvStyle = null; navInd = null; popups = null;
     }, MS(190));
 }

@@ -20,11 +20,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # No dependencies by design, so there is nothing to install.
+      - name: install tokenizer and check router on its supported platform
+        if: runner.os == 'Windows'
+        run: npm ci --ignore-scripts
+      - run: npm run check
+        if: runner.os == 'Windows'
       # selfcheck compiles the whole hot tree, constructs the host against a
       # fake Electron and asserts no timer/watcher leaks. The asar payload stage
       # is skipped automatically when no Claude Desktop install is present.
       - run: node selfcheck.js
+        if: runner.os != 'Windows'
 
   patcher:
     name: patcher smoke test

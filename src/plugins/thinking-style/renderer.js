@@ -1,33 +1,42 @@
 /* claude-ui-mod :: thinking-style (renderer)
  *
- * Restyles the Code transcript's thinking blocks. Pure CSS: one <style> tag in
- * document.head, no DOM mutation, no observer, nothing to keep in sync.
+ * Restyles the Code transcript's thinking blocks and formats their inline
+ * Markdown. Gemini and GPT reasoning summaries use Markdown delimiters; Claude
+ * thinking is ordinarily plain text, so blocks with no delimiter stay untouched.
  *
- * Why CSS-only. The thinking text lives in a React-owned node that re-renders
- * per token while it streams, so anything inserted *inside* it is destroyed on
- * the next token, and a `class` added to it is clobbered whenever React rewrites
- * className. Styling from a stylesheet touches neither, and ::before is a
- * pseudo-element rather than a child, so the label survives too.
+ * Formatting is intentionally inline-only. Thinking nodes stream under React
+ * ownership, and their stock pre-wrap whitespace already represents paragraphs
+ * and line breaks. Replacing that with headings, lists, tables or paragraph nodes
+ * caused broken line layout and horizontal-rule artefacts. Code, emphasis,
+ * strikethrough and HTTPS links need no change to that structure.
  *
- * Two different components render thinking text: one wraps it in a
- * `group/thinking` container (it carries a hover control), one drops it bare
- * into the message column with no wrapper at all — 9 wrapped and 11 bare in one
- * transcript, which is why keying on the container styled only some of them.
- * The text element is the common hook and carries the same four classes in both.
- *
- * The transcript's own typography rule is
- *   .epitaxy-root .epitaxy-transcript-typography :where(.text-body):not(button,…)
- * at (0,2,1), setting font-size/line-height from --chat-body/--chat-leading.
- * Prefixing with that same ancestor puts these rules at (0,6,0), which beats it
- * without !important, and scopes everything here to the transcript.
- *
- * Nothing hides, clamps, truncates or collapses: whitespace-pre-wrap and
- * break-words are left as the app set them, so every character still renders.
+ * React replaces the text node as a thought streams. The observer reformats each
+ * replacement, while the raw-text marker makes the mutation caused by our own
+ * innerHTML write a no-op. CSS still owns the visual treatment, so React may
+ * replace a formatted node at any point without losing the thinking view.
  */
 'use strict';
 
 const SCOPE = '.epitaxy-transcript-typography ';
 const TEXT = SCOPE + '.text-body.text-muted.italic.whitespace-pre-wrap';
+const SELECTOR = '.epitaxy-transcript-typography .text-body.text-muted.italic.whitespace-pre-wrap';
+// claude.ai now frames transcript groups with `div.border-l-2.border-alpha-2.pl-md`.
+// Ten of the eleven in a measured transcript held a thinking block, where its rule
+// landed 10px outside ours and the thought read as two grey lines with a gutter.
+// The eleventh held one `.prose` paragraph — a status blurb, no thought anywhere
+// inside it — and drew the same rule beside a line that is not a thought.
+//
+// Every one of them is dropped while this plugin is on, not just the ones holding
+// a thought. The app applies this component inconsistently: most status blurbs sit
+// outside it entirely, so the rule marks nothing the reader can act on, and keying
+// the suppression on the contents would leave that odd one behind and admit
+// whatever the app wraps next. The transcript gets exactly one kind of vertical
+// rule, ours, from the spine and indent controls.
+const WRAPPER = '.epitaxy-transcript-typography .border-l-2.border-alpha-2';
+
+const MARKED = 'data-cuimod-think-md';
+const RAW = '__cuimodThinkingRaw';
+const RENDERED = '__cuimodThinkingRendered';
 
 const FACES = [
     { value: 'Verdana, Geneva, sans-serif', label: 'Verdana' },
@@ -43,12 +52,47 @@ const FACES = [
 const style = document.createElement('style');
 style.id = 'cuimod-thinking-style';
 (document.head || document.documentElement).appendChild(style);
-ctx.onDispose(() => { try { style.remove(); } catch (_) {} });
 
-// One generator for both the live stylesheet and the dashboard's "after" stage,
-// so the preview is the real rules at real size, not a drawing of them.
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function hasInlineMarkdown(text) {
+    return /```|`[^`\r\n]+`|\*\*[^*\r\n]+\*\*|~~[^~\r\n]+~~|\[[^\]\r\n]+\]\(https?:\/\/[^\s)]+\)|(?:^|[^\w*])\*[^*\r\n]+\*(?=[^\w*]|$)|(?:^|[^\w_])_[^_\r\n]+_(?=[^\w_]|$)/.test(text);
+}
+
+// Only generated markup reaches innerHTML. Text and URL attributes are escaped
+// before substitution, and link targets are restricted to explicit HTTP(S).
+function formatInlineMarkdown(text) {
+    const code = [];
+    let s = String(text == null ? '' : text);
+    const holdCode = (content, block) => {
+        const token = '￰CODE_' + code.length + '_￱';
+        code.push('<code class="cuimod-think-code' + (block ? ' block' : '') + '">' + escapeHtml(content) + '</code>');
+        return token;
+    };
+
+    s = s.replace(/(^|\r?\n)```[^\r\n]*\r?\n?([\s\S]*?)```/g,
+        (_, lead, content) => lead + holdCode(content, true));
+    s = s.replace(/`([^`\r\n]+)`/g, (_, content) => holdCode(content, false));
+    s = escapeHtml(s);
+
+    s = s.replace(/\[([^\]\r\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        '<a class="cuimod-think-link" href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    s = s.replace(/\*\*\*([^*\r\n]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\*\*([^*\r\n]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/~~([^~\r\n]+)~~/g, '<del>$1</del>');
+    s = s.replace(/(^|[^\w*])\*([^*\r\n]+)\*(?=[^\w*]|$)/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[^\w_])_([^_\r\n]+)_(?=[^\w_]|$)/g, '$1<em>$2</em>');
+    return s.replace(/￰CODE_(\d+)_￱/g, (_, i) => code[Number(i)] || '');
+}
+
 function rules(sel, v) {
-    // Theme tokens follow light/dark for free; a picked colour is absolute.
     const ink = v.useThemeColor ? 'hsl(var(--text-300))' : v.color;
     const firstLine = v.useThemeColor ? 'hsl(var(--text-200))' : v.color;
     const spineInk = v.useThemeColor ? 'hsl(var(--text-500))' : v.spineColor;
@@ -64,20 +108,14 @@ ${sel} {
     line-height: ${v.leading};
     color: ${ink};
     white-space: pre-wrap;
-
-    /* The indent is added back because the app sets border-box, and the
-     * measure is about the text, not the box. */
     max-width: calc(${v.measure}ch + ${v.indent}px);
-
     border-left: ${v.spineWidth}px solid ${spine};
     padding-left: ${v.indent}px;
     margin: ${v.gap}px 0 ${v.gap + 2}px;
     transition: border-color 160ms ease;
-
     text-wrap: pretty;
 }
 ${sel}:hover { border-left-color: ${spineHover}; }
-
 ${sel}::before {
     content: ${v.showLabel ? JSON.stringify(v.labelText) : 'none'};
     display: block;
@@ -91,15 +129,42 @@ ${sel}::before {
     margin-bottom: 7px;
     user-select: none;
 }
-/* A turn that thinks three times in a row is labelled once. */
 ${sel} + ${sel}::before { content: none; }
-
 ${sel}::first-line { color: ${v.firstLine ? firstLine : ink}; }
+${sel} .cuimod-think-code {
+    font-family: var(--font-mono, "Cascadia Mono", Consolas, ui-monospace, monospace);
+    font-size: .92em;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    white-space: pre-wrap;
+}
+${sel} .cuimod-think-code.block {
+    display: block;
+    margin: .45em 0;
+    padding: 7px 10px;
+    overflow-x: auto;
+    border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+}
+${sel} .cuimod-think-link {
+    color: ${v.useThemeColor ? 'hsl(var(--text-200))' : ink};
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+${sel} strong { font-weight: 600; }
+${sel} em { font-style: italic; }
+${sel} del { text-decoration: line-through; opacity: .7; }
 `;
 }
 
-// What the app does on its own, measured from the live transcript: muted italic
-// anthropic-sans at 14/20, no framing, running the full column width.
+// Kept out of rules() because rules() is reused for the preview stage, which has
+// no app wrapper and must not emit a transcript-wide selector.
+function wrapperRules() {
+    return `
+${WRAPPER} { border-left-width: 0; padding-left: 0; }
+`;
+}
+
 function stockRules(sel) {
     return `
 ${sel} {
@@ -115,22 +180,68 @@ ${sel} {
 `;
 }
 
-function apply(v) {
-    style.textContent = v.enabled ? rules(TEXT, v) : '';
+let currentConfig = null;
+
+function forgetNode(node) {
+    delete node[RAW];
+    delete node[RENDERED];
+    node.removeAttribute(MARKED);
 }
 
-// A real newline pair in the sample, because the blank lines the model emits are
-// exactly what the leading knob scales.
-const SAMPLE = `The user is asking about the wire format, so the answer has to come from the struct definition rather than from the field names. Checking the packed layout before I say anything about offsets.
+function formatNode(node) {
+    if (!currentConfig || !currentConfig.enabled || !currentConfig.renderMarkdown || !node.isConnected) return;
+    const raw = node.textContent || '';
+    // innerHTML turns delimiters into markup, so textContent is the rendered
+    // string rather than the source string. React's next source replacement is
+    // distinguishable because it differs from this saved rendered text.
+    if (node.getAttribute(MARKED) === '1' && node[RENDERED] === raw) return;
+    if (!hasInlineMarkdown(raw)) { forgetNode(node); return; }
+    node[RAW] = raw;
+    node.innerHTML = formatInlineMarkdown(raw);
+    node[RENDERED] = node.textContent;
+    node.setAttribute(MARKED, '1');
+}
 
-Both sides agree on the first three fields; the fourth is where the client reads a u16 and the server writes a u32.`;
+function restoreNode(node) {
+    const raw = node[RAW];
+    // React can replace its text between the last observer delivery and a hot
+    // reload. Preserve that newer source rather than restoring an old snapshot.
+    if (raw != null && node.textContent === node[RENDERED]) node.textContent = raw;
+    forgetNode(node);
+}
+
+function restoreAll() {
+    for (const node of document.querySelectorAll('[' + MARKED + '="1"]')) restoreNode(node);
+}
+
+function scanAndFormat() {
+    if (!currentConfig || !currentConfig.enabled || !currentConfig.renderMarkdown) { restoreAll(); return; }
+    for (const node of document.querySelectorAll(SELECTOR)) formatNode(node);
+}
+
+function apply(v) {
+    currentConfig = v;
+    style.textContent = v.enabled ? rules(TEXT, v) + wrapperRules() : '';
+    scanAndFormat();
+}
+
+ctx.observe(document.documentElement, { childList: true, subtree: true, characterData: true }, scanAndFormat);
+cuimod.onSessionChange(scanAndFormat);
+ctx.onDispose(() => { restoreAll(); try { style.remove(); } catch (_) {} });
+
+const SAMPLE = `Checking \`net_player_state.cpp\` before accepting the **first three fields**.
+
+\`\`\`cpp
+uint16_t x, y;
+\`\`\``;
 
 const spec = {
     plugin: 'thinking-style',
     title: 'Thinking style',
-    description: 'Typography and framing for thinking blocks in the transcript.',
+    description: 'Typography, framing, and inline Markdown for thinking blocks in the transcript.',
     defaults: {
         enabled: true,
+        renderMarkdown: true,
         face: 'Verdana, Geneva, sans-serif',
         size: 14,
         leading: 1.62,
@@ -148,29 +259,20 @@ const spec = {
         firstLine: true,
     },
     controls: [
-        { key: 'enabled', type: 'toggle', label: 'Enabled',
-          hint: 'Off leaves the app’s muted italic alone.', group: 'Type' },
+        { key: 'enabled', type: 'toggle', label: 'Enabled', hint: 'Off leaves the app’s muted italic alone.', group: 'Type' },
+        { key: 'renderMarkdown', type: 'toggle', label: 'Inline Markdown', hint: 'Formats code, emphasis, strikethrough, links, and fenced code without changing thought layout.', group: 'Format' },
         { key: 'face', type: 'combo', label: 'Typeface', options: FACES, group: 'Type' },
         { key: 'size', type: 'slider', label: 'Size', min: 10, max: 22, step: 0.5, unit: 'px', group: 'Type' },
-        { key: 'leading', type: 'slider', label: 'Line height', min: 1.1, max: 2.2, step: 0.01, unit: '×',
-          hint: 'Also scales the blank lines the model emits between paragraphs.', group: 'Type' },
-        { key: 'measure', type: 'slider', label: 'Measure', min: 40, max: 200, step: 1, unit: 'ch',
-          hint: 'Line length. The classic 62–70 is a convention, not a limit — the column caps it anyway.',
-          group: 'Type' },
-
-        { key: 'useThemeColor', type: 'toggle', label: 'Follow theme colours',
-          hint: 'On, colours come from the app’s tokens and track light/dark.', group: 'Colour' },
-        { key: 'color', type: 'color', label: 'Text colour',
-          hint: 'Used only when “Follow theme colours” is off.', group: 'Colour' },
-        { key: 'spineColor', type: 'color', label: 'Spine and label colour', group: 'Colour' },
-        { key: 'spineAlpha', type: 'slider', label: 'Spine opacity', min: 0, max: 1, step: 0.01, group: 'Colour' },
-        { key: 'firstLine', type: 'toggle', label: 'Brighten first line',
-          hint: 'Anchors the eye at the start of each block.', group: 'Colour' },
-
+        { key: 'leading', type: 'slider', label: 'Line height', min: 1.1, max: 2.2, step: 0.01, unit: '×', hint: 'Also scales the blank lines the model emits between paragraphs.', group: 'Type' },
+        { key: 'measure', type: 'slider', label: 'Measure', min: 40, max: 200, step: 1, unit: 'ch', hint: 'Line length. The column still caps it.', group: 'Type' },
+        { key: 'useThemeColor', type: 'toggle', label: 'Follow theme colors', hint: 'On, colors come from the app’s tokens and track light/dark.', group: 'Color' },
+        { key: 'color', type: 'color', label: 'Text color', hint: 'Used only when “Follow theme colors” is off.', group: 'Color' },
+        { key: 'spineColor', type: 'color', label: 'Spine and label color', group: 'Color' },
+        { key: 'spineAlpha', type: 'slider', label: 'Spine opacity', min: 0, max: 1, step: 0.01, group: 'Color' },
+        { key: 'firstLine', type: 'toggle', label: 'Brighten first line', hint: 'Anchors the eye at the start of each block.', group: 'Color' },
         { key: 'spineWidth', type: 'slider', label: 'Spine width', min: 0, max: 6, step: 1, unit: 'px', group: 'Frame' },
         { key: 'indent', type: 'slider', label: 'Indent', min: 0, max: 40, step: 1, unit: 'px', group: 'Frame' },
         { key: 'gap', type: 'slider', label: 'Vertical gap', min: 0, max: 40, step: 1, unit: 'px', group: 'Frame' },
-
         { key: 'showLabel', type: 'toggle', label: 'Show label', group: 'Label' },
         { key: 'labelText', type: 'text', label: 'Label text', group: 'Label' },
         { key: 'labelSize', type: 'slider', label: 'Label size', min: 8, max: 16, step: 0.5, unit: 'px', group: 'Label' },
@@ -179,15 +281,14 @@ const spec = {
     preview: {
         title: 'Preview — thinking block',
         beforeLabel: 'stock app, plugin off',
-        node() {
+        node(which) {
             const d = document.createElement('div');
             d.className = 'pv-text';
-            d.textContent = SAMPLE;
+            if (which === 'after') d.innerHTML = formatInlineMarkdown(SAMPLE);
+            else d.textContent = SAMPLE;
             return d;
         },
-        css(v, sel, which) {
-            return which === 'before' ? stockRules(sel + ' .pv-text') : rules(sel + ' .pv-text', v);
-        },
+        css(v, sel, which) { return which === 'before' ? stockRules(sel + ' .pv-text') : rules(sel + ' .pv-text', v); },
     },
 };
 

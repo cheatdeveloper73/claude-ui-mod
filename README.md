@@ -53,14 +53,90 @@ by forcing a font on the subtree.
 | plugin | what it does |
 |---|---|
 | `dashboard` | The settings overlay on **Insert**: sidebar of plugins, grouped controls, live 1:1 before/after preview frames. Persists to `.state/settings.json`. |
+| `provider-picker` | Provider tabs inside the native model picker. Extends the local model catalog so native draft selection and the native effort slider work per conversation. OpenAI runs on the Codex OAuth you already hold — no metered API key. Other providers come from the catalogue or from a [provider adapter](docs/provider-adapters.md). |
+| `compaction-provider` | Replaces Claude Code’s text-only GPT compaction turn with Codex V2’s native encrypted checkpoint. The router restores the opaque item on later GPT turns and keeps a portable text fallback for switching to Claude or Gemini. |
+| `context-management` | Codex's experimental context management, run from the router on the ChatGPT plan you already hold. GPT sessions get the model-only `notes` scratchpad, the budget guidance and reminders, and an optional `new_context` window reset. Upstream's instructions telling the model to conceal the tools are stripped. |
 | `task-rail` | A rail pinned left of the prompt composer showing the live task list of the Code session that window is displaying. |
 | `usage-bar` | Context and rate-limit meters in the empty middle of the composer footer. Hides the app's own usage band once it has read the reset time off it. |
+| `context-pill` | A pill that appears only once the session is carrying 300k tokens or more, warming and pulsing past a second threshold. Same CLI reply `usage-bar` reads, so the two cannot disagree. Dismiss snoozes it until context grows another 50k. |
+| `queue` | An explicit send queue. Mid-turn, Enter is intercepted before the app sees it and the message lands in a rail above the prompt with steer / edit / delete per row, plus auto-send when the turn fully ends. |
+| `subagents` | A HUD of this session's agents in the gutter under the chat title: who is running, what tool they are on, how long. Finished ones sit below as ghosts. Click one for its full transcript and controls, read from the CLI's own per-agent files so it survives a stop-and-resume. Ships a demo-data mode. |
+| `throughput` | Real tokens per second, measured at the router: exact provider token counts over this machine's own clocks, split into the upstream hop, the prefill, and the generation window. Live in-flight streams plus per-agent history, joined to the CLI transcript so each rate is attributed to the main session or to the named subagent that produced it. Persists to `provider-throughput-v1.jsonl`. |
+| `goal` | An always-on band for the CLI's `/goal` stop-hook: the armed condition, how many times it has checked in, and the evaluator's verdicts. Read from the session transcript rather than the app's stream state, which loses them. Set, edit or clear a goal mid-turn from the band. |
+| `provider-routing` | Starts the router when a Claude Code session is spawned and points that session at it. No UI. This is the plugin that makes provider switching work at all; disable it and every session goes straight to Anthropic. |
+| `plan-usage-capture` | Reads Claude's own plan-usage response as the app fetches it, and persists the rate-limit numbers to `.state/claude-plan-resets.json`. That file is where the Claude quota meter and its reset countdown come from. |
+| `hide-usage-band` | Hides or dims Claude's own usage-limit banners in the composer, by keyword. Ships **off**; enable and configure it in the dashboard. Overlaps `usage-bar`'s own `hideBanner` toggle — use one or the other. |
 | `thinking-default` | Sets the transcript view to Thinking the first time a session appears in a window. One shot per session, so switching back by hand sticks. |
 | `thinking-style` | Typography and framing for thinking blocks. |
 | `transcript-type` | Typeface and size for normal transcript text, by feeding the app's own `--chat-body` / `--chat-leading` tokens. |
 
+**Insert → Providers & agents** controls GPT reasoning summaries, optional
+provider-supplied reasoning text, tab animation, and upstream identity logging.
+The visible GPT thinking is an OpenAI summary by default. The dashboard cannot
+unlock hidden raw reasoning. Request settings apply to the next model call and
+also cover GPT subagents; they do not change reasoning effort.
+
+**Insert → Context compaction** selects native Codex V2 or Claude Code's normal
+text-summary path for GPT sessions. Codex checkpoints are durable under the
+router state directory and bound to the CLI session id. Claude, Gemini and other
+providers continue using their normal Claude Code compaction path. The portable
+fallback is enabled by default so switching away from GPT after a checkpoint is
+safe.
+
+**Insert → Context management** turns on Codex's experimental context lane for
+GPT sessions. Notes are additive: the model gets a server-side scratchpad that
+survives a window reset, and nothing else about the turn changes. Window reset
+lets it call `new_context`, after which this router sends later turns from the
+cut point instead of the whole transcript, so continuity lives in its notes.
+The transcript archive is off by default: turning it on asks OpenAI to ingest and
+index the whole thread, not just what the model chose to write. Tool results are encrypted by
+the backend and readable only inside inference, so note contents never reach this
+machine. The tool descriptions are reserved and validated upstream, so they ship
+verbatim; the guidance this router injects is not, and it tells the model you may
+be told about its notes — so asking works. `GET /contextz` reports window state and a drift verdict that
+fires when Codex changes the feature upstream.
+
+Plugin settings live in `.state/settings.json` and that one file is **tracked**,
+so the configuration is recoverable and `git log -p .state/settings.json` is its
+history. Everything else under `.state/` stays ignored, credentials included, and
+the publish step excludes the settings file from the public mirrors. After
+restoring an older copy, run `dashboard.reload` and reload the renderer — the
+store is authoritative in memory once read.
+
 Adding your own needs no re-patch — drop a directory into `src/plugins/` and it
 loads live. See [docs/plugin-api.md](docs/plugin-api.md).
+
+## Usage Atlas
+
+The router keeps a permanent, deduplicated record of every response it relays —
+exact provider token counts, the model that served it, and what it would have
+cost at that day's list price. It serves that back as a dashboard:
+
+```
+http://127.0.0.1:8789/usage/
+```
+
+Same page from inside the app: click the usage ring in the composer, then
+**Open Usage Atlas ↗**.
+
+What is on it, and where each number comes from:
+
+| panel | source |
+|---|---|
+| Quota meters, with a burn-rate forecast and time-to-exhaustion | Claude plan percentages captured by `plan-usage-capture`; ChatGPT windows from your Codex login; any adapter's own account quotas |
+| Tokens by model, and a daily timeline | the router's own accounting store |
+| Spend | those token counts priced from `router/pricing.mjs`, recomputed on every read |
+| Audit trail | the last 100 responses, with no message content |
+
+Two things worth knowing before you read the numbers. **Cost is never stored** —
+it is derived from tokens on every request, so correcting a price in
+`pricing.mjs` retroactively fixes every historical day with no migration. And a
+model with no rate is reported as *unpriced* rather than as zero, so a gap in
+the price table reads as a gap rather than as free traffic.
+
+Meters only appear for providers you actually have. A fresh install with no
+Codex login and no adapter shows the Claude meter alone; the token, timeline and
+spend panels populate from the first response either way.
 
 ## Requirements
 
@@ -81,6 +157,7 @@ while it runs, and the running version cannot be replaced.
 ```bash
 git clone https://gitlab.com/blockshooter/claude-ui-mod
 cd claude-ui-mod
+npm ci
 node patch.js apply
 ```
 
@@ -143,6 +220,28 @@ dump.
 | `src/plugins/*/main.js` | hot, on save (main process) |
 | `src/plugins/*/renderer.js` | hot, on save (renderer) |
 
+The provider router is in `router/`. It listens on `127.0.0.1:8789`; the routing
+plugin starts it when needed and supplies that endpoint when Desktop spawns a
+Code CLI. `router/supervisor.mjs` owns the public port and swaps workers
+blue-green: a saved change boots a candidate on a private port, accepts it only
+after `/healthz` and a semantic canary pass, then switches new requests while
+the previous generation drains. Sessions stay up across a router edit.
+
+Every request is routed on `body.model`. Anything unclaimed goes to
+api.anthropic.com byte-identical. `gpt-*` is translated to the OpenAI Responses
+API and sent on the Codex subscription OAuth. Anything else is a **catalogue
+entry** if the backend already speaks Anthropic Messages, or a **provider
+adapter** under `router/adapters/` if it needs real code — see
+[docs/provider-adapters.md](docs/provider-adapters.md). No adapter ships by
+default and none is required.
+
+GPT preflight counts use a pinned local `o200k_base` tokenizer over the
+translated request, including image-size estimates instead of base64 text. A
+provider adapter may supply a native counter instead. After a response, both
+context displays use the CLI's provider-reported input total, including cached
+input; the tooltip distinguishes this latest measured prompt from a preflight
+estimate. Category breakdowns remain estimates.
+
 The two baked files are deliberately dumb loaders with no feature logic. If you
 are editing them to add a feature, it belongs in `host.js` or a plugin.
 
@@ -160,7 +259,8 @@ Why reloading is safe while a long agent run is in flight:
   across a dispose cycle.
 - **The page never reloads.** A renderer reload swaps isolated-world code only;
   claude.ai's React tree and your sessions are untouched.
-- Nothing goes near the Claude Code CLI child processes or their stdio pipes.
+- UI reloads never replace Claude Code CLI processes or their stdio pipes.
+  Provider routing only decorates the environment when a CLI is spawned.
 
 Kill switch: create a file named `DISABLED` in the repo root and save anything
 under `src/`. The host unloads. Delete it and save again to restore.
@@ -183,6 +283,7 @@ to whatever was focused a moment ago.
 
 - [docs/development.md](docs/development.md) — the hot-reload dev flow
 - [docs/plugin-api.md](docs/plugin-api.md) — plugin contracts, host RPC surface, introspection recipes
+- [docs/provider-adapters.md](docs/provider-adapters.md) — adding a provider, by catalogue entry or by adapter
 - [docs/internals.md](docs/internals.md) — verified Claude Desktop internals, and the dead ends not worth re-walking
 - [docs/troubleshooting.md](docs/troubleshooting.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)

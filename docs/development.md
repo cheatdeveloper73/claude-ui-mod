@@ -80,10 +80,30 @@ world — it is never contextBridged to claude.ai's page JS.
 
 ```bash
 node selfcheck.js                 # compile + wiring + leak check, touches nothing
+npm run check                     # selfcheck plus the whole regression suite
 node patch.js status
 node patch.js apply --force       # only needed for the two baked files
 node patch.js revert              # restores asar AND exe
 ```
+
+Router work has one more gate, because the router is a live process serving
+running sessions:
+
+```bash
+node scripts/router-canary.mjs --router-dir router
+```
+
+`router/supervisor.mjs` owns the public port and swaps workers blue-green: a
+saved change boots a candidate on a private port, accepts it only after
+`/healthz` and that canary pass, then switches new requests while the previous
+generation drains. So **never edit a watched `router/*.mjs` file incrementally**
+— assemble the whole candidate elsewhere, verify it there, and replace the
+watched files inside one debounce window. A half-written file is a deployment,
+not a draft.
+
+Adding a provider is [docs/provider-adapters.md](provider-adapters.md). It needs
+no change to `index.mjs`: a catalogue entry if the backend already speaks
+Anthropic Messages, otherwise a directory under `router/adapters/`.
 
 Kill switch: create a file named `DISABLED` in this directory and save any file
 under `src/` — the host unloads. Delete it and save again to restore.

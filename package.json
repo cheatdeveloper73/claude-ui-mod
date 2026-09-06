@@ -1,23 +1,62 @@
 {
   "name": "claude-ui-mod",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Hot-reloadable plugin runtime injected into the Claude Desktop app on Windows: task rail, usage meters, transcript typography and a settings dashboard.",
   "license": "MIT",
   "private": false,
-  "engines": { "node": ">=18" },
-  "os": ["win32"],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32"
+  ],
   "main": "patch.js",
-  "bin": { "claude-ui-mod": "patch.js" },
-  "files": ["lib/", "src/", "patch.js", "watch.js", "selfcheck.js", "install.ps1", "docs/"],
+  "bin": {
+    "claude-ui-mod": "patch.js"
+  },
+  "files": [
+    "lib/",
+    "src/",
+    "router/",
+    "tests/",
+    "scripts/",
+    "patch.js",
+    "watch.js",
+    "selfcheck.js",
+    "install.ps1",
+    "docs/",
+    "examples/",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
+  ],
   "scripts": {
-    "check": "node selfcheck.js",
+    "check": "npm run check:public",
+    "check:public": "node selfcheck.js && node --test tests/context-count.test.mjs tests/dashboard-ui.test.mjs tests/nanogpt-sync.test.mjs tests/prompt-policy.test.mjs tests/provider-adapter-registry.test.mjs tests/auto-compact-main.test.cjs tests/provider-lifecycle.test.js tests/provider-accounting.test.mjs tests/provider-analytics.test.mjs tests/provider-compaction.test.mjs tests/provider-context-management.test.mjs tests/provider-dashboard.test.mjs tests/provider-limits.test.mjs tests/provider-openai-stream.test.mjs tests/provider-reasoning.test.mjs tests/provider-reset-credits.test.mjs tests/provider-supervisor.test.mjs tests/provider-telemetry.test.mjs tests/provider-throughput.test.mjs tests/provider-pricing.test.mjs tests/throughput-chip.test.mjs tests/thinking-markdown.test.mjs tests/usage-bar-main.test.cjs && node tests/provider-router.test.mjs",
     "status": "node patch.js status",
     "apply": "node patch.js apply",
     "revert": "node patch.js revert",
     "watch": "node watch.js"
   },
-  "keywords": ["claude", "claude-desktop", "claude-code", "electron", "asar", "plugin", "ui-mod", "windows"],
-  "repository": { "type": "git", "url": "git+https://gitlab.com/blockshooter/claude-ui-mod.git" },
-  "bugs": { "url": "https://gitlab.com/blockshooter/claude-ui-mod/-/issues" },
-  "homepage": "https://gitlab.com/blockshooter/claude-ui-mod#readme"
+  "keywords": [
+    "claude",
+    "claude-desktop",
+    "claude-code",
+    "electron",
+    "asar",
+    "plugin",
+    "ui-mod",
+    "windows"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/blockshooter/claude-ui-mod.git"
+  },
+  "bugs": {
+    "url": "https://gitlab.com/blockshooter/claude-ui-mod/-/issues"
+  },
+  "homepage": "https://gitlab.com/blockshooter/claude-ui-mod#readme",
+  "dependencies": {
+    "js-tiktoken": "1.0.21"
+  }
 }

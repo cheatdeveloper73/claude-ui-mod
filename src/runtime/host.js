@@ -7,7 +7,8 @@
  * disposer, so reloads cannot leak intervals, watchers or listeners into a
  * long-running app.
  */
-'use strict';
+'use strict'; // Changes here signal the baked loader to reload the host.
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -126,7 +127,15 @@ module.exports = function createHost(boot) {
         modDir: MOD_DIR,
         tasksRoot: TASKS_ROOT,
         methods: [...methods.keys()].sort(),
-        plugins: listPlugins(),
+        // `plugins` used to be listPlugins(), i.e. the directory listing -- which
+        // reports a plugin whose factory THREW as present. The host is right to
+        // catch that throw so one bad plugin cannot take the others down, but it
+        // meant the only introspection surface said a dead plugin was fine, and
+        // selfcheck had nothing to compare against.
+        plugins: loaded.slice(),
+        pluginsOnDisk: listPlugins(),
+        pluginsFailed: listPlugins().filter((n) => loaded.indexOf(n) === -1
+            && fs.existsSync(path.join(MOD_DIR, 'src', 'plugins', n, 'main.js'))),
     }));
 
     method('host.reload', () => { setTimeout(() => boot.loadHost('rpc'), 0); return true; });

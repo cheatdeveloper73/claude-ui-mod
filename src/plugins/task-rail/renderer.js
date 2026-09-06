@@ -38,7 +38,7 @@ const CSS = `
 :host { all: initial; }
 .rail {
     position: fixed;
-    z-index: 2147483000;
+    z-index: 50;
     display: flex;
     flex-direction: column;
     box-sizing: border-box;
@@ -114,7 +114,7 @@ const CSS = `
 .foot .lnk { all: unset; cursor: pointer; font-size: 10px; color: hsl(var(--accent-100, 210 71% 52%)); }
 
 .tip {
-    position: fixed; z-index: 2147483001; box-sizing: border-box;
+    position: fixed; z-index: 51; box-sizing: border-box;
     max-width: 340px; width: max-content; padding: 8px 10px;
     font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
     font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
@@ -740,6 +740,10 @@ ${sel} .pv-r.d { color: hsl(var(--text-500, 48 5% 57%)); text-decoration: line-t
 .body { max-height: ${v.maxHeight}px; }
 `);
         attach();
+        // The suppression itself is main-side; this only carries the setting.
+        // Main defaults it on and re-arms on its own interval, so a renderer
+        // that never gets here leaves the guard in its default state.
+        cuimod.rpc('task-rail.autoOpen', { suppress: v.blockNativeAutoOpen !== false }).catch(() => {});
     }
 
     // The rail's host is created once at install, but a reload can race it and
@@ -754,6 +758,7 @@ ${sel} .pv-r.d { color: hsl(var(--text-500, 48 5% 57%)); text-decoration: line-t
         defaults: {
             enabled: true, width: 264, radius: 12, opacity: 1,
             tint: 1, border: 0.12, shadow: true, maxHeight: 460,
+            blockNativeAutoOpen: true,
         },
         controls: [
             { key: 'enabled', type: 'toggle', label: 'Show rail', group: 'Rail' },
@@ -769,6 +774,9 @@ ${sel} .pv-r.d { color: hsl(var(--text-500, 48 5% 57%)); text-decoration: line-t
             { key: 'border', type: 'slider', label: 'Border strength', min: 0, max: 0.5, step: 0.01,
               group: 'Appearance' },
             { key: 'shadow', type: 'toggle', label: 'Drop shadow', group: 'Appearance' },
+            { key: 'blockNativeAutoOpen', type: 'toggle', label: "Block the app's auto-open",
+              hint: "Keeps the app's Plan pane from opening itself on a session's first task. Opening it by hand still works.",
+              group: "App's task pane" },
         ],
         apply,
         preview: {

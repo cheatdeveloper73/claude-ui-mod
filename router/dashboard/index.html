@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Provider Usage Atlas</title>
+<link rel="stylesheet" href="/usage/styles.css">
+<a class="skip selectable" href="#main">Skip to usage data</a>
+<header class="masthead motion-surface">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <div><p class="eyebrow">LOCAL ROUTER · LIVE PROVIDER TELEMETRY</p><h1>Usage Atlas</h1></div>
+  </div>
+  <div class="actions">
+    <span id="status" class="status" role="status" aria-live="polite"><i></i>Connecting</span>
+    <button id="copy-snapshot" class="icon-button copy-action" type="button" aria-label="Copy dashboard snapshot" title="Copy dashboard snapshot">⧉</button>
+    <button id="theme" class="icon-button" type="button" aria-label="Toggle theme">◐</button>
+    <button id="refresh" class="primary-button" type="button"><span>Refresh upstream</span><kbd>R</kbd></button>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <p id="load-error" class="load-error" role="alert" hidden></p>
+  <noscript><p class="load-error">Usage Atlas needs JavaScript to read the local usage snapshot.</p></noscript>
+  <section class="hero motion-section" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <p class="eyebrow">CAPACITY, VELOCITY, AND TOKEN ECONOMICS</p>
+      <h2 id="hero-title">Know what the next hour costs.</h2>
+      <p>Exact provider terminal usage meets native account quotas. Forecasts appear only after the meter has moved enough to measure.</p>
+    </div>
+    <div class="filters" aria-label="Dashboard filters">
+      <div id="provider-filter" class="segmented" role="group" aria-label="Provider">
+      </div>
+      <button id="range-combo" class="combo" type="button" role="combobox" aria-label="Time range" aria-haspopup="listbox" aria-expanded="false">
+        <span class="combo-kicker">Range</span><span class="combo-label">All time</span><span class="combo-arrow" aria-hidden="true">▾</span>
+      </button>
+      <button id="horizon-combo" class="combo" type="button" role="combobox" aria-label="Projection horizon" aria-haspopup="listbox" aria-expanded="false">
+        <span class="combo-kicker">Project</span><span class="combo-label">1 hour</span><span class="combo-arrow" aria-hidden="true">▾</span>
+      </button>
+    </div>
+  </section>
+
+  <nav class="section-nav" aria-label="Section navigation">
+    <a href="#forecast">Forecasts</a><a href="#tokens">Tokens</a><a href="#spend">Spend</a><a href="#rates">Rates</a><a href="#accounts">Accounts</a><a href="#audit-details">Audit</a>
+  </nav>
+
+  <section id="kpis" class="kpi-grid motion-region" aria-label="Usage summary"></section>
+
+  <section id="forecast" class="section motion-section" aria-labelledby="forecast-title">
+    <div class="section-head">
+      <div><p class="eyebrow">QUOTA FORECASTS</p><h2 id="forecast-title">Every live meter</h2></div>
+      <div id="forecast-legend" class="legend" aria-label="Provider legend"></div>
+    </div>
+    <div id="forecast-grid" class="forecast-grid motion-region"></div>
+    <p id="range-note" class="range-note"></p>
+    <p id="forecast-empty" class="empty" hidden>No meters match this provider filter.</p>
+  </section>
+
+  <section class="section split motion-section" aria-label="Token usage and provider health" id="tokens">
+    <article class="panel" aria-labelledby="tokens-title">
+      <div class="panel-head"><div><p class="eyebrow">EXACT TERMINAL TOKENS</p><h2 id="tokens-title">Models</h2></div><span id="token-total" class="panel-stat selectable">—</span></div>
+      <div id="model-bars" class="model-bars motion-region"></div>
+      <div class="timeline-section">
+        <h3>Daily tokens · all providers</h3>
+        <p class="chart-caption">UTC dates. The API supplies combined daily totals; the provider filter applies to model totals above.</p>
+        <div id="daily-timeline" class="timeline"></div>
+        <details class="chart-data"><summary>Daily values</summary><div class="table-shell" tabindex="0" aria-label="Daily token totals"><table id="daily-table"><thead><tr><th scope="col">Date (UTC)</th><th scope="col">Responses</th><th scope="col">Input context</th><th scope="col">Output</th><th scope="col">Total tokens</th></tr></thead><tbody></tbody></table></div></details>
+      </div>
+    </article>
+    <article class="panel" aria-labelledby="sources-title">
+      <div class="panel-head"><div><p class="eyebrow">AUTHORITY & FRESHNESS</p><h2 id="sources-title">Data sources</h2></div></div>
+      <div id="sources" class="sources motion-region"></div>
+    </article>
+  </section>
+
+  <section class="section motion-section" aria-labelledby="spend-title" id="spend">
+    <div class="section-head">
+      <div><p class="eyebrow">API-EQUIVALENT SPEND</p><h2 id="spend-title">What this traffic would have cost</h2></div>
+      <div class="head-actions">
+        <button id="copy-spend-tsv" class="text-button copy-action" type="button">Copy TSV</button>
+        <button id="copy-spend-json" class="text-button copy-action" type="button">Copy JSON</button>
+      </div>
+    </div>
+    <div id="spend-providers" class="model-bars motion-region"></div>
+    <div class="table-shell" tabindex="0">
+      <table id="spend-table"><thead><tr><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Responses</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th><th scope="col">Total</th></tr></thead><tbody class="motion-region"></tbody></table>
+    </div>
+    <p id="spend-note" class="range-note"></p>
+    <div id="gateway-wrap" class="gateway-wrap" hidden>
+      <div class="panel-head"><div><p class="eyebrow">UPSTREAM LEDGER · ATTEMPTS SENT</p><h3 id="gateway-title">Upstream attempts</h3></div><span id="gateway-total" class="panel-stat selectable">—</span></div>
+      <div class="table-shell" tabindex="0">
+        <table id="gateway-table"><thead><tr><th scope="col">Account</th><th scope="col">Model</th><th scope="col">Requests</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Output</th><th scope="col">Spend</th></tr></thead><tbody class="motion-region"></tbody></table>
+      </div>
+      <p id="gateway-note" class="range-note"></p>
+    </div>
+  </section>
+
+  <section id="rates" class="section motion-section" aria-labelledby="rates-title">
+    <div class="section-head">
+      <div><p class="eyebrow">PUBLISHED RATES · USD PER 1M TOKENS</p><h2 id="rates-title">Rate card</h2></div>
+      <span id="rate-fingerprint" class="panel-stat mono">—</span>
+    </div>
+    <div class="table-shell" tabindex="0">
+      <table id="rate-table"><thead><tr><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Write · 5m</th><th scope="col">Write · 1h</th><th scope="col">Output</th><th scope="col">In force</th></tr></thead><tbody class="motion-region"></tbody></table>
+    </div>
+    <p id="rate-note" class="range-note"></p>
+  </section>
+
+  <section class="section motion-section" aria-labelledby="accounts-title" id="accounts">
+    <div class="section-head">
+      <div><p class="eyebrow">RAW ACCOUNT BREAKDOWN</p><h2 id="accounts-title">Accounts and windows</h2></div>
+      <div class="head-actions">
+        <button id="copy-meters-tsv" class="text-button copy-action" type="button">Copy TSV</button>
+        <button id="copy-meters-json" class="text-button copy-action" type="button">Copy JSON</button>
+        <button id="density" class="text-button" type="button">Compact rows</button>
+      </div>
+    </div>
+    <div class="table-tools">
+      <label class="table-search"><span>Find a window</span><input id="account-search" type="search" placeholder="Account, model or quota" autocomplete="off"></label>
+      <span id="account-count" class="range-note" role="status"></span>
+    </div>
+    <div class="table-shell" tabindex="0" aria-label="Accounts and quota windows">
+      <table id="meters-table"><thead><tr><th scope="col">Provider</th><th scope="col">Account</th><th scope="col">Window / model</th><th scope="col">Used</th><th scope="col">Rate</th><th scope="col">ETA / reset</th><th scope="col">1% observed as</th><th scope="col">Freshness</th><th scope="col"><span class="sr-only">Copy</span></th></tr></thead><tbody class="motion-region"></tbody></table>
+    </div>
+  </section>
+
+  <details id="audit-details" class="section raw motion-section">
+    <summary><span><span class="eyebrow">AUDIT TRAIL</span><strong>Recent exact responses</strong></span><span id="event-count">0 records</span></summary>
+    <div class="raw-content">
+      <div class="raw-toolbar"><span>Provider response evidence</span><button id="copy-events-json" class="text-button copy-action" type="button">Copy JSON</button></div>
+      <div class="table-shell" tabindex="0">
+        <table id="events-table"><thead><tr><th scope="col">Time</th><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Session</th><th scope="col">Input context</th><th scope="col">Output</th><th scope="col">Reasoning</th><th scope="col">Source</th></tr></thead><tbody class="motion-region"></tbody></table>
+      </div>
+    </div>
+  </details>
+</main>
+
+<div id="popups" class="popups" aria-live="polite"></div>
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<footer class="motion-surface"><span>Loopback-only dashboard · credentials never leave the router process</span><span id="generated">Waiting for first snapshot</span></footer>
+<script src="/usage/app.js" defer></script>

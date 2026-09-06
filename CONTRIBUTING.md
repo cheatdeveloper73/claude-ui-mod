@@ -8,12 +8,19 @@ restart: drop a directory into `src/plugins/` and the running app picks it up.
 ```bash
 git clone https://gitlab.com/blockshooter/claude-ui-mod
 cd claude-ui-mod
+npm ci                   # one pinned dependency; see below
 node patch.js apply      # Claude Desktop must be fully quit
 node selfcheck.js        # should print SELFCHECK PASS
 ```
 
-There is no build step and no dependency to install. Everything is plain
-CommonJS run by the app's own Node.
+There is no build step. The injected UI is plain CommonJS run by the app's own
+Node and needs nothing installed.
+
+`npm ci` is for the router, which has exactly one dependency: `js-tiktoken`,
+imported lazily by `router/count-tokens.mjs` to count tokens for the OpenAI arm.
+Skip it and everything still appears to work — `selfcheck.js` and the router
+canary both pass, because neither reaches that code path — right up until the
+first GPT `count_tokens` request answers `502 Cannot find package 'js-tiktoken'`.
 
 ## The loop
 

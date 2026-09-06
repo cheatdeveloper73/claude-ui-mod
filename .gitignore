@@ -1,6 +1,16 @@
-# runtime state written by the mod (per-machine, per-user)
-.state/
+# runtime state written by the mod (per-machine, per-user).
+# `.state/*` rather than `.state/` so one file can be negated out of it: git
+# will not descend into an ignored directory, so a negation under `.state/`
+# would never be reached.
+.state/*
 .probe/
+
+# The dashboard's settings store is the exception, and it is tracked on purpose:
+# it is the only record of how every plugin is configured, and losing it loses
+# hours of tuning. It carries no credentials -- those live in the sibling
+# provider-secrets.json, which stays ignored by the rule above -- and
+# publish-public.mjs excludes it, so it never reaches the public mirrors.
+!.state/settings.json
 
 # update-watcher output
 watch.log

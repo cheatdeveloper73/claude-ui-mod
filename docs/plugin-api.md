@@ -55,6 +55,7 @@ world. Full DOM access; claude.ai's page JS cannot see it.
 | `appOn(channel, fn)` | subscribe to an app channel; returns unsubscribe |
 | `eipc(ns, iface, method)` | compose an app channel name |
 | `tap` | ring buffer (300) of the app's own IPC calls |
+| `observeInvoke(fn)` | fires on every app IPC invoke as it is made; returns unsubscribe |
 | `log(...)`, `refresh()`, `reload()` | |
 
 Return `{ dispose() }` or use `ctx.onDispose` — either is honored.
