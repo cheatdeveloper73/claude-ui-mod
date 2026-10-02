@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">
+    <defs>
+        <clipPath id="visor-clip">
+            <path d="M3 8h9v3h-1v1H4v-1H3z"/>
+        </clipPath>
+    </defs>
+    <path fill="#050C16" d="M5 1h6v1h2v2h1v2h2v3h-1v4h-2v2h-2v1H5v-1H3v-2H2V9H0V6h3V4h1V2h1z"/>
+    <path fill="#AEB6C1" d="M5 2h6v1h2v1h1v3H3V5h1V3h1z"/>
+    <path fill="#667384" d="M1 6h13v2H1z"/>
+    <path fill="#111D2A" d="M3 8h9v3h-1v1H4v-1H3z"/>
+    <path fill="#2D3A49" d="M4 12h8v3h-1v1H5v-1H4z"/>
+    <path fill="#687688" d="M12 7h3v2h1v3h-1v2h-4v-2h1z"/>
+    <path fill="#BEC5CD" d="M13 9h2v2h-1v2h-2v-1h1z"/>
+    <path fill="#DBE4EE" d="M5 3h1v1H5zM7 2h1v1H7zM9 3h1v1H9zM11 4h1v1h-1z"/>
+    <path fill="#405062" d="M5 4h1v1H5zM7 3h1v1H7zM8 4h1v1H8zM10 2h1v1h-1zM12 5h1v1h-1z"/>
+    <path data-accent="" fill="#00FF66" d="M4 9h3v1H4z"/>
+    <path fill="#111D2A" d="M6 13h1v2H6zM8 13h1v2H8zM10 13h1v2h-1z"/>
+</svg>

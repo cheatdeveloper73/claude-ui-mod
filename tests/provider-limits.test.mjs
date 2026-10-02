@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ProviderLimits } from '../router/limits.mjs';
+import { ProviderLimits, sanitizeOpenAI } from '../router/limits.mjs';
 
 function reply(value, status = 200) {
     return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -15,6 +15,17 @@ const WHAM = {
     rate_limit_reset_credits: { available_count: 0 },
     email: 'must-not-escape@example.test',
 };
+
+test('usage-credit eligibility stays independent of full subscription and reset credits', () => {
+    const value=sanitizeOpenAI({...WHAM,rate_limit:{...WHAM.rate_limit,allowed:false,limit_reached:true},
+        credits:{has_credits:true,unlimited:false,overage_limit_reached:false,balance:'42122.6873185000',email:'private'}},'now');
+    assert.equal(value.rateLimit.limitReached,true);
+    assert.equal(value.resetCredits,0);
+    assert.deepEqual(value.credits,{hasCredits:true,unlimited:false,overageLimitReached:false,balance:'42122.6873185000'});
+    assert.equal(sanitizeOpenAI(WHAM,'now').credits,null);
+    assert.deepEqual(sanitizeOpenAI({...WHAM,credits:{has_credits:'yes',balance:'garbage'}},'now').credits,
+        {hasCredits:null,unlimited:null,overageLimitReached:null,balance:null});
+});
 
 test('OpenAI limits preserve precision and expose no credentials', async () => {
     const calls = [];

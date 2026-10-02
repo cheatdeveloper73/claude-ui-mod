@@ -1,5 +1,5 @@
 import React from 'react';
-import { RAIL_CSS, DASH_CSS, USAGE_CSS } from './generated-css.js';
+import { RAIL_CSS, DASH_CSS, USAGE_CSS, TP_CSS, SA_CSS, Q_CSS } from './generated-css.js';
 
 /* claude.ai's own token values, dark theme, as measured in the running app and
  * recorded in docs/internals.md. The plugin sheets read these, so getting them
@@ -34,6 +34,7 @@ export const TOKENS = `
     --oncolor-100: 0 0% 100%;
     --cui-accent: 14 62% 60%;
     --font-ui: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 `;
 
@@ -45,7 +46,7 @@ body { margin: 0; background: #000; }
 export const Sheets: React.FC = () => (
     <style
         dangerouslySetInnerHTML={{
-            __html: TOKENS + RESET + RAIL_CSS + USAGE_CSS + DASH_CSS,
+            __html: TOKENS + RESET + RAIL_CSS + USAGE_CSS + DASH_CSS + TP_CSS + SA_CSS + Q_CSS,
         }}
     />
 );

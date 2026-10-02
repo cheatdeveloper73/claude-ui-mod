@@ -36,9 +36,22 @@ const STATUS = {
 
 const CSS = `
 :host { all: initial; }
+/* z-index above the subagent rail's 50, and it has to be.
+ *
+ * Both rails are fixed in the same gutter and neither measures the other: this
+ * one grows upward from the composer, the subagent rail grows downward from the
+ * top of the transcript, and a long agent list closes the gap. At equal z-index
+ * the winner was DOM order, and the subagent host is appended later (it is built
+ * on its first poll, after this one installs) — so its rows painted over this
+ * header, and because its .rail is pointer-events:auto across its whole box,
+ * gaps between rows included, it also swallowed the clicks on these buttons.
+ * The task rail is the smaller box and the one with controls in it, so it takes
+ * the overlap. Its own background is opaque, so nothing passes through to the
+ * agent rows underneath. The subagent detail sheet is a modal and lifts its
+ * whole host to 2147483500, which still clears this. */
 .rail {
     position: fixed;
-    z-index: 50;
+    z-index: 60;
     display: flex;
     flex-direction: column;
     box-sizing: border-box;
@@ -113,8 +126,10 @@ const CSS = `
              color: hsl(var(--text-400, 60 3% 45%)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .foot .lnk { all: unset; cursor: pointer; font-size: 10px; color: hsl(var(--accent-100, 210 71% 52%)); }
 
+/* One above .rail. The host is unpositioned, so these two do not stack inside
+   it — they compete in the root stacking context and both had to move. */
 .tip {
-    position: fixed; z-index: 51; box-sizing: border-box;
+    position: fixed; z-index: 61; box-sizing: border-box;
     max-width: 340px; width: max-content; padding: 8px 10px;
     font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
     font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;

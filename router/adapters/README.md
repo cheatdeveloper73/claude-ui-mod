@@ -4,9 +4,11 @@ Drop a directory in here with an `index.mjs` and the router will route to your
 backend. Nothing else registers it — no list to edit, no build step, no restart
 of anything but the router worker.
 
-An empty directory is the normal state. The router ships three arms compiled in
-(Anthropic passthrough, the OpenAI Responses translation, and the
-catalogue-driven compatible-provider forwarder) and needs no adapter to work.
+One adapter ships here: `command-code/`, which serves the Command Code
+open-weight models and is a complete example of a translating adapter. The
+router also has three arms compiled in (Anthropic passthrough, the OpenAI
+Responses translation, and the catalogue-driven compatible-provider forwarder)
+and needs no adapter to work.
 
 **Before you write one, check whether you need one.** If your backend already
 speaks Anthropic Messages at `POST /v1/messages`, add a catalogue entry instead

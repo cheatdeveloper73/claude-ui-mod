@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 
-const rendererSource = fs.readFileSync(path.resolve('src/plugins/thinking-style/renderer.js'), 'utf8');
+import { fileURLToPath } from 'node:url';
+
+const rendererSource = fs.readFileSync(fileURLToPath(new URL('../src/plugins/thinking-style/renderer.js', import.meta.url)), 'utf8');
 
 function textFromHtml(html) {
     return String(html)

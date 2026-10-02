@@ -44,6 +44,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const VERSION = 1;
+export const AGENT_ISOLATION_VERSION = 2;
+
+// Claude Code 2.1.260 subtracts this fixed reserve from every explicit
+// CLAUDE_CODE_AUTO_COMPACT_WINDOW. The router budgets against that real trigger,
+// then leaves Codex's fallback buffer immediately before it.
+export const CLAUDE_AUTO_COMPACT_RESERVE = 33000;
+
+const CONTEXT_RESET_MARKER_RE = /\[\[cuimod:context-reset:v1:([0-9a-fA-F-]{36})\]\]/;
 
 // Every route the extension uses, from ext/history-notes/src/tools.rs:84-96 and
 // extension.rs:122. Pinned as a set because a route appearing or disappearing is
@@ -778,6 +786,46 @@ export function budgetFingerprint(budget)
 
 export const BASELINE_FINGERPRINT = BUDGET_KEYS.join(',');
 
+// Codex keeps two boundaries. The base boundary drives the reminder and
+// fallback prompt. Automatic compaction is delayed by the fallback buffer, so
+// the model gets one last tool-capable round before a forced window reset.
+// Claude Code's explicit window names the latter boundary after its own fixed
+// reserve, so subtract the Codex buffer to recover the base boundary.
+export function contextBudgetLimits(modelLimit, autoCompact, budget, reminders = true)
+{
+    const full = Number(modelLimit);
+    if (!Number.isFinite(full) || full <= 0) return null;
+    const fallback = reminders && typeof budget?.auto_compact_fallback_prompt === 'string'
+        && budget.auto_compact_fallback_prompt
+        ? Math.max(0, Number(budget.auto_compact_fallback_buffer_tokens) || 0)
+        : 0;
+    const configured = autoCompact?.enabled && Number.isFinite(Number(autoCompact.window))
+        ? Math.max(1, Number(autoCompact.window) - CLAUDE_AUTO_COMPACT_RESERVE)
+        : full;
+    const force = Math.min(full, configured);
+    const base = Math.max(1, force - fallback);
+    return {
+        modelLimit: full,
+        baseLimit: base,
+        forceLimit: force,
+        fallbackBuffer: force - base,
+        autoCompactWindow: autoCompact?.window ?? null,
+        autoCompactSource: autoCompact?.source || 'auto',
+    };
+}
+
+export function contextBudgetStatus(used, limits)
+{
+    const tokens = Number(used);
+    if (!limits || !Number.isFinite(tokens)) return null;
+    return {
+        used: tokens,
+        remaining: Math.max(0, limits.baseLimit - tokens),
+        forceRemaining: Math.max(0, limits.forceLimit - tokens),
+        ...limits,
+    };
+}
+
 export function driftReport(budget, removedCounts)
 {
     const fingerprint = budgetFingerprint(budget);
@@ -840,22 +888,93 @@ export function reminderMessage(template, remaining)
     };
 }
 
+export function contextResetSummary(id)
+{
+    if (!/^[0-9a-fA-F-]{36}$/.test(String(id || ''))) throw new Error('invalid context reset id');
+    return `[[cuimod:context-reset:v1:${id}]]`;
+}
+
+function itemText(item)
+{
+    return (item?.content || [])
+        .filter(part => ['input_text', 'output_text'].includes(part?.type))
+        .map(part => part.text || '')
+        .join('\n');
+}
+
+// Claude Code persists a compaction response as a synthetic user message. A
+// context reset response is only an acknowledgement, not conversation state, so
+// remove the matching marker before counting or inference. Unknown markers lose
+// only the marker text; they cannot authorize dropping a whole message.
+export function restoreContextResetInput(input, state)
+{
+    let restored = 0;
+    let degraded = 0;
+    const resetIds = [];
+    const output = [];
+    for (const item of input || [])
+    {
+        const text = itemText(item);
+        const match = CONTEXT_RESET_MARKER_RE.exec(text);
+        if (!match)
+        {
+            output.push(item);
+            continue;
+        }
+        if (state?.clientReset?.id === match[1] || state?.lastClientResetId === match[1])
+        {
+            restored++;
+            resetIds.push(match[1]);
+            continue;
+        }
+        const content = (item.content || []).map(part => {
+            if (!['input_text', 'output_text'].includes(part?.type) || typeof part.text !== 'string') return part;
+            return { ...part, text: part.text.replace(CONTEXT_RESET_MARKER_RE, '').trimStart() };
+        });
+        output.push({ ...item, content });
+        degraded++;
+    }
+    return { input: output, restored, degraded, resetIds };
+}
+
+export function stripContextResetMarkers(body)
+{
+    if (!body || !Array.isArray(body.messages)) return body;
+    let changed = false;
+    const messages = body.messages.filter(message => {
+        const content = typeof message?.content === 'string'
+            ? message.content
+            : Array.isArray(message?.content)
+                ? message.content.filter(part => part?.type === 'text').map(part => part.text || '').join('\n')
+                : '';
+        if (!CONTEXT_RESET_MARKER_RE.test(content)) return true;
+        changed = true;
+        return false;
+    });
+    return changed ? { ...body, messages } : body;
+}
+
 // ----------------------------------------------------- window store ------
 
 const SESSION_RE = /^[0-9a-fA-F-]{8,64}$/;
 
 function userMessageDigest(item)
 {
-    const text = (item?.content || [])
-        .filter(part => part?.type === 'input_text')
-        .map(part => part.text || '')
-        .join('\n');
-    return crypto.createHash('sha256').update(text).digest('hex').slice(0, 32);
+    // Text alone makes every image-only user turn identical and lets two turns
+    // with the same caption but different images authorize the same cut. The
+    // translated Responses content is the stable wire identity we later match.
+    return crypto.createHash('sha256').update(JSON.stringify(item?.content || [])).digest('hex').slice(0, 32);
 }
 
 export function userMessages(input)
 {
     return (input || []).filter(item => item?.type === 'message' && item.role === 'user');
+}
+
+export function windowCutsMatch(left, right)
+{
+    return Number.isInteger(left?.userMessages) && left.userMessages === right?.userMessages
+        && typeof left.digest === 'string' && left.digest === right?.digest;
 }
 
 // A `new_context` call has to make the model's next request start from an empty
@@ -872,9 +991,19 @@ export function applyWindowCut(input, cut)
 {
     if (!cut || !Number.isInteger(cut.userMessages) || cut.userMessages < 1) return { input, applied: false };
     const users = userMessages(input);
-    if (users.length < cut.userMessages) return { input, applied: false, degraded: 'history is shorter than the recorded cut' };
-    const anchor = users[cut.userMessages - 1];
-    if (userMessageDigest(anchor) !== cut.digest) return { input, applied: false, degraded: 'history changed under the recorded cut' };
+    let anchor = users[cut.userMessages - 1];
+    if (!anchor || userMessageDigest(anchor) !== cut.digest)
+    {
+        const matches = users.filter(item => userMessageDigest(item) === cut.digest);
+        if (matches.length !== 1)
+        {
+            const reason = users.length < cut.userMessages
+                ? 'history is shorter than the recorded cut'
+                : matches.length > 1 ? 'window cut anchor is ambiguous' : 'history changed under the recorded cut';
+            return { input, applied: false, degraded: reason };
+        }
+        anchor = matches[0];
+    }
     const at = input.indexOf(anchor);
     if (at === -1) return { input, applied: false, degraded: 'cut anchor is not in this history' };
     const kept = input.slice(at + 1);
@@ -882,6 +1011,47 @@ export function applyWindowCut(input, cut)
     // dropped turn. Keep the tail rather than send an empty window.
     if (!kept.some(item => item?.type === 'message' && item.role === 'user')) return { input, applied: false, degraded: 'cut would remove every user message' };
     return { input: kept, applied: true, dropped: at + 1 };
+}
+
+function emptyActivity()
+{
+    return {
+        turns: 0,
+        hintCalls: 0,
+        modelCalls: 0,
+        noteCalls: 0,
+        historyCalls: 0,
+        resets: 0,
+        modelResets: 0,
+        forcedResets: 0,
+        compactionResets: 0,
+        unattributedResets: 0,
+        failures: 0,
+        lastTurnAt: null,
+        lastModelCallAt: null,
+        lastResetAt: null,
+        lastResetCause: null,
+        budget: null,
+    };
+}
+
+function activityOf(state)
+{
+    const activity = { ...emptyActivity(), ...(state?.activity || {}) };
+    if (!state?.activity && Number(state?.windows) > 1)
+    {
+        activity.resets = Number(state.windows) - 1;
+        activity.unattributedResets = activity.resets;
+    }
+    return activity;
+}
+
+function cutForInput(input, beforeLastUser = false)
+{
+    const users = userMessages(input);
+    const index = users.length - (beforeLastUser ? 2 : 1);
+    if (index < 0) return null;
+    return { userMessages: index + 1, digest: userMessageDigest(users[index]) };
 }
 
 export class WindowStore
@@ -921,13 +1091,28 @@ export class WindowStore
     // The identity the notes store is namespaced by. It is deliberately derived
     // from the Claude Code session and nothing else: hold it stable and notes
     // and history follow the conversation across every window reset.
+    quarantineLegacy(sessionId)
+    {
+        const existing = this.read(sessionId);
+        if (!existing || existing.agentIsolationVersion === AGENT_ISOLATION_VERSION) return existing;
+        return this.ensure(sessionId);
+    }
+
     ensure(sessionId)
     {
         const existing = this.read(sessionId);
-        if (existing) return existing;
+        if (existing?.agentIsolationVersion === AGENT_ISOLATION_VERSION) return existing;
         const windowId = crypto.randomUUID();
+        const now = new Date().toISOString();
+        // Older stores admitted parent and subagent requests under one Claude Code
+        // session id. Subagent requests carry only a boolean marker, so their
+        // agent identity cannot be reconstructed safely. Quarantine that backend
+        // namespace and every cut derived from it; the main transcript remains
+        // intact and starts a clean notes/history identity on its next turn.
         return this.write({
+            ...(existing || {}),
             version: VERSION,
+            agentIsolationVersion: AGENT_ISOLATION_VERSION,
             sessionId,
             storeId: crypto.randomUUID(),
             firstWindowId: windowId,
@@ -936,26 +1121,108 @@ export class WindowStore
             windows: 1,
             installationId: crypto.randomUUID(),
             cut: null,
+            clientReset: null,
+            lastClientResetId: null,
             reminderWindow: null,
-            createdAt: new Date().toISOString(),
+            fallbackWindow: null,
+            threadHint: null,
+            activity: emptyActivity(),
+            ...(existing ? { quarantinedStoreId: existing.storeId || null, quarantinedAt: now } : {}),
+            createdAt: existing?.createdAt || now,
+            updatedAt: now,
+        });
+    }
+
+    recordActivity(sessionId, update)
+    {
+        const state = this.ensure(sessionId);
+        const activity = activityOf(state);
+        update(activity);
+        return this.write({ ...state, activity, updatedAt: new Date().toISOString() });
+    }
+
+    recordTurn(sessionId, { hint = false, failure = false, budget = null, threadHint = null } = {})
+    {
+        const state = this.ensure(sessionId);
+        const activity = activityOf(state);
+        activity.turns++;
+        if (hint) activity.hintCalls++;
+        if (failure) activity.failures++;
+        activity.lastTurnAt = new Date().toISOString();
+        activity.budget = budget;
+        return this.write({
+            ...state,
+            ...(typeof threadHint === 'string' ? { threadHint } : {}),
+            activity,
             updatedAt: new Date().toISOString(),
         });
     }
 
-    rotate(sessionId, input)
+    recordModelCall(sessionId, call, failed = false)
+    {
+        return this.recordActivity(sessionId, activity => {
+            activity.modelCalls++;
+            if (call?.namespace === 'notes') activity.noteCalls++;
+            if (call?.namespace === 'history') activity.historyCalls++;
+            if (failed) activity.failures++;
+            activity.lastModelCallAt = new Date().toISOString();
+        });
+    }
+
+    rotate(sessionId, input, { cause = 'model', beforeLastUser = false, clientResetId = null } = {})
     {
         const state = this.ensure(sessionId);
-        const users = userMessages(input);
+        const cut = cutForInput(input, beforeLastUser);
         const windowId = crypto.randomUUID();
+        const now = new Date().toISOString();
+        const activity = activityOf(state);
+        activity.resets++;
+        if (cause === 'model') activity.modelResets++;
+        if (cause === 'forced') activity.forcedResets++;
+        if (cause === 'compaction') activity.compactionResets++;
+        activity.lastResetAt = now;
+        activity.lastResetCause = cause;
+        // The last measurement describes the retired transcript. Keep the reset
+        // visible immediately, but do not label the old boundary as budget left
+        // in the fresh window before its first routed turn is measured.
+        activity.budget = null;
         return this.write({
             ...state,
             previousWindowId: state.windowId,
             windowId,
             windows: (state.windows || 1) + 1,
-            cut: users.length ? { userMessages: users.length, digest: userMessageDigest(users.at(-1)) } : state.cut,
+            cut: cut || state.cut,
+            clientReset: clientResetId ? { id: clientResetId, cut: cut || state.cut } : null,
             reminderWindow: null,
-            updatedAt: new Date().toISOString(),
+            fallbackWindow: null,
+            activity,
+            updatedAt: now,
         });
+    }
+
+    beginClientReset(sessionId, input)
+    {
+        const state = this.ensure(sessionId);
+        const cut = cutForInput(input);
+        if (state.clientReset && windowCutsMatch(state.clientReset.cut, cut))
+            return { state, id: state.clientReset.id, reused: true };
+        const id = crypto.randomUUID();
+        return { state: this.rotate(sessionId, input, { cause: 'compaction', clientResetId: id }), id, reused: false };
+    }
+
+    acknowledgeClientReset(sessionId, ids)
+    {
+        const state = this.ensure(sessionId);
+        if (!state.clientReset || !ids?.includes(state.clientReset.id)) return state;
+        return this.write({ ...state, cut: null, clientReset: null,
+            lastClientResetId: state.clientReset.id, updatedAt: new Date().toISOString() });
+    }
+
+    clearCut(sessionId, expected)
+    {
+        const state = this.ensure(sessionId);
+        if (!state.cut || !windowCutsMatch(state.cut, expected)) return state;
+        return this.write({ ...state, cut: null, updatedAt: new Date().toISOString() });
     }
 
     claimReminder(sessionId)
@@ -963,6 +1230,14 @@ export class WindowStore
         const state = this.ensure(sessionId);
         if (state.reminderWindow === state.windowId) return false;
         this.write({ ...state, reminderWindow: state.windowId, updatedAt: new Date().toISOString() });
+        return true;
+    }
+
+    claimFallback(sessionId)
+    {
+        const state = this.ensure(sessionId);
+        if (state.fallbackWindow === state.windowId) return false;
+        this.write({ ...state, fallbackWindow: state.windowId, updatedAt: new Date().toISOString() });
         return true;
     }
 
@@ -977,11 +1252,17 @@ export class WindowStore
         const state = sessionId ? this.read(sessionId) : null;
         if (!state) return null;
         return {
+            agentIsolationVersion: state.agentIsolationVersion || null,
+            quarantinedPriorNamespace: typeof state.quarantinedStoreId === 'string',
+            quarantinedAt: state.quarantinedAt || null,
             windowId: state.windowId,
             firstWindowId: state.firstWindowId,
             previousWindowId: state.previousWindowId,
             windows: state.windows || 1,
             cutUserMessages: state.cut?.userMessages ?? null,
+            pendingClientReset: !!state.clientReset,
+            threadHint: typeof state.threadHint === 'string' ? state.threadHint : null,
+            activity: activityOf(state),
             createdAt: state.createdAt,
             updatedAt: state.updatedAt,
         };

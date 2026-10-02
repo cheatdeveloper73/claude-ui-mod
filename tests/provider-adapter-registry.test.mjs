@@ -29,7 +29,7 @@ const kit = { log: message => logged.push(message), stateDir: temp, accountingDi
 const WORKING = `export default function (kit) {
     return {
         id: 'acme', provider: 'acme', limitKey: 'acme',
-        models: [{ id: 'acme-1', name: 'Acme One', efforts: ['low', 'high'] }],
+        models: [{ id: 'acme-1', name: 'Acme One', provider: 'acme-billing', context: 123456, efforts: ['low', 'high'] }],
         claims: (model) => /^(claude-)?acme/i.test(String(model)),
         handle: async () => {},
         count: async () => {},
@@ -91,6 +91,9 @@ test('a broken adapter is recorded and skipped while the rest still load', async
     assert.equal(health.errors.length, 4);
     assert.deepEqual(health.loaded.map(row => row.id), ['acme']);
     assert.equal(health.loaded[0].ready, true);
+    assert.deepEqual(health.loaded[0].modelRoutes, [
+        { id: 'acme-1', provider: 'acme-billing', context: 123456 },
+    ]);
 });
 
 test('one adapter failing at request time cannot empty the others', async () => {

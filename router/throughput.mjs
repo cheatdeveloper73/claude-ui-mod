@@ -27,6 +27,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeUsage } from './telemetry.mjs';
+import { replayJsonl } from './jsonl-archive.mjs';
 
 // A cumulative-token observation series is what makes an intra-response rate
 // curve possible at all. Providers that report usage once, at the end, produce
@@ -88,8 +89,10 @@ function durableAppend(file, line)
 // is the only in-request signal separating the two lanes, and it is why this
 // lives here: it exists to label a measurement, not to route anything.
 //
-// WHICH subagent it was is not in the request at all. That join lives in the CLI
-// transcript and is keyed by the same provider response id recorded here.
+// The body does not identify which subagent sent it. CLI 2.1.260 does provide
+// that identity separately as x-claude-code-agent-id; provider adapters may use
+// the header, while this body-only measurement helper still joins through the
+// provider response id and CLI transcript.
 //
 // Read from the client body, before any provider preparation, because the
 // some provider arms deliberately strip those blocks before they go upstream.
@@ -246,8 +249,21 @@ class Sample
         if (OPENAI_TERMINAL.has(type))
         {
             this.observeTokens(event.response?.usage?.output_tokens);
-            if (this.terminalAt === null) this.terminalAt = this.ledger.now();
+            // A single Anthropic turn may span hidden model-only Responses
+            // rounds. complete() is deferred to the visible terminal, so its
+            // clock must advance with that terminal instead of staying on round 1.
+            this.terminalAt = this.ledger.now();
         }
+    }
+
+    nextOpenAIResponse()
+    {
+        // The durable record is keyed by the final response id. A hidden
+        // model-only response has its own cumulative usage, so carrying that
+        // point into the next response would create a false cross-response curve.
+        this.series = [];
+        this.seriesTruncated = false;
+        this.terminalAt = null;
     }
 
     // Called from the same place the usage ledger is written, so the two files
@@ -344,24 +360,19 @@ export class ThroughputLedger
         this.recent = [];
         this.records = [];
         this.seen = new Set();
+        this.summaryCache = null;
         this.load();
     }
 
     load()
     {
-        let text = '';
-        try { text = fs.readFileSync(this.file, 'utf8'); } catch (_) { return; }
-        for (const line of text.split('\n'))
-        {
-            if (!line.trim()) continue;
-            let record;
-            try { record = JSON.parse(line); } catch (_) { continue; }
-            if (record?.version !== 1 || !record.provider || !record.responseId) continue;
+        replayJsonl(this.file, record => {
+            if (record?.version !== 1 || !record.provider || !record.responseId) return;
             // The series is the one unbounded field. It stays on disk; holding
             // one per historical response is what would make this unbounded too.
             record.series = null;
             this.index(record);
-        }
+        });
     }
 
     index(record)
@@ -372,6 +383,7 @@ export class ThroughputLedger
         this.records.push(record);
         this.recent.push(record);
         if (this.recent.length > this.recentMax) this.recent.shift();
+        this.summaryCache = null;
         return true;
     }
 
@@ -433,6 +445,15 @@ export class ThroughputLedger
     snapshot()
     {
         const now = this.now();
+        // Historical aggregates scan and percentile-sort the full ledger. The
+        // UI polls this endpoint every second, while the ledger can contain
+        // hundreds of thousands of responses. Recompute only when index() adds
+        // a completed response; live samples and recent rows remain fresh on
+        // every poll without pinning the inference worker's event loop.
+        this.summaryCache ||= {
+            providers: summarize(this.records, record => record.provider),
+            models: summarize(this.records, record => record.provider + ':' + record.servedModel),
+        };
         const live = [...this.live.values()].map(sample => sample.snapshot(now));
         for (const entry of live)
         {
@@ -449,8 +470,8 @@ export class ThroughputLedger
             records: this.records.length,
             live,
             recent: this.recent.slice(-40).map(record => ({ ...record, series: undefined })),
-            providers: summarize(this.records, record => record.provider),
-            models: summarize(this.records, record => record.provider + ':' + record.servedModel),
+            providers: this.summaryCache.providers,
+            models: this.summaryCache.models,
         };
     }
 
@@ -461,6 +482,27 @@ export class ThroughputLedger
         const since = Date.parse(options.since || '');
         const until = Date.parse(options.until || '');
         const limit = Math.max(1, Math.min(5000, Number(options.limit) || 500));
+        // The in-app chip asks for the last one (and the visible panel for the
+        // last forty) for one session every second. Scanning and summarizing the
+        // entire historical ledger before slicing those rows made a 186k-record
+        // archive consume a full CPU core. With no analytical filters, walk the
+        // append-only index backward and stop as soon as the requested tail is
+        // complete. These callers consume records only, not global rollups.
+        const tailOnly = !!options.session && limit <= 40
+            && !options.provider && !options.model && typeof options.subagent !== 'boolean'
+            && !Number.isFinite(since) && !Number.isFinite(until);
+        if (tailOnly)
+        {
+            const records = [];
+            for (let i = this.records.length - 1; i >= 0 && records.length < limit; i--)
+            {
+                const record = this.records[i];
+                if (record.sessionId === options.session) records.push({ ...record, series: undefined });
+            }
+            records.reverse();
+            return { version: 1, matched: records.length, returned: records.length, records,
+                providers: [], models: [], sessions: [], lanes: [] };
+        }
         const rows = this.records.filter(record => {
             if (options.session && record.sessionId !== options.session) return false;
             if (options.provider && record.provider !== options.provider) return false;

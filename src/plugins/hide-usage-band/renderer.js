@@ -3,15 +3,40 @@
  * Removes or collapses the weekly limit, session limit, and usage warning bands
  * that appear above the composer input.
  *
- * The desktop injects alert bands into .epitaxy-composer-aux-view /
- * .epitaxy-composer-band when reaching quota (e.g. "Weekly limit reached Get more
- * usage to keep working · Resets Mon, Aug 31, 9:00 AM"). Because React controls
- * className on these nodes, styling is applied via data-attributes tagged by text
- * matching and enforced via a dedicated <style> sheet in document.head.
+ * Because React controls className on these nodes, styling is applied via
+ * data-attributes tagged by text matching and enforced via a dedicated <style>
+ * sheet in document.head.
  *
- * Empty aux container rows are collapsed when all child bands are hidden,
- * preventing orphaned blank margins above the prompt box while keeping git/PR
- * diff rows untouched when present.
+ * WHERE THE BANDS ARE (re-established 2026-09-06 against app-1.46388.4)
+ *
+ * `.epitaxy-composer-aux-view` and `.epitaxy-composer-band` are gone — zero
+ * matches in the live DOM and the strings no longer appear anywhere in the
+ * claude.ai bundle the page loads. Scoping to them made scanBands() iterate an
+ * empty NodeList, so nothing was ever tagged and the sheet had nothing to act
+ * on. That is the whole of the breakage.
+ *
+ * Two anchors replace them, and the union is deliberate:
+ *
+ *   .epitaxy-band-enter   the band component's own class. Read out of the
+ *                         bundle: the band root renders as
+ *                         div{role=status, aria-live=polite,
+ *                         class=`${bg} ${pad} text-body epitaxy-band-enter`}.
+ *                         role/aria-live alone are useless as a selector —
+ *                         four sr-only live regions match them per window.
+ *   composer rows         every row box stacked above `.epitaxy-prompt` inside
+ *                         its own parent, including the children of the
+ *                         `<nav>` that now holds the branch/PR row. Geometry,
+ *                         not class, so a row claude.ai renames or adds
+ *                         tomorrow is still found.
+ *
+ * Both are then gated by the same text match, which is what actually decides.
+ * Scoping is not decoration: session titles in the sidebar match the limit
+ * wording often enough that an unscoped text sweep hides the wrong things —
+ * measured, two false hits in one probe.
+ *
+ * The empty container is hidden outright rather than zero-heighted: the
+ * composer stack is `flex flex-col gap-1.5`, so a collapsed-but-present nav
+ * still contributes its gap.
  */
 'use strict';
 
@@ -34,24 +59,61 @@ ctx.onDispose(cleanupDom);
 
 let cfg = null;
 
+const DEFAULTS = {
+    enabled: false,
+    mode: 'hide',
+    hideWeekly: true,
+    hideSession: true,
+    hideOtherLimits: true,
+    hideButton: true,
+    collapseEmptyContainer: true,
+    dimOpacity: 0.2,
+    customKeywords: '',
+};
+
+// Wordings read out of the claude.ai bundle (index-BhceMCtx.js, 2026-09-06),
+// not invented: the band's message and detail strings are defined there as one
+// table per severity. Each group is what its own filter toggle owns.
+const RE_WEEKLY = [
+    /weekly\s+limit\s+reached/i,
+    /approaching\s+weekly\s+usage\s+limit/i,
+    /weekly\s+limit\s+resets/i,
+    /your\s+weekly\s+limit/i,
+];
+const RE_SESSION = [
+    /session\s+limit\s+reached/i,
+    /approaching\s+session\s+usage\s+limit/i,
+    /session\s+limit\s+resets/i,
+    /(?:5[\s-]hour|hourly)\s+limit/i,
+];
+const RE_OTHER = [
+    /usage\s+limit\s+reached/i,
+    /limit\s+reached/i,                                  // "{model} limit reached"
+    /approaching\s+(?:usage|extra\s+usage|usage\s+credit)\s+limit/i,
+    /you.?ve\s+used\s+\d+%?\s+of\s+your\b.*\blimit/i,
+    /get\s+more\s+usage\s+to\s+keep\s+working/i,
+    /turn\s+on\s+usage\s+credits\s+to\s+keep\s+(?:working|going)/i,
+    /now\s+using\s+(?:usage\s+credits|extra\s+usage)/i,
+    /out\s+of\s+(?:usage|extra\s+usage|usage\s+credits)\b/i,
+    /(?:monthly\s+|org\s+)?spend\s+limit\s+reached/i,
+    /you\s+hit\s+your\s+spend\s+limit/i,
+    /runs\s+on\s+usage\s+credits/i,
+    /switch\s+models\s+to\s+keep\s+working/i,
+];
+
+function anyMatch(list, t) {
+    for (const re of list) if (re.test(t)) return true;
+    return false;
+}
+
 function shouldHideBand(text, v) {
     if (!text || typeof text !== 'string') return false;
     const t = text.trim();
     if (!t) return false;
 
-    if (v.hideWeekly) {
-        if (/weekly\s+limit|weekly\s+usage|limit\s+reached.*resets/i.test(t)) return true;
-        if (/resets\s+(?:mon|tue|wed|thu|fri|sat|sun)/i.test(t)) return true;
-    }
-
-    if (v.hideSession) {
-        if (/(?:5[\s-]hour|hourly|session)\s+limit/i.test(t)) return true;
-    }
-
-    if (v.hideOtherLimits) {
-        if (/(?:usage|rate)\s+limit|approaching\s+limit|exceeded\s+limit/i.test(t)) return true;
-        if (/get\s+more\s+usage\s+to\s+keep\s+working/i.test(t)) return true;
-    }
+    if (v.hideWeekly && anyMatch(RE_WEEKLY, t)) return true;
+    if (v.hideSession && anyMatch(RE_SESSION, t)) return true;
+    if (v.hideOtherLimits && anyMatch(RE_OTHER, t)) return true;
 
     if (v.customKeywords && typeof v.customKeywords === 'string') {
         const words = v.customKeywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
@@ -64,56 +126,84 @@ function shouldHideBand(text, v) {
     return false;
 }
 
-function scanBands() {
-    if (!cfg || !cfg.enabled) {
-        for (const e of document.querySelectorAll('[' + ATTR_BAND + ']')) e.removeAttribute(ATTR_BAND);
-        for (const e of document.querySelectorAll('[' + ATTR_BTN + ']')) e.removeAttribute(ATTR_BTN);
-        for (const e of document.querySelectorAll('[' + ATTR_CONTAINER + ']')) e.removeAttribute(ATTR_CONTAINER);
-        return;
+// Every row box stacked above the prompt, plus the rows inside the <nav> that
+// holds the branch/PR row. The nav itself is never a candidate — tagging it
+// would take the branch row down with the band it contains.
+function composerRows(out) {
+    const prompt = document.querySelector('.epitaxy-prompt');
+    if (!prompt) return;
+    const container = prompt.parentElement;
+    if (!container) return;
+    const promptTop = prompt.getBoundingClientRect().top;
+
+    for (const child of container.children) {
+        if (child === prompt || child.contains(prompt)) continue;
+        const rows = child.tagName === 'NAV' ? Array.from(child.children) : [child];
+        for (const row of rows) {
+            const r = row.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+            if (r.top >= promptTop) continue;   // footer row, popovers, menus
+            out.add(row);
+        }
     }
+}
+
+function clearTags() {
+    for (const e of document.querySelectorAll('[' + ATTR_BAND + ']')) e.removeAttribute(ATTR_BAND);
+    for (const e of document.querySelectorAll('[' + ATTR_BTN + ']')) e.removeAttribute(ATTR_BTN);
+    for (const e of document.querySelectorAll('[' + ATTR_CONTAINER + ']')) e.removeAttribute(ATTR_CONTAINER);
+}
+
+function scanBands() {
+    if (!cfg || !cfg.enabled) { clearTags(); return; }
 
     const v = cfg;
+    const bands = new Set(document.querySelectorAll('.epitaxy-band-enter'));
+    composerRows(bands);
 
-    // Scan composer bands and any composer aux views
-    const bands = document.querySelectorAll('.epitaxy-composer-band, .epitaxy-composer-aux-view > div, [class*="composer-band"]');
-    const checkedContainers = new Set();
+    const tagged = new Set();
+    const containers = new Set();
 
     for (const band of bands) {
-        const text = band.textContent || '';
-        const match = shouldHideBand(text, v);
+        const match = shouldHideBand(band.textContent || '', v);
 
         if (match) {
             band.setAttribute(ATTR_BAND, '1');
+            tagged.add(band);
 
-            // Find any "Get more usage" / action buttons inside
             if (v.hideButton || v.mode === 'button_only') {
                 const btns = band.querySelectorAll('button, a[role="button"]');
                 for (const b of btns) {
-                    if (/get\s+more|upgrade|usage/i.test(b.textContent || '')) {
+                    if (/get\s+more|upgrade|usage|buy\s+credits|keep\s+working|switch\s+models|turn\s+on|request/i.test(b.textContent || '')) {
                         b.setAttribute(ATTR_BTN, '1');
                     }
                 }
             }
         } else {
             if (band.hasAttribute(ATTR_BAND)) band.removeAttribute(ATTR_BAND);
-            if (band.hasAttribute(ATTR_BTN)) band.removeAttribute(ATTR_BTN);
+            for (const b of band.querySelectorAll('[' + ATTR_BTN + ']')) b.removeAttribute(ATTR_BTN);
         }
 
-        const parent = band.closest('.epitaxy-composer-aux-view');
-        if (parent) checkedContainers.add(parent);
+        const parent = band.parentElement;
+        if (parent && parent.tagName === 'NAV') containers.add(parent);
     }
 
-    // Collapse empty parent aux container if all visible children are hidden bands
-    if (v.collapseEmptyContainer) {
-        for (const container of checkedContainers) {
-            const children = Array.from(container.children).filter((c) => {
-                const cs = window.getComputedStyle(c);
-                return cs && cs.display !== 'none' && cs.visibility !== 'hidden';
-            });
-            const allHidden = children.length > 0 && children.every((c) => c.hasAttribute(ATTR_BAND));
-            if (allHidden) container.setAttribute(ATTR_CONTAINER, '1');
-            else container.removeAttribute(ATTR_CONTAINER);
-        }
+    // A band that scrolled out of the composer keeps its attribute otherwise.
+    for (const e of document.querySelectorAll('[' + ATTR_BAND + ']')) {
+        if (!tagged.has(e)) e.removeAttribute(ATTR_BAND);
+    }
+
+    for (const container of containers) {
+        const children = Array.from(container.children).filter((c) => {
+            if (c.hasAttribute(ATTR_BAND)) return true;   // hidden by us, still counts
+            const cs = window.getComputedStyle(c);
+            return cs && cs.display !== 'none' && cs.visibility !== 'hidden';
+        });
+        const allHidden = v.collapseEmptyContainer
+            && children.length > 0
+            && children.every((c) => c.hasAttribute(ATTR_BAND));
+        if (allHidden) container.setAttribute(ATTR_CONTAINER, '1');
+        else container.removeAttribute(ATTR_CONTAINER);
     }
 }
 
@@ -174,15 +264,13 @@ function generateCss(v) {
 `;
     }
 
+    // The composer stack is `flex flex-col gap-1.5`, so a zero-height container
+    // still contributes its gap above the prompt. Take it out of layout.
     let containerRules = '';
     if (v.collapseEmptyContainer) {
         containerRules = `
 [${ATTR_CONTAINER}="1"] {
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-    min-height: 0 !important;
-    height: 0 !important;
-    overflow: hidden !important;
+    display: none !important;
 }
 `;
     }
@@ -191,8 +279,10 @@ function generateCss(v) {
 }
 
 function apply(v) {
-    cfg = v;
-    style.textContent = generateCss(v);
+    // Stored settings only carry keys the panel has written, so a filter the
+    // user never touched arrives undefined and would read as off.
+    cfg = Object.assign({}, DEFAULTS, v);
+    style.textContent = generateCss(cfg);
     scanBands();
 }
 
@@ -208,17 +298,7 @@ const spec = {
     plugin: 'hide-usage-band',
     title: 'Usage band cleaner',
     description: 'Hides or collapses weekly limit reached and quota warning bands above the composer.',
-    defaults: {
-        enabled: false,
-        mode: 'hide',
-        hideWeekly: true,
-        hideSession: true,
-        hideOtherLimits: true,
-        hideButton: true,
-        collapseEmptyContainer: true,
-        dimOpacity: 0.2,
-        customKeywords: '',
-    },
+    defaults: DEFAULTS,
     controls: [
         { key: 'enabled', type: 'toggle', label: 'Enabled',
           hint: 'Turn off to restore stock composer warning bands.', group: 'Behavior' },

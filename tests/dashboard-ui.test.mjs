@@ -172,9 +172,41 @@ function snapshot()
     };
 }
 
+const usageRequests = ui => ui.requests.filter(request => String(request.url).startsWith('/usage/api'));
+const poolPinRequests = ui => ui.requests.filter(request => String(request.url) === '/poolpinz');
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+function response(status, value)
+{
+    return { status, ok: status >= 200 && status < 300, json: async () => value };
+}
+
+function poolStatus(overrides = {})
+{
+    return {
+        version: 1,
+        label: 'Fixture account pool',
+        mode: 'auto',
+        targetAccountId: null,
+        appliedAccountId: null,
+        applied: true,
+        targetAccountName: null,
+        appliedAccountName: null,
+        accounts: [
+            { id: 1, name: 'Account 1', status: 'active', schedulable: true, rateLimitedAt: null, rateLimitResetAt: null },
+            { id: 2, name: 'Account 2', status: 'active', schedulable: false, rateLimitedAt: null, rateLimitResetAt: null },
+        ],
+        snapshotAt: null,
+        appliedAt: null,
+        error: null,
+        ...overrides,
+    };
+}
+
 test('website boots when browser storage is blocked', () => {
     const ui = harness();
-    assert.equal(ui.requests.length, 1);
+    assert.equal(usageRequests(ui).length, 1);
+    assert.equal(poolPinRequests(ui).length, 1);
     assert.doesNotThrow(() => ui.run('toggleTheme()'));
     assert.equal(ui.document.documentElement.dataset.theme, 'light');
 });
@@ -274,11 +306,11 @@ test('reconciled row copy handlers use the latest record and fire once', async (
 
 test('latest range request wins even if the cancelled fetch resolves last', async () => {
     const ui = harness();
-    const first = ui.requests[0];
+    const first = usageRequests(ui)[0];
     const secondLoad = ui.run("state.range = 'today'; load()");
     assert.equal(first.options.signal.aborted, true);
     const current = snapshot(); current.range.key = 'today';
-    ui.requests[1].resolve({ ok: true, json: async () => current });
+    usageRequests(ui).at(-1).resolve({ ok: true, json: async () => current });
     await secondLoad;
     first.resolve({ ok: true, json: async () => snapshot() });
     await new Promise(resolve => setImmediate(resolve));
@@ -327,8 +359,66 @@ test('fractional published rates remain distinguishable from free tokens', () =>
 test('repeated refresh actions do not restart an in-flight request', async () => {
     const ui = harness();
     await ui.run('load(true)');
-    assert.equal(ui.requests.length, 1);
-    assert.equal(ui.requests[0].options.signal.aborted, false);
+    assert.equal(usageRequests(ui).length, 1);
+    assert.equal(poolPinRequests(ui).length, 1);
+    assert.equal(usageRequests(ui)[0].options.signal.aborted, false);
+});
+
+test('optional pool control hides when unsupported and renders generic account choices when available', async () => {
+    const unsupported = harness();
+    poolPinRequests(unsupported)[0].resolve(response(501, { error: { type: 'not_supported_error' } }));
+    await settle();
+    assert.equal(unsupported.get('#pool-pin').hidden, true);
+    unsupported.data(snapshot());
+    assert.match(unsupported.get('#kpis').textContent, /12 responses/, 'unrelated dashboard rendering still works');
+
+    const ui = harness();
+    poolPinRequests(ui)[0].resolve(response(200, poolStatus()));
+    await settle();
+    const root = ui.get('#pool-pin');
+    assert.equal(root.hidden, false);
+    assert.match(root.textContent, /Fixture account pool/);
+    assert.match(root.textContent, /Auto/);
+    assert.match(root.textContent, /Account 1/);
+    assert.match(root.textContent, /Account 2/);
+
+    const account2 = root.children[1].children.find(button => button.dataset.accountId === '2');
+    root.dispatch('click', { target: account2 });
+    const pinPost = poolPinRequests(ui).find(request => request.options?.method === 'POST');
+    assert.deepEqual(JSON.parse(pinPost.options.body), { action: 'pin', id: 2 });
+    const pinned = poolStatus({ mode: 'pinned', targetAccountId: 2, appliedAccountId: 2, applied: true,
+        targetAccountName: 'Account 2', appliedAccountName: 'Account 2' });
+    pinPost.resolve(response(200, pinned));
+    await settle();
+    poolPinRequests(ui).at(-1).resolve(response(200, pinned));
+    await settle();
+
+    const auto = root.children[1].children.find(button => button.dataset.poolPinAction === 'auto');
+    root.dispatch('click', { target: auto });
+    const posts = poolPinRequests(ui).filter(request => request.options?.method === 'POST');
+    assert.deepEqual(JSON.parse(posts.at(-1).options.body), { action: 'auto' });
+    posts.at(-1).resolve(response(200, poolStatus()));
+    await settle();
+    poolPinRequests(ui).at(-1).resolve(response(200, poolStatus()));
+    await settle();
+    assert.match(root.textContent, /Mode: Auto/);
+});
+
+test('pool control renders an application error without breaking the dashboard', async () => {
+    const ui = harness();
+    poolPinRequests(ui)[0].resolve(response(200, poolStatus()));
+    await settle();
+    ui.data(snapshot());
+    const root = ui.get('#pool-pin');
+    const account2 = root.children[1].children.find(button => button.dataset.accountId === '2');
+    root.dispatch('click', { target: account2 });
+    const post = poolPinRequests(ui).find(request => request.options?.method === 'POST');
+    post.resolve(response(502, { error: { type: 'upstream_error', message: 'fixture verification failed' } }));
+    await settle();
+    poolPinRequests(ui).at(-1).resolve(response(200, poolStatus()));
+    await settle();
+    assert.match(root.textContent, /fixture verification failed/);
+    assert.match(ui.get('#kpis').textContent, /12 responses/);
 });
 
 test('unknown quota values stay unknown and never produce invalid widths', () => {

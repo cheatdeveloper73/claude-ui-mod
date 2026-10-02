@@ -11,6 +11,12 @@
  *              plus the controls for it. Opened by clicking a rail row, and it
  *              grows out of that row rather than cutting to a new screen.
  *
+ *   The chat   what passed between that agent and its direct parent — the
+ *              assignment, SendMessage traffic both ways, the final report —
+ *              drawn in the gutter left of the transcript as the app draws its
+ *              own conversation. It sits beside the transcript, never instead
+ *              of it, and is simply absent when the window leaves no gutter.
+ *
  * Colour carries one meaning: running. Everything else is the app's own neutral
  * ramp, and agent types are told apart by their names rather than by hues
  * assigned from a hash.
@@ -49,50 +55,77 @@ const RAIL_MIN = 196;
 // and out of the app's own session state (see refresh), so there is no
 // threshold to tune; the rest of these are implementation numbers, not tastes.
 const POLL_MS = 2000;
+const SESSION_GAP_MS = 5000;
 const TAIL_LINES = 5;
 const MAX_TURNS = 400;
 const GAP_MS = 90000;
 const MEASURE_FALLBACK = 760;
+// The chat's column: narrower than CHAT_MIN and a message is a word per line,
+// wider than CHAT_MAX and it stops reading as a column beside the transcript.
+const CHAT_MIN = 250;
+const CHAT_MAX = 440;
+const CHAT_GAP = 36;
+const CHAT_PAGE = 60;
+const CHAT_CLAMP = 280;      // px of message before it folds behind "show more"
 
 // ------------------------------------------------------------------ state
 let cliSid = null;
 let agents = [];
-let defs = {};
+let defs = {}, defsAt = 0;
+const DEFS_MS = 30000;
 let detailId = null;         // agent shown in the sheet, or null
 let showAll = false;
 let railOff = false;         // hidden by the hotkey for this session
 let loading = false;
 let lastErr = null;
+let sessionGap = false;
+let sessionGapTimer = null;
 let armedStop = null;
 let armedTimer = null;
 
 const details = new Map();   // agentId -> detail payload
 const pendingDetail = new Set();
 
+// The chat belongs to one agent at a time. chatSeq retires any thread request
+// still in flight when the sheet moves to another agent or closes.
+let chatItems = [], chatEarlier = 0, chatParent = 'main';
+let chatSeq = 0, chatBusy = false;
+
 // Live DOM the renderer patches rather than rebuilds.
 let railEl = null, railCap = null, capTxt = null, railDemo = null;
 let railBody = null, runBox = null, doneBox = null, moreEl = null, emptyEl = null;
 let sheetEl = null, sheetInner = null, scrimEl = null;
+let chatEl = null, chatBody = null, chatList = null, chatMore = null;
 const runEls = new Map();    // agentId -> row
 const doneEls = new Map();
+const chatEls = new Map();   // message id -> node
 
 const STOP_TASK = cuimod.eipc('claude.web', 'LocalSessions', 'stopTask');
 const GET_SESSION = cuimod.eipc('claude.web', 'LocalSessions', 'getSession');
 
-/* Whether an agent is running is answered in two parts, neither of them a timer.
+/* Whether an agent is running is answered in three parts, none of them a timer.
  *
  * main.js reads the agent's own transcript: a terminal stop_reason on the last
- * line means it finished, an interruption marker means it was stopped, and
- * anything else means the CLI still owes it a write. Over the 142 agents of one
- * real session that settles 137 of them outright.
+ * line means it finished, an interruption marker means it was stopped.
  *
- * The remainder are files that end mid-turn, which is what a hard kill leaves
- * behind and also what a live agent looks like. Only the CLI can tell those
- * apart, and the app publishes exactly the bit needed: hasBackgroundActivity on
- * the session record, which is its own hasLiveBackgroundTasks. If the session
- * that owns the agent has no live background task, nothing is running in it.
- * (activeBackgroundTasks itself, the per-task map, is stripped from the record
- * the renderer receives — checked against app-1.26832.0.) */
+ * Anything else means the CLI still owes that file a write — which is what a
+ * hard kill leaves behind, what a live agent looks like, and, far more often
+ * than the original measurement suggested, what a perfectly finished agent
+ * looks like too. So main.js then reads the parent's own <task-notification>
+ * records, which are the CLI stating that a named agent stopped. In two
+ * measured sessions that took the unresolved residue from 13 of 16 to 0, and
+ * from 22 of 97 to 8 — the 8 being every agent that had written within three
+ * minutes.
+ *
+ * What survives both is an agent with no notification the parent can see, which
+ * in practice means a nested one. For those the app publishes the only bit
+ * available: hasBackgroundActivity on the session record, which is its own
+ * hasLiveBackgroundTasks. If the session that owns the agent has no live
+ * background task, nothing is running in it. (activeBackgroundTasks itself, the
+ * per-task map, is stripped from the record the renderer receives — checked
+ * against app-1.26832.0.) That flag is session-wide, so it must stay a last
+ * resort: applied to a large residue it marks every dead agent running at once,
+ * which is the failure this was rebuilt to remove. */
 async function backgroundActivity() {
     try {
         const local = (location.pathname.match(/local_[0-9a-f-]{36}/) || [null])[0];
@@ -122,7 +155,19 @@ function dur(ms) {
 const ts = (v) => (v ? Date.parse(v) : null);
 const hhmm = (ms) => (Number.isFinite(ms) ? new Date(ms).toTimeString().slice(0, 5) : '—');
 const clock = (ms) => (Number.isFinite(ms) ? new Date(ms).toTimeString().slice(0, 8) : '');
+// BEGIN definition pin
 const shortModel = (m) => String(m || '').replace(/^claude-/, '').replace(/-\d{8}$/, '');
+// What a definition pins, as "model · effort", beside its name. This is the
+// definition's own frontmatter, not what the transcript later reports, so it
+// is known the moment the agent is. A context tag ("[1m]") and an effort
+// already folded into the id ("gpt-6.1-sol:high") are dropped from the model.
+function defPin(type) {
+    const d = type && defs[type];
+    if (!d) return '';
+    const model = d.model ? shortModel(String(d.model).replace(/\[[^\]]*\]/g, '').replace(/:.*$/, '')) : '';
+    return [model, d.effort].filter(Boolean).join(' · ');
+}
+// END definition pin
 const STRIP = /`([^`]*)`|\*\*([^*]*)\*\*/g;
 // A one-liner is plain text. Leaving the source markup in shows the reader
 // literal asterisks and backticks in the one place there is no room for them.
@@ -144,94 +189,94 @@ const NLC = String.fromCharCode(10);
 const MOCK_T0 = Date.now();
 const MOCK_LIVE = 3;
 const MOCK = [
-    { n: 'rv-physics', t: 'reviewer', m: 'claude-opus-5', e: 'high', ago: 892000, ran: 0,
-      tool: 'Bash', last: 'Checking the solver pool against the binary',
-      brief: 'Review the joint solver rewrite against the reference implementation.' },
-    { n: 'rv-wire', t: 'reviewer', m: 'claude-opus-5', e: 'high', ago: 631000, ran: 0,
-      tool: 'Read', last: 'Reading the packed struct definitions for the delta channel',
-      brief: 'Audit the wire format changes for client/server type agreement.' },
-    { n: 'rd-audio', t: 'reader', m: 'claude-sonnet-5', e: 'medium', ago: 148000, ran: 0,
-      tool: 'Grep', last: 'Locating every call into the mixer ring buffer',
-      brief: 'Read the DSP mixer end to end and report its buffering contract.' },
-    { n: 'rd-mco', t: 'worker-med', m: 'claude-sonnet-5', e: 'medium', ago: 2280000, ran: 668000,
+    { n: 'rv-scheduler', t: 'reviewer', m: 'claude-opus-5-5', e: 'high', ago: 892000, ran: 0,
+      tool: 'Bash', last: 'Checking the backoff table against the spec',
+      brief: 'Review the retry scheduler rewrite against the reference implementation.' },
+    { n: 'rv-protocol', t: 'reviewer', m: 'claude-opus-5-5', e: 'high', ago: 631000, ran: 0,
+      tool: 'Read', last: 'Reading the frame definitions for the delta channel',
+      brief: 'Audit the protocol changes for client/server type agreement.' },
+    { n: 'rd-cache', t: 'reader', m: 'claude-sonnet-5-5', e: 'medium', ago: 148000, ran: 0,
+      tool: 'Grep', last: 'Locating every call into the eviction queue',
+      brief: 'Read the cache layer end to end and report its eviction contract.' },
+    { n: 'doc-sync', t: 'writer', m: 'claude-sonnet-5-5', e: 'medium', ago: 2280000, ran: 668000,
       tool: 'Write', last: 'Landed. Section written, 12 symbols cross-checked against the write journal.',
-      brief: 'Document the map-chunk order subsystem.' },
-    { n: 'rd-keys', t: 'worker-med', m: 'claude-sonnet-5', e: 'medium', ago: 2280000, ran: 586000,
+      brief: 'Document the sync subsystem.' },
+    { n: 'doc-config', t: 'writer', m: 'claude-sonnet-5-5', e: 'medium', ago: 2280000, ran: 586000,
       tool: 'Bash', last: 'File is untracked (new doc, not previously committed) — expected, no diff to show.',
-      brief: 'Write the input-binding reference.' },
-    { n: 'rd-net-phys', t: 'worker-med', m: 'claude-sonnet-5', e: 'medium', ago: 2280000, ran: 712000,
-      tool: 'Read', last: 'Prediction and reconciliation both documented; three open questions listed at the end.',
-      brief: 'Document netcode prediction against the physics tick.' },
-    { n: 'rv-parts', t: 'reviewer', m: 'claude-opus-5', e: 'high', ago: 4100000, ran: 1491000, stopped: true,
-      tool: 'Grep', last: 'Two real defects, one of them a lifetime bug in the emitter pool. Details inline.',
-      brief: 'Review the particle system refactor.' },
-    { n: 'rv-physics2', t: 'reviewer', m: 'claude-opus-5', e: 'high', ago: 4180000, ran: 1502000,
+      brief: 'Write the configuration reference.' },
+    { n: 'doc-session', t: 'writer', m: 'claude-sonnet-5-5', e: 'medium', ago: 2280000, ran: 712000,
+      tool: 'Read', last: 'Resumption and reconciliation both documented; three open questions listed at the end.',
+      brief: 'Document session resumption against the clock tick.' },
+    { n: 'rv-pool', t: 'reviewer', m: 'claude-opus-5-5', e: 'high', ago: 4100000, ran: 1491000, stopped: true,
+      tool: 'Grep', last: 'Two real defects, one of them a lifetime bug in the lease pool. Details inline.',
+      brief: 'Review the connection pool refactor.' },
+    { n: 'rv-scheduler2', t: 'reviewer', m: 'claude-opus-5-5', e: 'high', ago: 4180000, ran: 1502000,
       tool: 'Read', last: 'No defects that survive verification. One nit about an unused parameter.',
-      brief: 'Second pass over the joint solver.' },
-    { n: 'bench-frame', t: 'bench', m: 'claude-sonnet-5', e: 'medium', ago: 5900000, ran: 402000,
-      tool: 'Bash', last: 'ground 8.64ms -> 7.01ms; torch 280ms -> 255ms; air not run.',
-      brief: 'A/B the frame cost of the new culling path.' },
-    { n: 'mech-rename', t: 'mechanic', m: 'claude-haiku-4-5', e: 'low', ago: 6100000, ran: 41000, stopped: true,
+      brief: 'Second pass over the retry scheduler.' },
+    { n: 'bench-parse', t: 'tester', m: 'claude-sonnet-5-5', e: 'medium', ago: 5900000, ran: 402000,
+      tool: 'Bash', last: 'small 8.64ms -> 7.01ms; large 280ms -> 255ms; streaming not run.',
+      brief: 'A/B the parse cost of the new fast path.' },
+    { n: 'ed-rename', t: 'editor', m: 'claude-haiku-4-5', e: 'low', ago: 6100000, ran: 41000, stopped: true,
       tool: 'Edit', last: 'Renamed in 4 files. Build clean.',
-      brief: 'Rename g_snd_mix to g_audio_mix throughout.' },
-    { n: 'rd-vk-desc', t: 'reader', m: 'claude-sonnet-5', e: 'medium', ago: 7300000, ran: 903000,
-      tool: 'Read', last: 'Descriptor sets are allocated per-frame from a ring; the pool is never reset mid-frame.',
-      brief: 'Read the Vulkan descriptor allocation path.' },
-    { n: 'rd-cuda', t: 'reader', m: 'claude-sonnet-5', e: 'medium', ago: 7400000, ran: 1120000,
-      tool: 'Bash', last: 'The OptiX pipeline is rebuilt on every material edit. That is the stall.',
-      brief: 'Read the OptiX pipeline build path and find the stall.' },
-    { n: 'wk-lightmap', t: 'worker', m: 'claude-opus-5', e: 'high', ago: 9200000, ran: 2410000,
+      brief: 'Rename retry_cfg to backoff_cfg throughout.' },
+    { n: 'rd-buffers', t: 'reader', m: 'claude-sonnet-5-5', e: 'medium', ago: 7300000, ran: 903000,
+      tool: 'Read', last: 'Buffers are allocated per-request from a ring; the pool is never reset mid-request.',
+      brief: 'Read the buffer allocation path.' },
+    { n: 'rd-index', t: 'reader', m: 'claude-sonnet-5-5', e: 'medium', ago: 7400000, ran: 1120000,
+      tool: 'Bash', last: 'The index is rebuilt on every schema edit. That is the stall.',
+      brief: 'Read the index build path and find the stall.' },
+    { n: 'wk-cache', t: 'worker', m: 'claude-opus-5-5', e: 'high', ago: 9200000, ran: 2410000,
       tool: 'Bash', last: 'Landed on a worktree, tests green, 3 commits. Stopped once and resumed.',
-      brief: 'Implement the lightmap bake cache.' },
-    { n: 'wk-ui-rail', t: 'worker', m: 'claude-opus-5', e: 'high', ago: 9600000, ran: 1880000,
+      brief: 'Implement the result cache.' },
+    { n: 'wk-ui-rail', t: 'worker', m: 'claude-opus-5-5', e: 'high', ago: 9600000, ran: 1880000,
       tool: 'Write', last: 'Done. The rail now measures the gutter instead of assuming it.',
       brief: 'Rework the rail positioning to be sidebar-aware.' },
 ];
 
 const MOCK_SCRIPT = [
-    { k: 'user', p: [{ t: 'text', text: 'Read the joint solver and review the rewrite against the reference implementation. Report defects with file:line.' }] },
-    { k: 'assistant', p: [{ t: 'text', text: 'Starting from the solver entry point and following the call chain out.' },
-                          { t: 'tool', name: 'Read', input: 'file_path: src/physics/solver_joint.cpp' }] },
+    { k: 'user', p: [{ t: 'text', text: 'Read the retry scheduler and review the rewrite against the reference implementation. Report defects with file:line.' }] },
+    { k: 'assistant', p: [{ t: 'text', text: 'Starting from the scheduler entry point and following the call chain out.' },
+                          { t: 'tool', name: 'Read', input: 'file_path: src/net/scheduler_retry.cpp' }] },
     { k: 'user', p: [{ t: 'result', text: [
-        '     1  #include "solver_joint.h"',
-        '     2  #include "body_pool.h"',
-        '     3  #include "profile.h"',
+        '     1  #include "scheduler_retry.h"',
+        '     2  #include "lease_pool.h"',
+        '     3  #include "trace.h"',
         '     4',
-        '     5  #define JOINT_ITERS 8',
+        '     5  #define RETRY_ITERS 8',
         '     6',
-        '     7  void solve_joint_batch(joint_batch_t *b, float dt)',
+        '     7  void run_retry_batch(retry_batch_t *b, float dt)',
         '     8  {',
-        '     9      PROFILE_SCOPE("joint");',
+        '     9      TRACE_SCOPE("retry");',
         '    10      const float inv_dt = 1.0f / dt;',
         '    11',
         '    12      for (uint32_t i = 0; i < b->count; ++i)',
         '    13      {',
-        '    14          joint_t *j = &b->joints[i];',
-        '    15          body_t *a = body_from_handle(j->a);',
-        '    16          body_t *c = body_from_handle(j->b);',
+        '    14          retry_t *j = &b->retries[i];',
+        '    15          lease_t *a = lease_from_handle(j->a);',
+        '    16          lease_t *c = lease_from_handle(j->b);',
         '    17          if (!a || !c) continue;',
         '    18',
-        '    19          for (int it = 0; it < JOINT_ITERS; ++it)',
-        '    20              solve_one(j, a, c, inv_dt);',
+        '    19          for (int it = 0; it < RETRY_ITERS; ++it)',
+        '    20              retry_one(j, a, c, inv_dt);',
         '    21      }',
         '    22  }',
     ].join(NLC) }] },
-    { k: 'assistant', p: [{ t: 'tool', name: 'Grep', input: 'pattern: solve_joint_batch, output_mode: content' }] },
-    { k: 'user', p: [{ t: 'result', text: 'src/physics/step.cpp:214:    solve_joint_batch(&g_joints, dt);\nsrc/physics/step.cpp:281:    solve_joint_batch(&g_joints_soft, dt * 0.5f);' }] },
+    { k: 'assistant', p: [{ t: 'tool', name: 'Grep', input: 'pattern: run_retry_batch, output_mode: content' }] },
+    { k: 'user', p: [{ t: 'result', text: 'src/net/tick.cpp:214:    run_retry_batch(&g_retries, dt);\nsrc/net/tick.cpp:281:    run_retry_batch(&g_retries_soft, dt * 0.5f);' }] },
     { k: 'assistant', p: [{ t: 'text', text: 'Two call sites, and the second halves `dt` without halving the iteration count. That is the first thing to check against the reference.' },
-                          { t: 'tool', name: 'Bash', input: 'python tools/ida/smq.py xref 0x86C510' }] },
-    { k: 'user', p: [{ t: 'result', text: '0x86C510  solve_joint_batch\n  called from 0x8701A2 (physics_step)\n  called from 0x870455 (physics_step_soft)' }] },
+                          { t: 'tool', name: 'Bash', input: 'python tools/xref.py run_retry_batch' }] },
+    { k: 'user', p: [{ t: 'result', text: 'run_retry_batch\n  called from tick (src/net/tick.cpp:214)\n  called from tick_soft (src/net/tick.cpp:281)' }] },
     { k: 'gap', ms: 252000 },
-    { k: 'assistant', p: [{ t: 'text', text: 'Resumed. Picking up at the soft-body path.' },
-                          { t: 'tool', name: 'Read', input: 'file_path: src/physics/solver_soft.cpp, offset: 180, limit: 60' }] },
-    { k: 'user', p: [{ t: 'result', text: '  180      const float inv_dt = 1.0f / dt;\n  181      // NOTE: iterations tuned for 60hz\n  182      for (int it = 0; it < JOINT_ITERS; ++it)' }] },
-    { k: 'assistant', p: [{ t: 'text', text: 'Confirmed: `JOINT_ITERS` is a compile-time constant, so the halved `dt` at `src/physics/step.cpp:281` doubles the effective stiffness instead of holding it. The reference scales iterations with dt.' },
-                          { t: 'tool', name: 'Bash', input: 'git log -S JOINT_ITERS --oneline -- src/physics' }] },
-    { k: 'user', p: [{ t: 'result', text: 'a41c9de  physics: tune joint iterations for 60hz\n7b2210f  physics: initial soft body pass' }] },
-    { k: 'assistant', p: [{ t: 'text', text: 'One defect, confirmed against both the source and the binary. Writing it up.' },
-                          { t: 'tool', name: 'Write', input: 'file_path: reports/joint-solver-review.md' }] },
+    { k: 'assistant', p: [{ t: 'text', text: 'Resumed. Picking up at the soft-retry path.' },
+                          { t: 'tool', name: 'Read', input: 'file_path: src/net/retry_soft.cpp, offset: 180, limit: 60' }] },
+    { k: 'user', p: [{ t: 'result', text: '  180      const float inv_dt = 1.0f / dt;\n  181      // NOTE: iterations tuned for 60hz\n  182      for (int it = 0; it < RETRY_ITERS; ++it)' }] },
+    { k: 'assistant', p: [{ t: 'text', text: 'Confirmed: `RETRY_ITERS` is a compile-time constant, so the halved `dt` at `src/net/tick.cpp:281` doubles the effective retry pressure instead of holding it. The reference scales iterations with dt.' },
+                          { t: 'tool', name: 'Bash', input: 'git log -S RETRY_ITERS --oneline -- src/net' }] },
+    { k: 'user', p: [{ t: 'result', text: 'a41c9de  net: tune retry iterations for 60hz\n7b2210f  net: initial soft retry pass' }] },
+    { k: 'assistant', p: [{ t: 'text', text: 'One defect, confirmed against both the source and the reference trace. Writing it up.' },
+                          { t: 'tool', name: 'Write', input: 'file_path: reports/retry-scheduler-review.md' }] },
     { k: 'user', p: [{ t: 'result', text: 'File written (2,417 bytes).' }] },
-    { k: 'assistant', p: [{ t: 'text', text: '**One real defect.** `src/physics/step.cpp:281` halves `dt` without scaling `JOINT_ITERS`, which doubles effective joint stiffness on the soft-body pass. The reference implementation scales iterations with dt.' + NLC + NLC + 'Everything else in the rewrite matches the reference, including the warm-start path I expected to differ.' }] },
+    { k: 'assistant', p: [{ t: 'text', text: '**One real defect.** `src/net/tick.cpp:281` halves `dt` without scaling `RETRY_ITERS`, which doubles effective retry pressure on the soft-retry pass. The reference implementation scales iterations with dt.' + NLC + NLC + 'Everything else in the rewrite matches the reference, including the warm-start path I expected to differ.' }] },
 ];
 
 function mockList() {
@@ -247,7 +292,9 @@ function mockList() {
             startedAt: new Date(s).toISOString(),
             lastAt: new Date(e).toISOString(),
             lastTool: m.tool, lastText: m.last, brief: m.brief, active,
-            description: m.d || null, depth: 1,
+            description: m.d || null,
+            parentAgentId: i === 1 ? 'mock-0' : (i === 2 ? 'mock-1' : null),
+            depth: i < MOCK_LIVE ? i + 1 : 1,
             state: active ? 'inflight' : (m.stopped ? 'stopped' : 'done'),
         };
     });
@@ -279,13 +326,31 @@ function mockDetail(id) {
         tools, turns,
     };
 }
+// The same agents' side of the conversation: the assignment, one exchange for
+// the first of them, and the report for every one that has finished.
+function mockThread(id) {
+    const i = Number(String(id).split('-')[1]) || 0;
+    const m = MOCK[i] || MOCK[0];
+    const s = MOCK_T0 - m.ago;
+    const at = (ms) => new Date(s + ms).toISOString();
+    const messages = [{ id: id + '-brief', kind: 'brief', dir: 'parent', text: m.brief, at: at(0), status: 'sent' }];
+    if (i === 0) messages.push(
+        { id: id + '-m1', kind: 'message', dir: 'child', at: at(141000), status: 'delivered',
+          text: 'Two call sites for `run_retry_batch`. The soft-body one at `src/net/tick.cpp:281` halves `dt` and keeps `RETRY_ITERS`. Checking the reference before I call it a defect.' },
+        { id: id + '-m2', kind: 'message', dir: 'parent', at: at(188000), status: 'delivered',
+          text: 'Good. Confirm it against the binary, and check whether the warm-start path compensates before reporting.' });
+    if (i >= MOCK_LIVE) messages.push({ id: id + '-report', kind: 'report', dir: 'child', text: m.last, at: at(m.ran), status: 'completed' });
+    const parent = i === 1 ? MOCK[0].n : (i === 2 ? MOCK[1].n : 'main');
+    return { ok: true, messages, total: messages.length, earlier: 0, parentName: parent };
+}
+
 const MOCK_DEFS = {
-    reviewer: { name: 'reviewer', description: 'Cross-review lane. Reviews another agent’s landed work for real defects with full coverage, reports every finding with confidence and severity attached, and never fixes.' },
-    reader: { name: 'reader', description: 'Exhaustive code reader. Reads the prescribed files in full and follows the dependency chain until zero assumptions remain. Read-only.' },
-    'worker-med': { name: 'worker-med', description: 'Implementation lane at medium effort. Carries a self-contained brief through build, verification and landing.' },
-    worker: { name: 'worker', description: 'Implementation lane worker for orchestrated dispatch, on its own worktree.' },
-    bench: { name: 'bench', description: 'Measurement lane. Produces numbers with their conditions attached, and never implements the optimisation it measures.' },
-    mechanic: { name: 'mechanic', description: 'Small scoped tasks at minimal spend. Literal scope, no design risk.' },
+    reviewer: { name: 'reviewer', model: 'claude-opus-5-5', effort: 'medium', description: 'Cross-review lane. Reviews another agent’s landed work for real defects with full coverage, reports every finding with confidence and severity attached, and never fixes.' },
+    reader: { name: 'reader', model: 'claude-sonnet-5-5', effort: 'medium', description: 'Exhaustive code reader. Reads the prescribed files in full and follows the dependency chain until zero assumptions remain. Read-only.' },
+    writer: { name: 'writer', model: 'claude-opus-5-5', effort: 'medium', description: 'Implementation lane at medium effort. Carries a self-contained brief through build, verification and landing.' },
+    worker: { name: 'worker', model: 'claude-opus-5-5', effort: 'high', description: 'Implementation lane worker for orchestrated dispatch, on its own worktree.' },
+    tester: { name: 'tester', model: 'claude-opus-5-5', effort: 'medium', description: 'Measurement lane. Produces numbers with their conditions attached, and never implements the optimisation it measures.' },
+    editor: { name: 'editor', model: 'claude-sonnet-5-5', effort: 'high', description: 'Small scoped tasks at minimal spend. Literal scope, no design risk.' },
 };
 
 // ------------------------------------------------------------------ anchors
@@ -434,12 +499,20 @@ const CSS = () => `
 
 /* ---- a row ---- */
 .row {
+    --tree-indent: 0px; --tree-guide: 9px;
     position: relative; display: grid; grid-template-columns: 7px 1fr auto;
     gap: 8px; align-items: baseline;
+    margin-left: var(--tree-indent);
     padding: 4px 5px 5px; border-radius: 7px; cursor: pointer;
     animation: rowIn var(--d2) var(--e-out);
     transition: background var(--d1) linear, opacity var(--d2) var(--e-out),
                 transform var(--d1) var(--e-out);
+}
+.row.child::before {
+    content: ''; position: absolute; left: calc(var(--tree-guide) * -1); top: -4px;
+    width: max(2px, calc(var(--tree-guide) - 2px)); height: 14px;
+    border-left: 1px solid var(--hair); border-bottom: 1px solid var(--hair);
+    border-bottom-left-radius: 3px; opacity: .8; pointer-events: none;
 }
 .row:hover { transform: translateX(2px); }
 .row.live:hover .dot { box-shadow: 0 0 12px color-mix(in srgb, var(--acc) 85%, transparent); }
@@ -557,7 +630,18 @@ const CSS = () => `
 /* ============================================================== the sheet === */
 .sheet {
     position: fixed; pointer-events: auto; overflow-y: auto; scrollbar-gutter: stable;
+    scrollbar-color: auto;
     opacity: 1; background: var(--bg);
+}
+.sheet::-webkit-scrollbar { width: 11px; }
+.sheet::-webkit-scrollbar-track { background: transparent; }
+.sheet::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 16%, transparent);
+    border-radius: 7px; border: 3px solid transparent; background-clip: padding-box;
+}
+.sheet::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 26%, transparent);
+    background-clip: padding-box;
 }
 .sheet.leaving { animation: sheetOut var(--d2) var(--e-in) both; }
 @keyframes sheetOut { to { opacity: 0; } }
@@ -625,6 +709,7 @@ const CSS = () => `
 .subline > span { display: inline-flex; gap: 5px; }
 .subline > span + span::before { content: '·'; opacity: .45; margin-right: 4px; }
 .subline b { color: var(--fg2); font-weight: 500; }
+.subline .pin { opacity: .75; font-variant-numeric: tabular-nums; }
 
 .grid {
     width: var(--col); max-width: calc(100% - 32px); margin: 0 auto;
@@ -756,6 +841,118 @@ const CSS = () => `
 }
 .seam::before, .seam::after { content: ''; height: 1px; flex: 1 1 auto; background: var(--hair2); }
 .empty { padding: 40px 0; text-align: center; color: var(--fg3); line-height: 1.8; }
+
+/* ================================================================ the chat === */
+/* Drawn the way the app draws its own conversation, because that is the chat
+ * the reader already knows how to read. The parent is the child's user, so its
+ * messages are the app's UserMessage bubble, on the right and at most 85% of
+ * the column; the child answers in unboxed text on the left, as Claude does.
+ *
+ * The bubble's numbers are the app's own, read from ion-dist 2.7032.0:
+ * bg-[var(--cds-bg-user-message)] rounded-card px-lg py-md, where the fill is
+ * --cds-alpha-1 (neutral-900 at 5%), rounded-card is --cds-radius + .25rem,
+ * and every length is scaled by --cds-rem-scale = 16/17. Those tokens live on
+ * .cds-root, which this host is not inside, so the fill is read off .cds-root
+ * when the chat is built (--ubub) and otherwise derived the same way the rest of
+ * this sheet derives its washes: the text colour at 5%.
+ *
+ * A sibling of the sheet, not a child. The sheet is the scroll container and
+ * the chat must stay put while the transcript scrolls; place() pins it to the
+ * gutter between the sheet's left edge and the transcript column. */
+.chat {
+    position: fixed; pointer-events: auto; display: flex; flex-direction: column;
+    animation: chatIn var(--d3) var(--e-out) backwards; animation-delay: 90ms;
+}
+.chat.leaving { animation: chatOut var(--d2) var(--e-in) forwards; }
+@keyframes chatIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes chatOut { to { opacity: 0; } }
+.chat .cbody {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    overscroll-behavior: contain; scrollbar-color: auto; padding: 22px 6px 40px 0;
+}
+.chat .cbody.clipT { -webkit-mask-image: var(--fadeT); mask-image: var(--fadeT); }
+.chat .cbody.clipB { -webkit-mask-image: var(--fadeB); mask-image: var(--fadeB); }
+.chat .cbody.clipT.clipB { -webkit-mask-image: var(--fadeTB); mask-image: var(--fadeTB); }
+.chat .cbody::-webkit-scrollbar { width: 3px; height: 3px; }
+.chat .cbody::-webkit-scrollbar-track { background: transparent; }
+.chat .cbody::-webkit-scrollbar-thumb { background: color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 14%, transparent); border-radius: 2px; }
+.chat .earlier {
+    display: block; margin: 0 auto 18px; font-size: .7em; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--fg3); opacity: .6; cursor: pointer;
+    padding: 4px 8px; border-radius: 7px; transition: opacity var(--d1) linear, background var(--d1) linear;
+}
+.chat .earlier:hover { opacity: 1; background: var(--wash); }
+
+.msg { display: flex; flex-direction: column; min-width: 0; }
+.msg + .msg { margin-top: 20px; }
+.msg.parent { align-items: flex-end; }
+.msg .mwho {
+    display: flex; gap: 7px; align-items: baseline; margin: 0 2px 6px;
+    font-size: .74em; color: var(--fg3); white-space: nowrap; max-width: 100%;
+}
+.msg .mwho b { font-weight: 500; color: var(--fg2); overflow: hidden; text-overflow: ellipsis; }
+.msg .mwho .at { font-variant-numeric: tabular-nums; opacity: .8; }
+.msg .mwho .flag { color: #e58b83; }
+.msg .mwho .tag { letter-spacing: .1em; text-transform: uppercase; font-size: .9em; }
+.msg.child .mwho .tag { color: color-mix(in srgb, var(--acc) 62%, var(--fg2)); }
+/* Agent-to-agent messages are status reports packed into one paragraph. The
+   treatment below is mechanical, not a rewrite: the lead sentence carries the
+   message and is the one bright line; every further sentence starts its own
+   line in the secondary colour; long parenthetical asides step back a level;
+   paths, commits and file names become short monospace tokens. */
+.msg .mtext {
+    position: relative; min-width: 0; max-width: 100%;
+    line-height: 1.55; color: var(--fg2); overflow-wrap: anywhere;
+}
+.msg .mtext .s { display: block; }
+.msg .mtext .s + .s { margin-top: 5px; }
+.msg .mtext .s.lead { color: var(--fg); font-weight: 500; }
+.msg .mtext .aside { color: var(--fg3); }
+.msg .mtext .enum { display: block; padding-left: 20px; position: relative; margin-top: 4px; }
+.msg .mtext .enum > i {
+    position: absolute; left: 0; font-style: normal; color: var(--fg3);
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: .82em;
+}
+.msg .mtext .tok {
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: .84em;
+    color: var(--fg2); background: var(--wash); padding: 0 4px; border-radius: 4px;
+    white-space: pre-wrap;
+}
+.msg .mtext .tok.sha { color: color-mix(in srgb, var(--acc) 60%, var(--fg2)); }
+.msg.parent .mtext {
+    max-width: 85%; padding: calc(.5rem * 16 / 17) calc(.75rem * 16 / 17);
+    border-radius: calc(.625rem * 16 / 17);
+    background: var(--ubub, color-mix(in srgb, hsl(var(--text-100, 60 14% 97%)) 5%, transparent));
+}
+.msg .mtext .para + .para, .msg .mtext pre + .para, .msg .mtext .para + pre { margin-top: 10px; }
+.msg .mtext .hd { font-weight: 600; color: var(--fg); }
+.msg .mtext code {
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: .88em;
+    background: var(--wash); padding: 1px 5px; border-radius: 4px; white-space: pre-wrap;
+}
+.msg .mtext strong { font-weight: 600; }
+.msg .mtext pre {
+    margin: 0; padding: 7px 9px; border-radius: 7px; background: var(--bg2);
+    border: 1px solid var(--hair2); overflow-x: auto; scrollbar-color: auto;
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: .8em;
+    line-height: 1.5; color: var(--fg2); white-space: pre;
+}
+.msg .mtext pre::-webkit-scrollbar { height: 3px; }
+.msg .mtext pre::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 2px; }
+/* A long message folds the way the app folds a long user message: the content
+   inside the bubble is cut at a height and faded out through a mask, so the
+   fold needs no colour of its own and the bubble keeps its fill. */
+.msg .mbody.fold {
+    max-height: ${CHAT_CLAMP}px; overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 3rem), transparent);
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 3rem), transparent);
+}
+.msg .grow {
+    all: unset; margin: 5px 2px 0; font-size: .74em; color: var(--fg3); cursor: pointer;
+    padding: 2px 6px; border-radius: 6px; transition: color var(--d1) linear, background var(--d1) linear;
+}
+.msg .grow:hover { color: var(--fg); background: var(--wash); }
+.msg .grow:focus-visible { outline: 1px solid var(--acc); outline-offset: 1px; }
 `;
 
 // ------------------------------------------------------------------ host
@@ -796,11 +993,12 @@ ctx.onDispose(teardown);
 // cut the mask exists to remove.
 const EDGE = 2;
 function fades() {
-    const n = railBody;
-    if (!n) return;
-    const over = n.scrollHeight - n.clientHeight;
-    n.classList.toggle('clipT', over > EDGE && n.scrollTop > EDGE);
-    n.classList.toggle('clipB', over > EDGE && n.scrollTop < over - EDGE);
+    for (const n of [railBody, chatBody]) {
+        if (!n) continue;
+        const over = n.scrollHeight - n.clientHeight;
+        n.classList.toggle('clipT', over > EDGE && n.scrollTop > EDGE);
+        n.classList.toggle('clipB', over > EDGE && n.scrollTop < over - EDGE);
+    }
 }
 
 let misses = 0;
@@ -866,19 +1064,66 @@ function place() {
             sheetEl.classList.toggle('wide', b.width - col > 300);
         }
     }
+
+    // The gutter is measured, not derived: the grid is centred inside a
+    // scroller that reserves a stable scrollbar gutter, so its left edge is not
+    // (width - col) / 2 of anything this code knows.
+    if (chatEl) {
+        const st = sheetEl && sheetEl.__;
+        const b = sheetEl && sheetEl.style.visibility !== 'hidden' && sheetEl.getBoundingClientRect();
+        const g = st && st.grid.getBoundingClientRect();
+        const h = st && st.hd.getBoundingClientRect();
+        const right = g ? g.left - CHAT_GAP : 0;
+        const left = b ? Math.max(b.left + 24, right - CHAT_MAX) : 0;
+        const set = (k, v) => { if (chatEl.style[k] !== v) chatEl.style[k] = v; };
+        if (!b || !b.width || right - left < CHAT_MIN || !chatItems.length) set('display', 'none');
+        else {
+            set('display', '');
+            set('left', Math.round(left) + 'px');
+            set('top', Math.round(h.bottom) + 'px');
+            set('width', Math.round(right - left) + 'px');
+            set('height', Math.max(0, Math.round(b.bottom - h.bottom)) + 'px');
+            foldChat();
+            const cs = chatEl.__;
+            if (cs.pin) chatBody.scrollTop = chatBody.scrollHeight;
+            else if (cs.anchor) chatBody.scrollTop = cs.anchor.oldTop + chatBody.scrollHeight - cs.anchor.oldH;
+            cs.pin = false; cs.anchor = null;
+            fades();
+        }
+    }
 }
 function dedupe() {
     for (const n of document.querySelectorAll('#cuimod-subagents')) if (n !== host) { try { n.remove(); } catch (_) {} }
 }
 
 // ------------------------------------------------------------------ data
+/* Accepting workspace trust can leave the current route briefly unresolved.
+ * The bridge correctly withdraws the old session until that route has resolved
+ * again, but removing the whole rail during that gap makes stable UI
+ * blink out and back. Keep only its empty shell: no row from the retired
+ * session remains visible, and a genuinely unresolved route still ages out. */
+function setSessionGap(on) {
+    clearTimeout(sessionGapTimer);
+    sessionGapTimer = null;
+    sessionGap = !!on;
+    if (!sessionGap) return;
+    sessionGapTimer = setTimeout(() => {
+        sessionGapTimer = null;
+        sessionGap = false;
+        render();
+    }, SESSION_GAP_MS);
+}
+ctx.onDispose(() => clearTimeout(sessionGapTimer));
+
 async function refresh() {
     if (loading) return;
     if (V.mock) {
+        setSessionGap(false);
         agents = mockList();
         defs = MOCK_DEFS;
         lastErr = null;
         for (const a of agents) if (a.active || a.agentId === detailId) details.set(a.agentId, mockDetail(a.agentId));
+        if (detailId != null) loadChat(detailId);
         render();
         return;
     }
@@ -905,17 +1150,22 @@ async function refresh() {
         // A failed poll keeps the last good list. Clearing it tore the rail down
         // and rebuilt it on the next good one: a flicker caused by nothing.
         if (r && r.ok) {
+            setSessionGap(false);
             agents = r.agents || [];
             for (const a of agents) a.active = a.state === 'inflight' && live;
             lastErr = null;
         } else lastErr = (r && r.reason) || 'no data';
     } catch (e) { lastErr = String((e && e.message) || e); }
     finally { loading = false; }
-    if (!Object.keys(defs).length) {
-        try { defs = (await cuimod.rpc('subagents.defs')) || {}; } catch (_) {}
+    // Definitions are edited while the window stays open for days, and the
+    // sheet now states what each one pins, so a set fetched once goes stale.
+    // main.js caches for the same 30s, so this costs one read per period.
+    if (!Object.keys(defs).length || Date.now() - defsAt > DEFS_MS) {
+        try { defs = (await cuimod.rpc('subagents.defs')) || {}; defsAt = Date.now(); } catch (_) {}
     }
     // A live agent's tail is its detail, so those stay fresh while it runs.
     for (const a of agents) if (a.active || a.agentId === detailId) loadDetail(a.agentId);
+    if (detailId != null) loadChat(detailId);
     render();
 }
 
@@ -932,6 +1182,34 @@ async function loadDetail(id) {
         if (d && d.ok) { details.set(id, d); render(); }
     } catch (_) {}
     finally { pendingDetail.delete(id); }
+}
+
+function clearChat() {
+    chatSeq++;
+    chatItems = []; chatEarlier = 0; chatParent = 'main'; chatBusy = false;
+    chatEls.clear();
+    if (chatList) chatList.textContent = '';
+}
+
+// Without beforeId this is the newest page, polled while the sheet is open; it
+// is merged by message id, so pages already fetched for scrollback survive it.
+async function loadChat(id, beforeId) {
+    if (chatBusy || id == null || id !== detailId) return;
+    const seq = chatSeq, forSid = cliSid;
+    chatBusy = true;
+    try {
+        const r = V.mock ? mockThread(id) : await cuimod.rpc('subagents.thread', {
+            cliSid: forSid, agentId: id, limit: CHAT_PAGE, beforeId,
+        });
+        if (seq !== chatSeq || forSid !== cliSid || id !== detailId || !r || !r.ok) return;
+        const byMsg = new Map(chatItems.map((m) => [m.id, m]));
+        for (const m of r.messages || []) byMsg.set(m.id, m);
+        chatItems = Array.from(byMsg.values()).sort((x, y) => (ts(x.at) || 0) - (ts(y.at) || 0));
+        if (beforeId || !chatEls.size) chatEarlier = r.earlier || 0;
+        chatParent = r.parentName || 'main';
+        render();
+    } catch (_) {}
+    finally { if (seq === chatSeq) chatBusy = false; }
 }
 
 // ------------------------------------------------------------------ render
@@ -951,7 +1229,8 @@ function forgetNodes() {
     railEl = railCap = capTxt = railDemo = null;
     railBody = runBox = doneBox = moreEl = emptyEl = null;
     sheetEl = sheetInner = scrimEl = null;
-    runEls.clear(); doneEls.clear();
+    chatEl = chatBody = chatList = chatMore = null;
+    runEls.clear(); doneEls.clear(); chatEls.clear();
 }
 
 // Reconcile parent's children against `keys`, keeping existing nodes alive and
@@ -978,9 +1257,68 @@ const setText = (n, t) => { if (n && n.textContent !== t) n.textContent = t; };
 const setCls = (n, c, on) => { if (n) n.classList.toggle(c, !!on); };
 const setShown = (n, on) => { if (n && (n.style.display === 'none') === !!on) n.style.display = on ? '' : 'none'; };
 
+// BEGIN hierarchy projection
+/* The sidecar gives each agent its direct parent. Build from that relation rather
+ * than trusting spawnDepth: a missing parent becomes a root, and corrupt cycles
+ * still render exactly once. Input order is the existing newest-first order, so
+ * it remains the stable order for roots and siblings. */
+function hierarchyRows(rows) {
+    const all = Array.isArray(rows) ? rows : [];
+    const byAgent = new Map();
+    for (const a of all) if (a && a.agentId != null) byAgent.set(String(a.agentId), a);
+
+    const children = new Map();
+    const roots = [];
+    for (const a of all) {
+        if (!a || a.agentId == null) continue;
+        const id = String(a.agentId);
+        const parent = a.parentAgentId == null ? null : String(a.parentAgentId);
+        if (!parent || parent === id || !byAgent.has(parent)) roots.push(a);
+        else {
+            if (!children.has(parent)) children.set(parent, []);
+            children.get(parent).push(a);
+        }
+    }
+
+    const out = [];
+    const seen = new Set();
+    function visit(a, depth) {
+        const id = String(a.agentId);
+        if (seen.has(id)) return;
+        seen.add(id);
+        out.push({ agent: a, depth });
+        for (const child of children.get(id) || []) visit(child, depth + 1);
+    }
+    for (const root of roots) visit(root, 0);
+    // A cycle has no root. Follow parents to the repeated node before promoting
+    // one, so an ordinary child that appeared earlier never jumps above it.
+    for (const start of all) {
+        if (!start || start.agentId == null || seen.has(String(start.agentId))) continue;
+        const trail = new Set();
+        let root = start;
+        while (root && !seen.has(String(root.agentId))) {
+            const id = String(root.agentId);
+            if (trail.has(id)) break;
+            trail.add(id);
+            const parent = root.parentAgentId == null ? null : byAgent.get(String(root.parentAgentId));
+            if (!parent) break;
+            root = parent;
+        }
+        visit(root || start, 0);
+    }
+    return out;
+}
+
+// Keep the deepest row inside the narrowest supported rail while preserving a
+// distinct indent for every finite depth. Ordinary trees retain the 14px step.
+function hierarchyIndent(maxDepth) {
+    return maxDepth > 0 ? Math.min(14, 96 / maxDepth) : 14;
+}
+// END hierarchy projection
+
 function render() {
     if (!V.enabled) { teardown(); return; }
-    const wantRail = !railOff && agents.length > 0;
+    const wantRail = !railOff && (agents.length > 0 || sessionGap);
     const wantSheet = detailId != null && byId(detailId);
     if (!wantRail && !wantSheet) { teardown(); return; }
 
@@ -1001,9 +1339,15 @@ function render() {
             wrap.insertBefore(scrimEl, wrap.firstChild);
         }
         renderSheet(byId(detailId));
+        renderChat(byId(detailId));
     } else {
         if (sheetEl) { try { sheetEl.remove(); } catch (_) {} sheetEl = sheetInner = null; }
         if (scrimEl) { try { scrimEl.remove(); } catch (_) {} scrimEl = null; }
+        if (chatEl) {
+            try { chatEl.remove(); } catch (_) {}
+            chatEl = chatBody = chatList = chatMore = null;
+            chatEls.clear();
+        }
     }
 
     place();
@@ -1034,28 +1378,47 @@ function renderRail() {
     setCls(capTxt, 'n', live.length > 0);
     setShown(railDemo, !!V.mock);
 
-    // The demo exists to be looked at, so it is not subject to stoppedLimit:
-    // at 0 — a perfectly reasonable setting for real work — every finished
-    // agent is hidden, and the only thing left to click is the three running
-    // ones, whose transcripts are deliberately partial.
+    // The demo exists to be looked at, so it is not subject to stoppedLimit.
+    // Ancestors are structural and remain visible even when they are finished:
+    // otherwise a running child would float at depth zero with its parent hidden.
     const cap = (V.mock || showAll) ? done.length : Math.max(0, V.stoppedLimit);
-    const ghosts = done.slice(0, cap);
+    const include = new Set(live.map((a) => a.agentId));
+    for (const a of done.slice(0, cap)) include.add(a.agentId);
+    const allById = new Map(agents.map((a) => [a.agentId, a]));
+    for (const start of Array.from(include)) {
+        const chain = new Set();
+        let a = allById.get(start);
+        while (a && a.parentAgentId && !chain.has(a.agentId)) {
+            chain.add(a.agentId);
+            const parent = allById.get(a.parentAgentId);
+            if (!parent) break;
+            include.add(parent.agentId);
+            a = parent;
+        }
+    }
+    const tree = hierarchyRows(agents.filter((a) => include.has(a.agentId)));
+    const depth = new Map(tree.map((x) => [x.agent.agentId, x.depth]));
+    const maxDepth = tree.reduce((m, x) => Math.max(m, x.depth), 0);
+    const indent = hierarchyIndent(maxDepth);
 
-    sync(runBox, runEls, live.map((a) => a.agentId),
-        (id) => makeRow(byId(id)), (n, id) => patchRow(n, byId(id)));
-    sync(doneBox, doneEls, ghosts.map((a) => a.agentId),
-        (id) => makeRow(byId(id)), (n, id) => patchRow(n, byId(id)));
-    setShown(doneBox, ghosts.length > 0);
+    // One reconciled list is what keeps a finished parent immediately above a
+    // running child. State remains visual: live rows glow, finished rows ghost.
+    sync(runBox, runEls, tree.map((x) => x.agent.agentId),
+        (id) => makeRow(byId(id)), (n, id) => patchRow(n, byId(id), depth.get(id), indent));
+    sync(doneBox, doneEls, [], () => null, () => {});
+    setShown(doneBox, false);
 
     if (!agents.length) {
         if (!emptyEl) {
-            emptyEl = el('div', 'rempty', 'no agents in this session yet');
+            emptyEl = el('div', 'rempty');
             railBody.append(emptyEl);
         }
+        setText(emptyEl, sessionGap ? 'reconnecting to session…' : 'no agents in this session yet');
     } else if (emptyEl) { emptyEl.remove(); emptyEl = null; }
 
+    const hiddenDone = done.filter((a) => !include.has(a.agentId)).length;
     let label = null;
-    if (done.length > cap) label = '+' + (done.length - cap) + ' more';
+    if (hiddenDone > 0) label = '+' + hiddenDone + ' more';
     else if (showAll && done.length > V.stoppedLimit) label = 'fewer';
     if (!label) { if (moreEl) { moreEl.remove(); moreEl = null; } }
     else {
@@ -1107,10 +1470,18 @@ function makeRow(a) {
     });
     return n;
 }
-function patchRow(n, a) {
+function patchRow(n, a, depth, indentStep) {
     if (!a) return;
     const st = n.__;
     const s = spanOf(a);
+    const treeDepth = Number.isInteger(depth) && depth > 0 ? depth : 0;
+    const step = Number.isFinite(indentStep) && indentStep > 0 ? indentStep : 14;
+    const indent = treeDepth * step + 'px';
+    const guide = Math.round(Math.max(1, Math.min(9, step)) * 10) / 10 + 'px';
+    if (n.style.getPropertyValue('--tree-indent') !== indent) n.style.setProperty('--tree-indent', indent);
+    if (n.style.getPropertyValue('--tree-guide') !== guide) n.style.setProperty('--tree-guide', guide);
+    if (n.dataset.depth !== String(treeDepth)) n.dataset.depth = String(treeDepth);
+    setCls(n, 'child', treeDepth > 0);
     setCls(n, 'live', a.active);
     setCls(n, 'ghost', !a.active);
     setCls(n, 'halt', !a.active && a.state === 'stopped');
@@ -1214,7 +1585,7 @@ function renderSheet(a) {
 
         st = sheetEl.__ = {
             h2, badge, badgeTxt, subline, stop, copy, rev, close, crumb,
-            brief, tail, turns,
+            brief, tail, turns, hd, grid,
             kv: cRun.body, hist: cTools.body, def: cDef.body,
             cToolsBox: cTools.box, cDefBox: cDef.box,
             msig: null, hsig: null, dsig: null, bsig: null, briefSig: null,
@@ -1249,7 +1620,7 @@ function renderSheet(a) {
     setText(st.stop, armed ? 'confirm stop' : 'stop');
 
     const bits = [];
-    if (a.type) bits.push(['', a.type]);
+    if (a.type) bits.push(['', a.type, defPin(a.type)]);
     if (a.model) bits.push(['model ', shortModel(a.model)]);
     if (a.effort) bits.push(['effort ', a.effort]);
     bits.push([a.active ? 'running ' : (a.state === 'stopped' ? 'ran before it was stopped ' : 'ran '), dur(s.ms)]);
@@ -1258,10 +1629,11 @@ function renderSheet(a) {
     if (st.bsig !== bsig) {
         st.bsig = bsig;
         st.subline.textContent = '';
-        for (const [k, v] of bits) {
+        for (const [k, v, pin] of bits) {
             const n = el('span');
             if (k) n.append(el('b', null, k));
             n.append(document.createTextNode(v));
+            if (pin) n.append(el('span', 'pin', '(' + pin + ')'));
             st.subline.append(n);
         }
     }
@@ -1333,6 +1705,285 @@ function renderSheet(a) {
 
     patchTurns(st, d);
 }
+
+// ---------------------------------------------------------------- the chat
+function renderChat(a) {
+    if (!chatEl) {
+        chatEl = el('div', 'chat');
+        chatBody = el('div', 'cbody');
+        chatMore = el('div', 'earlier');
+        chatMore.style.display = 'none';
+        chatMore.addEventListener('click', () => { if (chatItems.length) loadChat(detailId, chatItems[0].id); });
+        chatList = el('div', 'clist');
+        chatBody.append(chatMore, chatList);
+        chatEl.append(chatBody);
+        chatEl.__ = { pin: false, anchor: null };
+        try {
+            const root = document.querySelector('.cds-root');
+            const fill = root && getComputedStyle(root).getPropertyValue('--cds-bg-user-message').trim();
+            if (fill) chatEl.style.setProperty('--ubub', fill);
+        } catch (_) {}
+        wrap.append(chatEl);
+    }
+    const st = chatEl.__;
+    const firstFill = !chatEls.size;
+    const lastId = chatList.lastChild && chatList.lastChild.__ && chatList.lastChild.__.id;
+    const firstId = chatList.firstChild && chatList.firstChild.__ && chatList.firstChild.__.id;
+    const atEnd = chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight < 40;
+    const oldH = chatBody.scrollHeight, oldTop = chatBody.scrollTop;
+
+    const byMsg = new Map(chatItems.map((m) => [m.id, m]));
+    const ids = chatItems.map((m) => m.id);
+    sync(chatList, chatEls, ids, (id) => msgNode(id), (n, id) => patchMsg(n, byMsg.get(id), a));
+    setText(chatMore, chatEarlier ? chatEarlier + ' earlier' : '');
+    setShown(chatMore, chatEarlier > 0);
+
+    // Scroll is settled in place(), once the column has a size: a scrollTop
+    // written while it is display:none is discarded.
+    if (!ids.length) return;
+    if (firstFill) st.pin = true;
+    else if (firstId && ids[0] !== firstId) st.anchor = { oldH, oldTop };
+    else if (ids[ids.length - 1] !== lastId && atEnd) st.pin = true;
+}
+
+function msgNode(id) {
+    const n = el('div', 'msg');
+    const who = el('div', 'mwho');
+    const nm = el('b');
+    const tag = el('span', 'tag');
+    const at = el('span', 'at');
+    const flag = el('span', 'flag');
+    who.append(nm, tag, at, flag);
+    const bubble = el('div', 'mtext');
+    const text = el('div', 'mbody');
+    bubble.append(text);
+    const grow = el('button', 'grow');
+    grow.type = 'button';
+    grow.style.display = 'none';
+    n.append(who, bubble, grow);
+    n.__ = { id, nm, tag, at, flag, text, grow, sig: null, open: false, long: false };
+    grow.addEventListener('click', () => { n.__.open = !n.__.open; foldChat(); });
+    return n;
+}
+
+const REPORT_TAG = { completed: 'final report', killed: 'stopped', failed: 'failed' };
+function patchMsg(n, m, a) {
+    if (!m) return;
+    const st = n.__;
+    const side = m.dir === 'parent' ? 'parent' : 'child';
+    setCls(n, 'parent', side === 'parent');
+    setCls(n, 'child', side === 'child');
+    setText(st.nm, side === 'parent' ? chatParent : (a && (a.name || a.type)) || 'agent');
+    const tag = m.kind === 'brief' ? 'assignment'
+        : m.kind === 'report' ? (REPORT_TAG[m.status] || 'report') : '';
+    setText(st.tag, tag);
+    setShown(st.tag, !!tag);
+    setText(st.at, hhmm(ts(m.at)));
+    const flag = m.status === 'failed' && m.kind === 'message' ? 'not delivered'
+        : m.status === 'pending' ? 'sending' : '';
+    setText(st.flag, flag);
+    setShown(st.flag, !!flag);
+    if (st.sig !== m.text) {
+        st.sig = m.text;
+        st.open = false;
+        st.text.textContent = '';
+        chatInto(st.text, m.text, side === 'parent' ? [chatParent] : [a && a.name, a && a.type]);
+    }
+}
+
+// A long message folds behind "show more". Whether it is long depends on the
+// column's width, so it is measured on every placement rather than guessed from
+// the character count.
+function foldChat() {
+    for (const n of chatEls.values()) {
+        const st = n.__;
+        st.long = st.text.scrollHeight > CHAT_CLAMP + 48;
+        setCls(st.text, 'fold', st.long && !st.open);
+        setShown(st.grow, st.long);
+        setText(st.grow, st.open ? 'show less' : 'show more');
+    }
+}
+
+// BEGIN chat formatting
+/* Message bodies are prose written by a model for another model: one long
+ * paragraph of findings, asides, paths and commit ids. Nothing here rewrites
+ * it. The shape it already has is made visible: a sentence starts a line, an
+ * inline "(1) … (2) …" run becomes a list, a long parenthetical steps back,
+ * and a path shrinks to its last two segments with the whole path on hover.
+ * Headings lose their hashes and fences become blocks. Text only — nothing a
+ * message contains ever becomes markup. */
+const CHAT_TOK = new RegExp([
+    '`([^`\\n]+)`',
+    '\\*\\*([^*\\n]+)\\*\\*',
+    '([A-Za-z]:\\\\[^\\s"\'`<>|]*[^\\s"\'`<>|.,;:)])',
+    '((?:\\.{1,2}/)?(?:[\\w@.+-]+/)+[\\w@.+-]*\\.(?:\\{[\\w,]+\\}|[A-Za-z][A-Za-z0-9]{0,5})(?::\\d+(?:-\\d+)?)?)',
+    '(\\b[\\w-]+(?:\\.[\\w-]+)*\\.(?:\\{[\\w,]+\\}|cpp|cc|c|h|hpp|cs|js|mjs|cjs|ts|tsx|py|json|jsonl|md|png|jpg|webp|ini|txt|obj|lib|dll|exe|ps1|sh|gd|toml|ya?ml|log|sln|vcxproj|pdb)(?::\\d+(?:-\\d+)?)?\\b)',
+    '\\b([0-9a-f]{7,40})\\b',
+].join('|'), 'g');
+const ASIDE_MIN = 24;
+const ABBREV = /(?:^|\s)(?:e\.g|i\.e|vs|etc|cf|approx|incl|no)\.$/i;
+
+function chatTok(node, text, cls, title) {
+    const t = el('span', 'tok' + (cls ? ' ' + cls : ''), text);
+    if (title) t.title = title;
+    node.append(t);
+}
+function chatPath(node, p) {
+    const segs = p.split(/[\\/]/).filter(Boolean);
+    if (segs.length <= 3) return chatTok(node, p, null, null);
+    chatTok(node, '…/' + segs.slice(-2).join('/'), null, p);
+}
+// Where the parenthesis opened at `from` closes, ignoring code spans.
+function closeParen(s, from) {
+    let depth = 0, code = false;
+    for (let i = from; i < s.length; i++) {
+        const c = s[i];
+        if (c === '`') code = !code;
+        else if (code) continue;
+        else if (c === '(') depth++;
+        else if (c === ')' && --depth === 0) return i;
+    }
+    return -1;
+}
+function chatInline(node, s) {
+    let i = 0;
+    const text = (t) => { if (t) node.append(document.createTextNode(t)); };
+    while (i < s.length) {
+        CHAT_TOK.lastIndex = i;
+        const m = CHAT_TOK.exec(s);
+        const open = s.indexOf('(', i);
+        const close = open >= 0 && (!m || open < m.index) ? closeParen(s, open) : -1;
+        if (close > open) {
+            text(s.slice(i, open));
+            const inner = s.slice(open + 1, close);
+            const host = inner.length >= ASIDE_MIN ? el('span', 'aside') : node;
+            if (host !== node) node.append(host);
+            host.append(document.createTextNode('('));
+            chatInline(host, inner);
+            host.append(document.createTextNode(')'));
+            i = close + 1;
+            continue;
+        }
+        if (!m) { text(s.slice(i)); break; }
+        text(s.slice(i, m.index));
+        if (m[1] != null) node.append(el('code', null, m[1]));
+        else if (m[2] != null) { const b = el('strong'); chatInline(b, m[2]); node.append(b); }
+        else if (m[3] != null || m[4] != null) chatPath(node, m[3] || m[4]);
+        else if (m[5] != null) chatTok(node, m[5], null, null);
+        else if (/\d/.test(m[6]) && /[a-f]/.test(m[6])) chatTok(node, m[6].slice(0, 12), 'sha', m[6]);
+        else text(m[6]);
+        i = m.index + m[0].length;
+    }
+}
+// Sentence ends: terminal punctuation at paren depth zero, outside code,
+// followed by space and something that can start a sentence.
+function chatSentences(s) {
+    const out = [];
+    let depth = 0, code = false, from = 0;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (c === '`') { code = !code; continue; }
+        if (code) continue;
+        if (c === '(') depth++;
+        else if (c === ')') depth = Math.max(0, depth - 1);
+        else if ((c === '.' || c === '!' || c === '?') && depth === 0 && /\s/.test(s[i + 1] || '')) {
+            const rest = s.slice(i + 1).replace(/^\s+/, '');
+            if (!/^[A-Z0-9"“`(\[]/.test(rest) || ABBREV.test(s.slice(from, i + 1))) continue;
+            out.push(s.slice(from, i + 1).trim());
+            from = s.length - rest.length;
+            i = from - 1;
+        }
+    }
+    if (s.slice(from).trim()) out.push(s.slice(from).trim());
+    return out;
+}
+// "… one of: (1) this; or (2) that" is a list the writer typed inline.
+const ENUM = /(^|[\s:;,])\((\d{1,2}|[a-h])\)\s/g;
+function chatSentence(node, s, lead) {
+    const marks = [];
+    ENUM.lastIndex = 0;
+    let m;
+    while ((m = ENUM.exec(s))) marks.push({ at: m.index + m[1].length, end: m.index + m[0].length, label: m[2] });
+    const line = el('span', 's' + (lead ? ' lead' : ''));
+    node.append(line);
+    // The writer ended an item with a full stop, so the items arrive one
+    // sentence each; a sentence that opens on its marker, or on "So: (1)", is
+    // still an item.
+    if (marks.length === 1 && marks[0].at === 0) {
+        line.className = 'enum';
+        line.append(el('i', null, marks[0].label));
+        chatInline(line, s.slice(marks[0].end));
+        return;
+    }
+    if (marks.length < 2 && !(marks.length === 1 && /:\s*$/.test(s.slice(0, marks[0].at)))) {
+        chatInline(line, s);
+        return;
+    }
+    chatInline(line, s.slice(0, marks[0].at).trim());
+    marks.forEach((k, j) => {
+        const item = el('span', 'enum');
+        item.append(el('i', null, k.label));
+        chatInline(item, s.slice(k.end, j + 1 < marks.length ? marks[j + 1].at : s.length).trim());
+        line.append(item);
+    });
+}
+function chatInto(node, text, names) {
+    let src = String(text == null ? '' : text).replace(/\r\n?/g, '\n');
+    // "gui status: …" from gui, under a header that already says gui.
+    for (const n of names || []) {
+        if (!n) continue;
+        const re = new RegExp('^\\s*' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\s+(?:status|update|report))?:\\s*', 'i');
+        if (re.test(src)) {
+            src = src.replace(re, '');
+            // "on the switch…" reads as a sentence again; "fedfcc8 lands…" is an id.
+            if (/^[a-z]+\s/.test(src)) src = src.charAt(0).toUpperCase() + src.slice(1);
+            break;
+        }
+    }
+    const lines = src.split('\n');
+    let para = [], lead = true;
+    const flush = () => {
+        const rows = para.filter((l) => l.trim());
+        para = [];
+        if (!rows.length) return;
+        const p = el('div', 'para');
+        let run = [];
+        const prose = () => {
+            if (!run.length) return;
+            for (const sent of chatSentences(run.join(' '))) { chatSentence(p, sent, lead); lead = false; }
+            run = [];
+        };
+        for (const l of rows) {
+            const li = /^\s*([-*+]|\d{1,2}[.)])\s+(.*)$/.exec(l);
+            if (!li) { run.push(l.trim()); continue; }
+            prose();
+            const item = el('span', 'enum');
+            item.append(el('i', null, /\d/.test(li[1]) ? li[1].replace(/[.)]$/, '') : '•'));
+            chatInline(item, li[2]);
+            p.append(item);
+            lead = false;
+        }
+        prose();
+        node.append(p);
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^\s*```/.test(line)) {
+            flush();
+            const body = [];
+            while (++i < lines.length && !/^\s*```/.test(lines[i])) body.push(lines[i]);
+            node.append(el('pre', null, body.join('\n')));
+            lead = false;
+            continue;
+        }
+        const h = /^#{1,6}\s+(.*)$/.exec(line);
+        if (h) { flush(); const d = el('div', 'para hd'); chatInline(d, h[1]); node.append(d); lead = false; continue; }
+        if (!line.trim()) { flush(); continue; }
+        para.push(line);
+    }
+    flush();
+}
+// END chat formatting
 
 function card(title) {
     const box = el('div', 'card');
@@ -1534,9 +2185,11 @@ function patchTurns(st, d) {
  * frame arrives first and the text settles into it. */
 function openDetail(id, fromRow) {
     const rect = fromRow ? fromRow.getBoundingClientRect() : null;
+    if (id !== detailId) clearChat();
     detailId = id;
     armedStop = null;
     if (!details.has(id)) loadDetail(id);
+    loadChat(id);
     render();
     if (!sheetEl || reduced()) return;
     const s = sheetEl.getBoundingClientRect();
@@ -1557,7 +2210,8 @@ function closeDetail() {
     const row = runEls.get(detailId) || doneEls.get(detailId);
     const s = sheetEl && sheetEl.getBoundingClientRect();
     const rect = row && row.getBoundingClientRect();
-    const done = () => { detailId = null; armedStop = null; render(); };
+    const done = () => { clearChat(); detailId = null; armedStop = null; render(); };
+    if (chatEl && !reduced()) chatEl.classList.add('leaving');
     if (!sheetEl || reduced() || !rect || !s || !s.width) {
         if (scrimEl && !reduced()) {
             scrimEl.classList.add('leaving');
@@ -1636,9 +2290,12 @@ ctx.track(document, 'visibilitychange', place);
 
 cuimod.onSessionChange((id) => {
     if (id === cliSid) return;
+    const keepShell = !railOff && (sessionGap || agents.length > 0 || detailId != null);
     cliSid = id;
     agents = []; showAll = false; detailId = null;
-    details.clear();
+    details.clear(); clearChat();
+    setSessionGap(keepShell);
+    render();
     refresh();
 });
 
@@ -1646,8 +2303,8 @@ cuimod.onSessionChange((id) => {
 function apply(v) {
     const wasMock = V.mock;
     V = Object.assign({}, DEF, v || {});
-    if (!V.enabled) { detailId = null; teardown(); return; }
-    if (V.mock !== wasMock) { agents = []; details.clear(); detailId = null; }
+    if (!V.enabled) { clearChat(); detailId = null; setSessionGap(false); teardown(); return; }
+    if (V.mock !== wasMock) { agents = []; details.clear(); clearChat(); detailId = null; }
     restyle();
     refresh();
     render();
@@ -1672,8 +2329,12 @@ ${sel} .sa-cap { display: flex; align-items: center; gap: 7px; padding: 0 5px 8p
     color: ${v.accent}; opacity: .6; }
 ${sel} .sa-cap i { flex: 1; font-style: normal; }
 ${sel} .sa-cap u { text-decoration: none; color: var(--fg3); letter-spacing: .12em; opacity: .8; }
-${sel} .sa-row { display: grid; grid-template-columns: 7px 1fr auto; gap: 8px;
+${sel} .sa-row { position: relative; display: grid; grid-template-columns: 7px 1fr auto; gap: 8px;
     align-items: baseline; padding: 4px 5px 5px; border-radius: 7px; }
+${sel} .sa-row.child { margin-left: 14px; }
+${sel} .sa-row.child::before { content: ''; position: absolute; left: -9px; top: -4px;
+    width: 7px; height: 14px; border-left: 1px solid var(--hair2);
+    border-bottom: 1px solid var(--hair2); border-bottom-left-radius: 3px; opacity: .8; }
 ${sel} .sa-dot { width: 5px; height: 5px; border-radius: 50%; align-self: start;
     margin-top: 5px; background: currentColor; opacity: .4; }
 ${sel} .sa-row.live .sa-dot { background: ${v.accent}; opacity: 1;
@@ -1716,7 +2377,7 @@ const spec = {
                     { value: 'F4', label: 'F4' }, { value: 'F8', label: 'F8' },
                     { value: 'Home', label: 'Home' }, { value: 'PageUp', label: 'Page Up' }] },
         { key: 'stoppedLimit', type: 'slider', label: 'Ghosts shown', min: 0, max: 40, step: 1, unit: '',
-          hint: 'How many agents that are no longer running stay listed under the live ones.', group: 'Rail' },
+          hint: 'How many finished agents remain visible in the hierarchy. Parents of visible agents stay shown.', group: 'Rail' },
         { key: 'railTop', type: 'slider', label: 'Drop below the title', min: 0, max: 260, step: 4, unit: 'px', group: 'Rail' },
         { key: 'railWidth', type: 'slider', label: 'Width', min: 200, max: 360, step: 4, unit: 'px', group: 'Rail' },
         { key: 'showThinking', type: 'toggle', label: 'Show thinking', group: 'Look',
@@ -1738,9 +2399,9 @@ const spec = {
 
             for (const r of [
                 { nm: 'rv-physics', when: '14m 52s', tool: 'Bash', doing: 'smq.py xref 0x86C510' },
-                { nm: 'rd-audio', when: '2m 28s', tool: 'Grep', doing: 'pattern: mixer_ring_push' },
+                { nm: 'rd-audio', when: '2m 28s', tool: 'Grep', doing: 'pattern: mixer_ring_push', child: true },
             ]) {
-                const row = el('div', 'sa-row live');
+                const row = el('div', 'sa-row live' + (r.child ? ' child' : ''));
                 const mid = el('div');
                 mid.append(el('div', 'sa-nm', r.nm));
                 const slot = el('div', 'sa-slot');

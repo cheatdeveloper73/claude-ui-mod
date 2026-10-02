@@ -165,7 +165,11 @@ export class AdapterRegistry
             let value = null;
             try { value = adapter.health ? adapter.health() : null; }
             catch (error) { value = { error: String(error?.message || error).slice(0, 240) }; }
-            return { id: adapter.id, provider: adapter.provider, models: (adapter.models || []).map(m => m.id), ...value };
+            const modelRoutes = (adapter.models || []).filter(model => typeof model?.id === 'string' && model.id)
+                .map(model => ({ id: model.id, provider: model.provider || adapter.provider,
+                    context: Number.isFinite(model.context) ? model.context : null }));
+            return { id: adapter.id, provider: adapter.provider, models: modelRoutes.map(model => model.id),
+                modelRoutes, ...value };
         });
         return { dir: ADAPTER_DIR, loaded: adapters, errors: this.errors };
     }

@@ -38,10 +38,10 @@ test('provider limits normalize every account plus a schedulable pool', () => {
         }, additionalRateLimits: [] },
         acme: { observedAt: at(40), source: 'acme.fixture', poolLabel: 'Acme pool', accounts: [
             { id: 1, name: 'One', status: 'active', schedulable: true, exact: true, quotas: {
-                'acme-flash-tiered': { utilization: 20, remainingFraction: 0.8, resetTime: at(50) },
+                'acme-flash-tiered': { utilization: 20, remainingFraction: 0.8, resetTime: at(50), windowSeconds: 604800 },
             } },
             { id: 2, name: 'Two', status: 'active', schedulable: true, exact: true, quotas: {
-                'acme-flash-tiered': { utilization: 40, remainingFraction: 0.6, resetTime: at(55) },
+                'acme-flash-tiered': { utilization: 40, remainingFraction: 0.6, resetTime: at(55), windowSeconds: 604800 },
             } },
             { id: 3, name: 'Off', status: 'active', schedulable: false, exact: true, quotas: {
                 'acme-flash-tiered': { utilization: 0, remainingFraction: 1, resetTime: at(55) },
@@ -53,6 +53,30 @@ test('provider limits normalize every account plus a schedulable pool', () => {
     const pool = rows.find(row => row.key === 'acme:pool:acme-flash-tiered');
     assert.equal(pool.usedPercent, 30);
     assert.equal(pool.accountCount, 2);
+    assert.equal(pool.windowSeconds, 604800);
+    assert.equal(rows.find(row => row.key === 'acme:1:acme-flash-tiered').windowSeconds, 604800);
+});
+
+test('a quota unit correction starts a new forecast history without erasing old samples', () => {
+    const file = path.join(temp, 'versioned-limits.jsonl');
+    const key = 'acme:pool:weekly';
+    fs.writeFileSync(file, JSON.stringify({ version: 1, key, provider: 'acme', model: 'weekly',
+        observedAt: new Date(Date.now() - 5 * 60000).toISOString(), usedPercent: 0.33, resetAt: null }) + '\n');
+    const analytics = new UsageAnalytics({ planFile, historyFile: file });
+    const result = analytics.snapshot({ acme: { historyVersion: 2, trackedQuotas: ['weekly'], accounts: [
+        { id: 1, status: 'active', schedulable: true, observedAt: new Date().toISOString(), quotas: {
+            weekly: { utilization: 33, remainingFraction: 0.67, windowSeconds: 604800 },
+        } },
+    ] } }, { recent: [], models: [], sessions: [], exactRecords: 0 });
+    const meter = result.meters.find(row => row.key === key);
+    assert.equal(meter.usedPercent, 33);
+    assert.equal(meter.forecast.sampleCount, 1);
+    assert.equal(meter.forecast.ratePerMinute, 0);
+    assert.equal(meter.history.length, 1);
+    const stored = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(stored.length, 3);
+    assert.equal(stored[0].usedPercent, 0.33);
+    assert.equal(stored[1].historyVersion, 2);
 });
 
 test('forecast reports observed burn rate and whether reset wins', () => {

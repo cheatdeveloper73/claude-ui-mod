@@ -1,0 +1,10 @@
+{
+  "host": "127.0.0.1",
+  "port": 8766,
+  "tokenFile": "~/.config/cuimod-voice/token",
+  "model": "laion/voicenet-dimension-predictors-commercial",
+  "modelRevision": "cdafe5170561eaadb09f012ed5ae48e4f82b7b91",
+  "modelDir": "~/.local/share/cuimod-prosody/model",
+  "baselineFile": "~/.config/cuimod-voice/prosody-baseline.json",
+  "device": "cpu"
+}

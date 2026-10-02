@@ -23,6 +23,8 @@ watch-hidden.vbs
 DISABLED
 
 node_modules/
+__pycache__/
+*.py[cod]
 *.tmp
 *.cuimod-backup
 

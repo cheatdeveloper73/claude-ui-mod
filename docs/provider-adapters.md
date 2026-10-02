@@ -78,7 +78,10 @@ model list that changes without a redeploy.
 An adapter is a directory under `router/adapters/` with an `index.mjs` that
 default-exports a factory. The registry discovers it at boot, calls the factory
 once with the kit, and asks the result which models it claims. Nothing else
-registers it. Zero adapters is a supported and default state.
+registers it. Zero adapters is a supported state; the published tree ships one,
+`router/adapters/command-code/`, which is also the most complete worked example
+of a translating adapter (Anthropic Messages to OpenAI Chat Completions, with a
+limits meter).
 
 ### A complete one
 

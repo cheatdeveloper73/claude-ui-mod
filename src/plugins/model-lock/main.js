@@ -28,8 +28,10 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const { providerRegistrations, registrationFor } = require('../provider-routing/registrations');
 
-const SUFFIX = '_$_claude.web_$_LocalSessions_$_setModel';
+const MODEL_SUFFIX = '_$_claude.web_$_LocalSessions_$_setModel';
+const EFFORT_SUFFIX = '_$_claude.web_$_LocalSessions_$_setEffort';
 // The picker click closes the menu before the invoke lands, so the arming
 // window has to outlive the menu itself. Ten seconds covers a slow roundtrip
 // and is still far shorter than the gap between a session focus and the
@@ -38,14 +40,21 @@ const ARM_MS = 10000;
 const KEEP_DROPS = 50;
 const SAVE_DEBOUNCE = 2000;
 
-// Effort rides in the model string as `slug:tier` and the million-context tag
-// as a `[...]` suffix, so the same model reaches us under several spellings.
-// Compare on the bare slug.
+// Older provider aliases can carry effort as `slug:tier`, while current Desktop
+// persists effort separately on the session. Model ownership still compares on
+// the bare slug so either spelling remains protected.
+function baseId(id) {
+    return String(id || '').trim().toLowerCase()
+        .replace(/\[1m\]/g, '')
+        .replace(/:(none|minimal|low|medium|high|xhigh|max|ultra|pro)$/, '');
+}
+
+// A declared provider's ids travel without the claude- alias, so a prefixed
+// spelling of one compares as its own id.
 function bare(id) {
-    return String(id || '')
-        .replace(/\[[^\]]*\]$/, '')
-        .replace(/:(low|medium|high|xhigh|max)$/, '')
-        .toLowerCase();
+    const text = baseId(id);
+    const stripped = text.replace(/^(?:claude-)+/, '');
+    return stripped !== text && registrationFor(stripped) ? stripped : text;
 }
 
 module.exports = function (ctx) {
@@ -68,7 +77,17 @@ module.exports = function (ctx) {
     ctx.onDispose(() => clearTimeout(saveTimer));
 
     let enabled = true;
-    let armedUntil = 0;
+    const armed = new Map();
+
+    function armedFor(sessionId, kind, now = Date.now(), consume = false) {
+        const entry = armed.get(sessionId);
+        if (!entry) return false;
+        for (const key of ['model', 'effort']) if (Number(entry[key] || 0) <= now) delete entry[key];
+        const active = Number(entry[kind] || 0) > now;
+        if (active && consume) delete entry[kind];
+        if (!entry.model && !entry.effort) armed.delete(sessionId);
+        return active;
+    }
 
     // Asking provider-picker for its own catalogue would be the tidier source,
     // but `boot.host` is not reliably there to ask through: probed from a plugin
@@ -95,6 +114,11 @@ module.exports = function (ctx) {
         } catch (_) { /* absent private catalogue is the normal case */ }
     }
 
+    // Availability controls admission in the adapter, not ownership of a saved
+    // selection. A retired model or missing catalogue must still stay selected
+    // until the user chooses another model.
+    const isInjected = id => injected.has(bare(id)) || registrationFor(bare(id)) !== null;
+
     // Authoritative current model for a session we have not seen a write for.
     // Desktop stores one JSON per session named by its id, two levels under
     // claude-code-sessions/<account>/<org>/. Only read on a candidate drop, so
@@ -116,13 +140,14 @@ module.exports = function (ctx) {
         sessionDirs = { at: now, list };
         return list;
     }
-    function storedModel(sessionId) {
+    function storedSelection(sessionId) {
         if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
         for (const dir of sessionRoots()) {
             try {
                 const raw = fs.readFileSync(path.join(dir, sessionId + '.json'), 'utf8');
-                const model = JSON.parse(raw).model;
-                if (model) return model;
+                const value = JSON.parse(raw);
+                if (value?.model) return { model: value.model,
+                    ...(Object.hasOwn(value, 'effort') ? { effort: value.effort ?? null } : {}) };
             } catch (_) {}
         }
         return null;
@@ -131,68 +156,160 @@ module.exports = function (ctx) {
     // What the session is on right now. Our own record wins: it is written the
     // moment a write is allowed through, while the app's session file is
     // flushed on a debounce and can lag a deliberate pick by seconds.
+    function currentSelection(sessionId) {
+        const live = state.bySession[sessionId];
+        if (live?.model && Object.hasOwn(live, 'effort')) return live;
+        const stored = storedSelection(sessionId);
+        if (!stored) return live || null;
+        const next = { ...(live || {}) };
+        let changed = false;
+        if (!next.model && stored.model) { next.model = stored.model; changed = true; }
+        if (!Object.hasOwn(next, 'effort') && Object.hasOwn(stored, 'effort')) {
+            next.effort = stored.effort ?? null; changed = true;
+        }
+        if (changed) {
+            next.at ||= Date.now();
+            state.bySession[sessionId] = next;
+            save();
+        }
+        return changed ? next : live || stored;
+    }
     function currentModel(sessionId) {
-        return state.bySession[sessionId]?.model || storedModel(sessionId);
+        return currentSelection(sessionId)?.model || null;
+    }
+    function currentEffort(sessionId) {
+        const selection = currentSelection(sessionId);
+        return selection && Object.hasOwn(selection, 'effort') ? selection.effort ?? null : undefined;
     }
 
-    function decide(sessionId, model) {
-        if (!enabled) return null;
-        if (!injected.size) return null;
-        if (Date.now() < armedUntil) return null;
+    function decideModel(sessionId, model) {
+        if (!enabled || armedFor(sessionId, 'model', Date.now(), true)) return null;
         const from = currentModel(sessionId);
-        if (!from) return null;
-        if (!injected.has(bare(from))) return null;
-        if (injected.has(bare(model))) return null;
-        if (bare(from) === bare(model)) return null;
+        if (!from || !isInjected(from) || isInjected(model) || bare(from) === bare(model)) return null;
         return { from, to: model };
     }
+    function decideEffort(sessionId, effort) {
+        if (!enabled || armedFor(sessionId, 'effort', Date.now(), true)) return null;
+        const model = currentModel(sessionId);
+        if (!model || !isInjected(model)) return null;
+        const from = currentEffort(sessionId);
+        const to = effort ?? null;
+        if (from === to) return null;
+        return { model, from, to, known: from !== undefined };
+    }
 
-    ctx.method('arm', () => { armedUntil = Date.now() + ARM_MS; return { armedUntil }; });
-    ctx.method('status', () => ({
-        enabled, armed: Date.now() < armedUntil, injected: injected.size, windows: wrapped.size,
-        tracked: Object.keys(state.bySession).length, drops: state.drops.length,
-        recent: state.drops.slice(-5), stateFile,
-    }));
+    ctx.method('arm', (p) => {
+        const sessionId = typeof p?.sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(p.sessionId) ? p.sessionId : null;
+        const kind = p?.kind === 'model' || p?.kind === 'effort' ? p.kind : null;
+        if (!sessionId || !kind) return { armed: false };
+        const value = armed.get(sessionId) || {};
+        value[kind] = Date.now() + ARM_MS;
+        armed.set(sessionId, value);
+        return { armed: true, sessionId, kind, armedUntil: value[kind] };
+    });
+    ctx.method('status', () => {
+        const now = Date.now();
+        for (const sessionId of [...armed.keys()]) {
+            armedFor(sessionId, 'model', now); armedFor(sessionId, 'effort', now);
+        }
+        return { enabled, armed: armed.size > 0, armedSessions: armed.size, injected: injected.size,
+            protectedNamespaces: providerRegistrations().map(r => r.pattern.source), windows: wrapped.size, tracked: Object.keys(state.bySession).length,
+            drops: state.drops.length, recent: state.drops.slice(-5), stateFile };
+    });
     ctx.method('settings', (p) => {
         if (p && typeof p.enabled === 'boolean') enabled = p.enabled;
         return { enabled };
     });
 
     const wrapped = new Map();
+    function rememberDrop(drop) {
+        state.drops.push({ at: new Date().toISOString(), ...drop });
+        if (state.drops.length > KEEP_DROPS) state.drops.splice(0, state.drops.length - KEEP_DROPS);
+        save();
+    }
     function attach() {
         for (const wc of ctx.electron.webContents.getAllWebContents()) {
             const registry = wc.ipc?._invokeHandlers;
             if (!registry) continue;
-            const key = [...registry.keys()].find(k => k.endsWith(SUFFIX));
-            if (!key) continue;
-            const current = registry.get(key);
-            if (wrapped.get(wc)?.wrapper === current) continue;
-            // A new host is built before the previous one is disposed. Unwrap
-            // our predecessor so hot reload cannot stack wrappers forever.
-            const original = current.__cuimodModelLockOriginal || current;
-            const wrapper = async (event, sessionId, model) => {
-                const drop = decide(sessionId, model);
-                if (drop) {
-                    state.drops.push({ at: new Date().toISOString(), sessionId, from: drop.from, to: model });
-                    if (state.drops.length > KEEP_DROPS) state.drops.splice(0, state.drops.length - KEEP_DROPS);
-                    save();
-                    ctx.log('held ' + sessionId + ' on ' + drop.from + ' (refused ' + model + ')');
-                    return;
+            const owned = wrapped.get(wc) || {};
+
+            const modelKey = [...registry.keys()].find(k => k.endsWith(MODEL_SUFFIX));
+            if (modelKey) {
+                const current = registry.get(modelKey);
+                if (owned.model?.wrapper !== current) {
+                    // A new host is built before the previous one is disposed. Unwrap
+                    // our predecessor so hot reload cannot stack wrappers forever.
+                    const original = current.__cuimodModelLockOriginal || current;
+                    const wrapper = async (event, sessionId, model) => {
+                        const drop = decideModel(sessionId, model);
+                        if (drop) {
+                            rememberDrop({ kind: 'model', sessionId, from: drop.from, to: model });
+                            ctx.log('held ' + sessionId + ' on ' + drop.from + ' (refused model ' + model + ')');
+                            return;
+                        }
+                        const before = state.bySession[sessionId];
+                        const accepted = { ...(before || {}), model, at: Date.now() };
+                        state.bySession[sessionId] = accepted;
+                        save();
+                        try { return await original(event, sessionId, model); }
+                        catch (error) {
+                            if (state.bySession[sessionId] === accepted) {
+                                if (before) state.bySession[sessionId] = before;
+                                else delete state.bySession[sessionId];
+                                save();
+                            }
+                            throw error;
+                        }
+                    };
+                    wrapper.__cuimodModelLockOriginal = original;
+                    registry.set(modelKey, wrapper);
+                    owned.model = { registry, key: modelKey, original, wrapper };
                 }
-                state.bySession[sessionId] = { model, at: Date.now() };
-                save();
-                return original(event, sessionId, model);
-            };
-            wrapper.__cuimodModelLockOriginal = original;
-            registry.set(key, wrapper);
-            wrapped.set(wc, { registry, key, original, wrapper });
+            }
+
+            const effortKey = [...registry.keys()].find(k => k.endsWith(EFFORT_SUFFIX));
+            if (effortKey) {
+                const current = registry.get(effortKey);
+                if (owned.effort?.wrapper !== current) {
+                    const original = current.__cuimodEffortLockOriginal || current;
+                    const wrapper = async (event, sessionId, effort) => {
+                        const drop = decideEffort(sessionId, effort);
+                        if (drop) {
+                            rememberDrop({ kind: 'effort', sessionId, model: drop.model, from: drop.from, to: drop.to });
+                            ctx.log('held ' + sessionId + ' on effort '
+                                + (drop.known ? (drop.from ?? 'default') : 'unknown')
+                                + ' (refused ' + (drop.to ?? 'default') + ')');
+                            return;
+                        }
+                        const before = state.bySession[sessionId];
+                        const model = currentModel(sessionId);
+                        const accepted = { ...(before || {}), ...(model ? { model } : {}), effort: effort ?? null, at: Date.now() };
+                        state.bySession[sessionId] = accepted;
+                        save();
+                        try { return await original(event, sessionId, effort); }
+                        catch (error) {
+                            if (state.bySession[sessionId] === accepted) {
+                                if (before) state.bySession[sessionId] = before;
+                                else delete state.bySession[sessionId];
+                                save();
+                            }
+                            throw error;
+                        }
+                    };
+                    wrapper.__cuimodEffortLockOriginal = original;
+                    registry.set(effortKey, wrapper);
+                    owned.effort = { registry, key: effortKey, original, wrapper };
+                }
+            }
+
+            if (owned.model || owned.effort) wrapped.set(wc, owned);
         }
         for (const [wc] of wrapped) if (wc.isDestroyed()) wrapped.delete(wc);
     }
     attach();
     ctx.every(1000, attach);
     ctx.onDispose(() => {
-        for (const { registry, key, original, wrapper } of wrapped.values())
+        for (const owned of wrapped.values()) for (const { registry, key, original, wrapper } of Object.values(owned))
             if (registry.get(key) === wrapper) registry.set(key, original);
         wrapped.clear();
     });

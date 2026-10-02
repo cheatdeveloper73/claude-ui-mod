@@ -16,17 +16,32 @@ import crypto from 'node:crypto';
 // cacheWrite5m / cacheWrite1h differ only where the provider sells the cache
 // entry's lifetime; elsewhere they are equal and the distinction never fires.
 const RATES = {
-    // OpenAI, standard tier, short-context bracket. Verified against
-    // platform.openai.com/docs/pricing on 2026-09-03, which prices input
-    // beyond 272k tokens at roughly 2x; the rollup constraint above applies
-    // here too, so these are floors for conversations that cross the bracket.
-    // Sol's rate is promotional at least through 2026-11-21 -- revisit then
-    // rather than guessing the successor rate. Cache writes bill at 1.25x
-    // input; our openai records carry no cache creation, so that multiplier
-    // is carried for completeness, not use.
+    // OpenAI, standard tier, short-context bracket. GPT-6 Sol and Luna were
+    // verified against their official model pages on 2026-09-22; the older
+    // entries against platform.openai.com/docs/pricing on 2026-09-03. Requests
+    // beyond 272k input tokens bill input/cache at 2x and output at 1.5x. The
+    // rollup cannot separate that bracket, so these are floors for conversations
+    // that cross it. GPT-5.6 Sol's rate is promotional at least through
+    // 2026-11-21 -- revisit then rather than guessing the successor rate. Cache
+    // writes bill at 1.25x input; our OpenAI records carry no cache creation, so
+    // that multiplier is carried for completeness, not use.
     'openai/gpt-6-astra': [
         { from: null, to: null,
           input: 10.00, cacheRead: 1.00, cacheWrite5m: 12.50, cacheWrite1h: 12.50, output: 50.00 },
+    ],
+    // GPT-6.1 Sol's cached input is half of GPT-6 Sol's; everything else matches.
+    // Verified against its official model page on 2026-09-29.
+    'openai/gpt-6.1-sol': [
+        { from: '2026-09-29', to: null,
+          input: 2.00, cacheRead: 0.10, cacheWrite5m: 2.50, cacheWrite1h: 2.50, output: 10.00 },
+    ],
+    'openai/gpt-6-sol': [
+        { from: '2026-09-22', to: null,
+          input: 2.00, cacheRead: 0.20, cacheWrite5m: 2.50, cacheWrite1h: 2.50, output: 10.00 },
+    ],
+    'openai/gpt-6-luna': [
+        { from: '2026-09-22', to: null,
+          input: 0.10, cacheRead: 0.01, cacheWrite5m: 0.125, cacheWrite1h: 0.125, output: 0.50 },
     ],
     'openai/gpt-5.6-sol': [
         { from: null, to: null,
@@ -43,8 +58,22 @@ const RATES = {
 
     // Anthropic first-party API. Verified against
     // docs.claude.com/en/docs/about-claude/pricing on 2026-09-03. Cache reads
-    // bill at 0.1x input -- 0.025x on Fable 5.1 specifically -- and cache
+    // bill at 0.1x input -- 0.025x on Fable 5.1, 0.05x on Opus 5.5 -- and cache
     // writes at 1.25x for the 5-minute TTL and 2x for the 1-hour TTL.
+    // Opus 5.5 verified against platform.claude.com/docs/en/about-claude/pricing
+    // on 2026-09-28; its cache read is 0.05x input, not 0.1x. Sonnet 5.5 was
+    // not yet on that page on 2026-09-28: its row comes from Anthropic's own
+    // model table (cached 2026-09-25), which states Sonnet 5's prices carry
+    // over, with cache writes at the standard multipliers. Re-verify once
+    // the pricing page lists it.
+    'claude/claude-opus-5-5': [
+        { from: null, to: null,
+          input: 4.00, cacheRead: 0.20, cacheWrite5m: 5.00, cacheWrite1h: 8.00, output: 20.00 },
+    ],
+    'claude/claude-sonnet-5-5': [
+        { from: null, to: null,
+          input: 2.00, cacheRead: 0.20, cacheWrite5m: 2.50, cacheWrite1h: 4.00, output: 10.00 },
+    ],
     'claude/claude-opus-5': [
         { from: null, to: null,
           input: 5.00, cacheRead: 0.50, cacheWrite5m: 6.25, cacheWrite1h: 10.00, output: 25.00 },

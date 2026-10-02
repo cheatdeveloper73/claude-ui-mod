@@ -239,6 +239,31 @@ test('the OpenAI Responses adapter finds the same three intervals', () => {
     assert.equal(record.deltaEvents, 2);
 });
 
+test('a hidden Responses round cannot own the final turn clock or token series', () => {
+    const c = clock();
+    const ledger = ledgerAt('openai-hidden-round.jsonl', c);
+    const sample = ledger.begin({ provider: 'openai', requestedModel: 'gpt-5.6-sol', streaming: true });
+    sample.upstream();
+    c.tick(100);
+    sample.openai({ type: 'response.completed', response: { id: 'resp_hidden', usage: { output_tokens: 4 } } });
+    assert.equal(ledger.snapshot().live[0].observedTokens, 4);
+    sample.nextOpenAIResponse();
+    assert.equal(ledger.snapshot().live[0].observedTokens, null);
+    c.tick(400);
+    sample.openai({ type: 'response.output_text.delta', delta: 'visible answer' });
+    c.tick(500);
+    sample.openai({ type: 'response.completed', response: { id: 'resp_final', usage: { output_tokens: 2 } } });
+    assert.equal(ledger.snapshot().live[0].observedTokens, 2,
+        'a smaller final response count must not be rejected behind the hidden response');
+    sample.complete({ responseId: 'resp_final', servedModel: 'gpt-5.6-sol', usage: { output_tokens: 2 } });
+
+    const [record] = ledger.records;
+    assert.equal(record.responseId, 'resp_final');
+    assert.equal(record.totalMs, 1000);
+    assert.equal(record.streamMs, 500);
+    assert.equal(record.series, null, 'the hidden response is not part of the final response curve');
+});
+
 test('percentiles ignore unmeasured samples and never invent one', () => {
     assert.equal(percentiles([null, null]), null);
     const p = percentiles([10, null, 20, 30, 40]);

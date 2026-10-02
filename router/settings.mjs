@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizePromptPolicySettings } from './prompt-policy.mjs';
 
 export const PROVIDER_DEFAULTS = Object.freeze({
+    reasoningEnabled: true,
     reasoningSummary: 'auto',
     showReasoningText: false,
     logUpstreamIdentity: true,
@@ -29,6 +30,7 @@ function readDashboardSettings()
 export function readProviderSettings() {
     const saved = readDashboardSettings()['provider-picker'];
     return {
+        reasoningEnabled: typeof saved?.reasoningEnabled === 'boolean' ? saved.reasoningEnabled : PROVIDER_DEFAULTS.reasoningEnabled,
         reasoningSummary: ['auto', 'detailed', 'off'].includes(saved?.reasoningSummary) ? saved.reasoningSummary : PROVIDER_DEFAULTS.reasoningSummary,
         showReasoningText: saved?.showReasoningText === true,
         logUpstreamIdentity: saved?.logUpstreamIdentity !== false,
@@ -80,5 +82,42 @@ export function readContextSettings()
         windowReset: saved?.windowReset === true,
         truncationBytes: Number.isFinite(bytes) && bytes >= 1000 && bytes <= 100000
             ? Math.round(bytes) : CONTEXT_DEFAULTS.truncationBytes,
+    };
+}
+
+function bareModel(value)
+{
+    return String(value || '').trim().toLowerCase()
+        .replace(/\[[^\]]*\]$/, '')
+        .replace(/:(low|medium|high|xhigh|max)$/, '')
+        .replace(/^claude-/, '');
+}
+
+function configuredWindow(value)
+{
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 100000 && number <= 1000000
+        ? Math.round(number) : null;
+}
+
+// This is the launch/live policy the Claude Code worker resolves, not a model
+// limit. Context management needs it because Codex budgets against the earlier
+// of the client's auto-compact scope and the provider's full context window.
+export function readAutoCompactBudget(model, sessionId)
+{
+    const saved = readDashboardSettings()['auto-compact'];
+    const overrides = saved?.sessionOverrides && typeof saved.sessionOverrides === 'object'
+        && !Array.isArray(saved.sessionOverrides) ? saved.sessionOverrides : {};
+    const override = typeof sessionId === 'string' ? overrides[sessionId] : null;
+    const enabled = typeof override?.enabled === 'boolean' ? override.enabled : saved?.enabled === true;
+    const perModel = saved?.perModel && typeof saved.perModel === 'object' && !Array.isArray(saved.perModel)
+        ? saved.perModel : {};
+    const sessionWindow = configuredWindow(override?.window);
+    const modelWindow = configuredWindow(perModel[bareModel(model)]);
+    const defaultWindow = configuredWindow(saved?.defaultWindow);
+    return {
+        enabled,
+        window: sessionWindow ?? modelWindow ?? defaultWindow,
+        source: sessionWindow !== null ? 'session' : modelWindow !== null ? 'model' : defaultWindow !== null ? 'default' : 'auto',
     };
 }

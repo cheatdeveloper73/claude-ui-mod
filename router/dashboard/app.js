@@ -1,6 +1,7 @@
 'use strict';
 
-const state = { data: null, provider: 'all', horizon: 60, range: 'all', loading: false, compact: false, accountQuery: '' };
+const state = { data: null, provider: 'all', horizon: 60, range: 'all', loading: false, compact: false, accountQuery: '',
+    poolPin: null, poolPinBusy: false, poolPinError: null };
 // Visual identity is independent of provider discovery. New providers still
 // appear from the payload without a client registration or a guessed brand hue.
 const colours = { claude: 'var(--claude)', openai: 'var(--openai)', gemini: 'var(--gemini)',
@@ -816,6 +817,126 @@ function renderGateway()
         + (updated ? `Last read ${age(updated)}.` : 'Not yet read.');
 }
 
+function poolPinAccountName(id)
+{
+    const account = state.poolPin?.accounts?.find(row => row.id === id);
+    return account?.name || (Number.isSafeInteger(id) ? `Account ${id}` : 'Unknown account');
+}
+
+function renderPoolPin()
+{
+    const root = $('#pool-pin');
+    const pool = state.poolPin;
+    const visible = !!pool || !!state.poolPinError;
+    root.hidden = !visible;
+    if (!visible) { swapChildren(root, []); return; }
+
+    const head = el('div', 'pool-pin-head');
+    const copy = el('div');
+    copy.append(el('p', 'eyebrow', 'ACCOUNT POOL CONTROL'));
+    copy.append(el('h3', null, pool?.label || 'Account pool'));
+    let status = 'Control unavailable';
+    if (state.poolPinBusy) status = 'Applying…';
+    else if (pool?.mode === 'auto') status = pool.applied ? 'Mode: Auto' : 'Auto requested · not verified';
+    else if (pool?.mode === 'pinned') status = pool.applied
+        ? `Pinned: ${pool.appliedAccountName || poolPinAccountName(pool.appliedAccountId)}`
+        : `Target: ${pool.targetAccountName || poolPinAccountName(pool.targetAccountId)} · not verified`;
+    head.append(copy, el('span', 'pool-pin-state', status));
+
+    const controls = el('div', 'segmented pool-pin-controls');
+    controls.setAttribute('role', 'group');
+    controls.setAttribute('aria-label', pool?.label || 'Account pool');
+    const auto = el('button', null, 'Auto');
+    auto.type = 'button';
+    auto.dataset.poolPinAction = 'auto';
+    auto.disabled = state.poolPinBusy;
+    auto.setAttribute('aria-pressed', String(pool?.mode === 'auto' && pool?.applied === true));
+    if (pool?.mode === 'auto' && pool?.applied === false) auto.classList.add('target');
+    controls.append(auto);
+
+    for (const account of pool?.accounts || [])
+    {
+        const button = el('button', null, account.name || `Account ${account.id}`);
+        button.type = 'button';
+        button.dataset.poolPinAction = 'pin';
+        button.dataset.accountId = String(account.id);
+        button.disabled = state.poolPinBusy;
+        const active = pool.applied === true && pool.appliedAccountId === account.id;
+        button.setAttribute('aria-pressed', String(active));
+        if (!active && pool.targetAccountId === account.id) button.classList.add('target');
+        button.title = `${account.schedulable ? 'Schedulable' : 'Paused'}${account.status ? ` · ${account.status}` : ''}`;
+        controls.append(button);
+    }
+
+    const nodes = [head, controls];
+    const message = pool?.error?.message || state.poolPinError;
+    if (message)
+    {
+        let prefix = 'Pool control failed';
+        if (pool?.mode === 'pinned' && pool?.applied !== true) prefix = 'Pin failed — pool was not verified';
+        else if (pool?.mode === 'auto' && pool?.applied !== true) prefix = 'Auto restore failed — original pool state was not verified';
+        nodes.push(el('p', 'pool-pin-error', `${prefix}. ${message}`));
+    }
+    swapChildren(root, nodes);
+}
+
+async function fetchPoolPin()
+{
+    try
+    {
+        const response = await fetch('/poolpinz', { cache: 'no-store' });
+        if (response.status === 501)
+        {
+            state.poolPin = null;
+            state.poolPinError = null;
+            renderPoolPin();
+            return null;
+        }
+        const value = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(value?.error?.message || `Pool control returned ${response.status}`);
+        if (!value || !Array.isArray(value.accounts)) throw new Error('Invalid pool control status');
+        state.poolPin = value;
+        state.poolPinError = null;
+    }
+    catch (error)
+    {
+        state.poolPinError = String(error?.message || error);
+    }
+    renderPoolPin();
+    return state.poolPin;
+}
+
+async function setPoolPin(action, id = null)
+{
+    if (state.poolPinBusy) return;
+    state.poolPinBusy = true;
+    state.poolPinError = null;
+    renderPoolPin();
+    let postError = null;
+    try
+    {
+        const body = action === 'pin' ? { action, id } : { action: 'auto' };
+        const response = await fetch('/poolpinz', {
+            method: 'POST', cache: 'no-store',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const value = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(value?.error?.message || `Pool control returned ${response.status}`);
+        if (value && Array.isArray(value.accounts)) state.poolPin = value;
+    }
+    catch (error)
+    {
+        postError = String(error?.message || error);
+        state.poolPinError = postError;
+    }
+
+    await fetchPoolPin();
+    if (postError && !state.poolPin?.error) state.poolPinError = postError;
+    state.poolPinBusy = false;
+    renderPoolPin();
+}
+
 function renderSources()
 {
     const nodes = [];
@@ -1004,7 +1125,7 @@ function render()
     if (!state.data) return;
     renderProviderFilter(); renderLegend(); renderHorizonLabel();
     renderKpis(); renderForecasts(); renderModels(); renderTimeline();
-    renderSpend(); renderGateway(); renderRates();
+    renderSpend(); renderGateway(); renderRates(); renderPoolPin();
     renderSources(); renderMetersTable(); renderEvents();
     renderRangeNote();
     $('#generated').textContent = 'Generated ' + new Date(state.data.generatedAt).toLocaleString();
@@ -1013,6 +1134,7 @@ function render()
 async function load(force = false)
 {
     if (force && state.loading) return;
+    void fetchPoolPin();
     const generation = ++requestGeneration;
     requestController?.abort();
     const controller = new AbortController();
@@ -1150,6 +1272,18 @@ $('#density').addEventListener('click', event => {
     state.compact = !state.compact;
     event.currentTarget.textContent = state.compact ? 'Comfortable rows' : 'Compact rows';
     renderMetersTable();
+});
+$('#pool-pin').addEventListener('click', event => {
+    let button = event.target;
+    while (button && button !== event.currentTarget && button.tagName !== 'BUTTON') button = button.parentElement;
+    if (!button || button === event.currentTarget || state.poolPinBusy) return;
+    const action = button.dataset.poolPinAction;
+    if (action === 'auto') void setPoolPin('auto');
+    else if (action === 'pin')
+    {
+        const id = Number(button.dataset.accountId);
+        if (Number.isSafeInteger(id) && id > 0) void setPoolPin('pin', id);
+    }
 });
 $('#theme').addEventListener('click', toggleTheme);
 $('#copy-snapshot').addEventListener('click', event => copyText(JSON.stringify(state.data, null, 2), 'Copied dashboard snapshot', event.currentTarget));

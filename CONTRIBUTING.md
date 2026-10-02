@@ -11,6 +11,7 @@ cd claude-ui-mod
 npm ci                   # one pinned dependency; see below
 node patch.js apply      # Claude Desktop must be fully quit
 node selfcheck.js        # should print SELFCHECK PASS
+npm run check:public     # the full public regression suite
 ```
 
 There is no build step. The injected UI is plain CommonJS run by the app's own
@@ -47,8 +48,15 @@ Both of these break the running app, and neither is caught by review-by-eye:
   Anything else leaks into a long-running window on every reload, and the app
   stays open for days.
 
-Two more that matter for review:
+Four more that matter for review:
 
+- **Never edit a watched `router/*.mjs` file incrementally.** The supervisor
+  treats a save as a deployment: it boots the file as a candidate worker and
+  switches new requests to it once it passes `/healthz` and a semantic canary.
+  A half-edited file is a live change, not a draft. Assemble the complete
+  candidate outside `router/`, run `node scripts/router-canary.mjs --router-dir
+  <your-dir>` and the router tests against it, then replace the files together.
+  `router/supervisor.mjs` is the stable listener and is not hot-swapped.
 - **Keep `src/main-hook.js` and `src/preload-hook.js` dumb.** They are baked
   into the asar and cost every user a re-patch and a restart to change. Feature
   logic goes in `src/runtime/host.js` or in a plugin. A merge request that adds
@@ -56,6 +64,11 @@ Two more that matter for review:
 - **Do not hardcode the eipc build uuid.** It changes per build. `patch.js`
   lifts it out of the shipped preload; compose channels with
   `cuimod.eipc(ns, iface, method)`.
+- **Keep provider specifics inside an adapter.** A backend that needs code lives
+  in `router/adapters/<name>/`, and shared router and plugin code never names
+  it. If you need a backend-specific fact in shared code, expose it as a field
+  on the adapter's own snapshot instead. `npm run check:public` must pass with
+  no adapter loaded.
 
 ## Style
 
@@ -74,9 +87,8 @@ you verified it against.
 The canonical home is <https://gitlab.com/blockshooter/claude-ui-mod>. Clone from
 there; a copy on any other host is a mirror and may be behind.
 
-New commits here are authored as
-`blockshooter <41701748-blockshooter@users.noreply.gitlab.com>`. Commits predating
-the move to GitLab carry the old `cheatdeveloper73` GitHub no-reply address.
+New commits here are authored under the maintainer's GitLab no-reply address.
+Older history carries the no-reply address of the previous GitHub account.
 
 Do not put a personal mailbox in a commit you send here. The author line is
 permanent, it is served to everyone who clones, and correcting it after the fact

@@ -21,7 +21,12 @@ let V = { ...DEF };
 let statusNode = null;
 let statusBody = null;
 let driftNode = null;
-let statusBusy = false;
+let statusGeneration = 0;
+let statusFlight = null;
+let statusQueued = false;
+let statusSessionId = cuimod.sessionId || null;
+let rendererDisposed = false;
+let stopSessionStatus = null;
 
 function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -45,6 +50,9 @@ function statusCard() {
 .cm-grid .k { color:hsl(var(--text-500)); }
 .cm-grid .v { color:hsl(var(--text-300)); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .cm-empty { margin-top:9px; font-size:11px; line-height:1.45; color:hsl(var(--text-500)); }
+.cm-notes { grid-column:1/-1; margin-top:4px; padding-top:8px; border-top:1px solid color-mix(in srgb,hsl(var(--text-100)) 8%,transparent); }
+.cm-notes .h { margin-bottom:4px; color:hsl(var(--text-500)); }
+.cm-notes .n { color:hsl(var(--text-300)); overflow-wrap:anywhere; line-height:1.45; }
 .cm-drift { margin-top:10px; font-size:11px; line-height:1.5; border-radius:8px; padding:8px 10px;
     background:color-mix(in srgb,#f3cb8a 12%,transparent); border:1px solid color-mix(in srgb,#f3cb8a 32%,transparent);
     color:hsl(var(--text-200)); }
@@ -72,11 +80,36 @@ function renderDrift(drift) {
     for (const note of drift.notes || []) driftNode.append(el('div', null, note));
 }
 
+function statusOwned(owner) {
+    return !rendererDisposed && owner.generation === statusGeneration
+        && owner.sessionId === statusSessionId && owner.sessionId === (cuimod.sessionId || null);
+}
+
+function invalidateStatus(sessionId = cuimod.sessionId || null) {
+    statusGeneration++;
+    statusFlight = null;
+    statusQueued = false;
+    statusSessionId = sessionId;
+    if (statusBody) {
+        statusBody.className = 'cm-empty';
+        statusBody.textContent = sessionId ? 'Reading this session’s router status…' : 'Open a Code session to see its context window state.';
+    }
+}
+
 async function refreshStatus() {
-    if (statusBusy || !statusBody) return;
-    statusBusy = true;
+    if (rendererDisposed || !statusBody) return false;
+    const sessionId = cuimod.sessionId || null;
+    if (sessionId !== statusSessionId) invalidateStatus(sessionId);
+    const generation = statusGeneration;
+    if (statusFlight?.generation === generation) {
+        statusQueued = true;
+        return statusFlight.promise;
+    }
+    const owner = { generation, sessionId, promise: null };
+    const run = Promise.resolve().then(async () => {
     try {
-        const value = await cuimod.rpc('context-management.status', { sessionId: cuimod.sessionId });
+        const value = await cuimod.rpc('context-management.status', { sessionId });
+        if (!statusOwned(owner)) return false;
         const dot = statusNode.querySelector('.cm-dot');
         const window = value?.window;
         const drift = value?.drift;
@@ -95,24 +128,71 @@ async function refreshStatus() {
         const activity = value.activity || {};
         row(statusBody, 'Window', `${window.windowId.slice(0, 8)} (${window.windows} this session)`);
         row(statusBody, 'Previous', window.previousWindowId ? window.previousWindowId.slice(0, 8) : 'none — no reset yet');
-        // Turns and hint calls prove the lane is running; tool calls only happen
-        // when the model decides to write or read something, which is normal to
-        // see at zero early in a session.
+        if (window.quarantinedPriorNamespace) row(statusBody, 'Agent isolation', window.quarantinedAt
+            ? `mixed-agent state quarantined ${new Date(window.quarantinedAt).toLocaleString()}`
+            : 'mixed-agent state quarantined');
+        // Every value is durable window metadata. A router generation swap must
+        // not turn completed resets or model calls back into "none yet".
         row(statusBody, 'Turns routed', `${activity.turns || 0}${activity.lastTurnAt ? ` · last ${new Date(activity.lastTurnAt).toLocaleTimeString()}` : ''}`);
-        row(statusBody, 'Notes lookups', String(activity.hintCalls || 0));
-        row(statusBody, 'Model tool calls', activity.toolCalls
-            ? `${activity.toolCalls} · last ${new Date(activity.lastToolCallAt).toLocaleTimeString()}`
-            : 'none yet — the model writes when it needs to');
-        row(statusBody, 'Budget left', Number.isFinite(activity.remaining)
-            ? `${Number(activity.remaining).toLocaleString()} tokens` : 'unknown');
+        row(statusBody, 'Thread-hint probes', String(activity.hintCalls || 0));
+        const modelCalls = activity.modelCalls ?? activity.toolCalls ?? 0;
+        row(statusBody, 'Model calls', modelCalls
+            ? `${modelCalls} · last ${new Date(activity.lastModelCallAt || activity.lastToolCallAt).toLocaleTimeString()}`
+            : 'none yet');
+        row(statusBody, 'Notes calls', String(activity.noteCalls || 0));
+        row(statusBody, 'History calls', String(activity.historyCalls || 0));
+        const resets = activity.resets || Math.max(0, Number(window.windows || 1) - 1);
+        row(statusBody, 'Context resets', resets
+            ? `${resets} · model ${activity.modelResets || 0} · forced ${activity.forcedResets || 0} · compact ${activity.compactionResets || 0}`
+                + (activity.unattributedResets ? ` · earlier ${activity.unattributedResets}` : '')
+            : 'none yet');
+        if (activity.lastResetAt) {
+            const cause = activity.lastResetCause === 'model' ? 'model-requested reset'
+                : activity.lastResetCause === 'forced' ? 'forced boundary reset'
+                : activity.lastResetCause === 'compaction' ? 'client compaction reset'
+                : 'earlier reset';
+            row(statusBody, 'Last transition', `${cause} · ${new Date(activity.lastResetAt).toLocaleTimeString()}`);
+        }
+        const budget = activity.budget || {};
+        row(statusBody, 'Budget left', Number.isFinite(budget.remaining ?? activity.remaining)
+            ? `${Number(budget.remaining ?? activity.remaining).toLocaleString()} tokens` : 'unknown');
+        if (Number.isFinite(budget.forceRemaining))
+            row(statusBody, 'Forced reset in', `${Number(budget.forceRemaining).toLocaleString()} tokens`);
+        if (Number.isFinite(budget.forceLimit)) {
+            const source = budget.autoCompactSource && budget.autoCompactSource !== 'auto'
+                ? ` · ${budget.autoCompactSource} policy` : '';
+            row(statusBody, 'Reset boundary', `${Number(budget.forceLimit).toLocaleString()} tokens${source}`);
+        }
+        if (window.pendingClientReset) row(statusBody, 'Client handoff', 'waiting for compacted transcript');
         if (activity.failures) row(statusBody, 'Failed calls', String(activity.failures));
         row(statusBody, 'Client version', value.clientVersion || 'unknown');
+        const notes = String(window.threadHint || '').split('\n').filter(line => /^- \/.+/.test(line));
+        if (notes.length) {
+            const block = el('div', 'cm-notes');
+            block.append(el('div', 'h', 'Recent model notes'));
+            for (const note of notes) block.append(el('div', 'n', note.slice(2)));
+            statusBody.append(block);
+        }
         if (value.lastError) row(statusBody, 'Last error', value.lastError);
         renderDrift(drift);
+        return true;
     } catch (_) {
+        if (!statusOwned(owner)) return false;
         statusBody.className = 'cm-empty';
         statusBody.textContent = 'Router status is temporarily unavailable.';
-    } finally { statusBusy = false; }
+        return false;
+    } finally {
+        if (statusFlight !== owner) return;
+        statusFlight = null;
+        if (statusQueued && statusOwned(owner)) {
+            statusQueued = false;
+            queueMicrotask(refreshStatus);
+        }
+    }
+    });
+    owner.promise = run;
+    statusFlight = owner;
+    return run;
 }
 
 const spec = {
@@ -127,9 +207,9 @@ const spec = {
         { key: 'notesTools', type: 'toggle', label: 'Notes tools', group: 'Channel',
           hint: 'Gives the model a server-side scratchpad that survives a window reset. Additive: nothing else about the turn changes.' },
         { key: 'reminders', type: 'toggle', label: 'Budget guidance', group: 'Channel',
-          hint: 'Injects the model-owned guidance, and one reminder per window once the remaining budget crosses the threshold.' },
+          hint: 'Budgets against the earlier of the configured auto-compact trigger and the model ceiling, then reserves Codex’s fallback buffer.' },
         { key: 'windowReset', type: 'toggle', label: 'Window reset', group: 'Continuity',
-          hint: 'Lets the model call new_context. Later turns are sent from the cut point instead of the whole transcript, so continuity moves to its notes.' },
+          hint: 'Lets the model call new_context. Manual, automatic and exhausted-window fallbacks also reset without summarizing.' },
         { key: 'historyTools', type: 'toggle', label: 'Transcript archive', group: 'Continuity',
           hint: 'Asks OpenAI to ingest and index this thread, and gives the model four tools to search it. Notes are what the model chose to write; this is the whole transcript, kept on their servers. Off by default for that reason.' },
         { key: 'truncationBytes', type: 'slider', label: 'Tool output ceiling', min: 1000, max: 100000, step: 1000,
@@ -150,9 +230,18 @@ const REG = (globalThis.__cuimodReg || (globalThis.__cuimodReg = { specs: new Ma
 REG.specs.set(spec.plugin, spec);
 REG.subs.forEach(fn => { try { fn(); } catch (_) {} });
 ctx.onDispose(() => {
+    rendererDisposed = true;
+    if (typeof stopSessionStatus === 'function') stopSessionStatus();
+    stopSessionStatus = null;
+    statusGeneration++;
+    statusFlight = null;
+    statusQueued = false;
     REG.specs.delete(spec.plugin);
     REG.subs.forEach(fn => { try { fn(); } catch (_) {} });
 });
 
-cuimod.onSessionChange(refreshStatus);
+stopSessionStatus = cuimod.onSessionChange((sessionId) => {
+    invalidateStatus(sessionId || null);
+    refreshStatus();
+});
 ctx.every(4000, refreshStatus);

@@ -7,14 +7,16 @@ import { RouterSupervisor } from '../router/supervisor.mjs';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function workerSource(version, exitAfterHealth = false)
+function workerSource(version, exitAfterHealth = false, slowDurationMs = 350)
 {
     return `import http from 'node:http';
 const version=${JSON.stringify(version)};
 const exitAfterHealth=${JSON.stringify(exitAfterHealth)};
+const slowDurationMs=${JSON.stringify(slowDurationMs)};
 const server=http.createServer((req,res)=>{
     if(req.url==='/healthz'){res.end(JSON.stringify({ok:true,version}));if(exitAfterHealth)setTimeout(()=>process.exit(17),10);return;}
-    if(req.url==='/slow'){res.write(version+'-start\\n');setTimeout(()=>res.end(version+'-end\\n'),350);return;}
+    if(req.url==='/slow'){res.write(version+'-start\\n');setTimeout(()=>res.end(version+'-end\\n'),slowDurationMs);return;}
+    if(req.url==='/hang'){res.write(version+'-start\\n');return;}
     res.end(version);
 });
 server.requestTimeout=0;server.listen(Number(process.env.MODEL_ROUTER_WORKER_PORT),'127.0.0.1');
@@ -82,6 +84,100 @@ test('supervisor swaps only healthy workers and drains old streams', async () =>
         fs.writeFileSync(entry, workerSource('v3'));
         await waitFor(() => supervisor.current?.generation >= 4 && !supervisor.reloading, 'healthy v3 worker');
         assert.equal(await (await fetch(endpoint + '/version')).text(), 'v3');
+    }
+    finally
+    {
+        await supervisor.close();
+        fs.rmSync(temp, { recursive: true, force: true });
+    }
+});
+
+test('rollback expiry keeps an active old response until it drains', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-supervisor-long-drain-'));
+    const entry = path.join(temp, 'worker.mjs');
+    fs.writeFileSync(entry, workerSource('v1', false, 2200));
+    const supervisor = new RouterSupervisor({ entry, watchDir: temp, port: 0,
+        rollbackWindowMs: 150, retiredDrainTimeoutMs: 4000, canary: false });
+
+    try
+    {
+        await supervisor.start();
+        const endpoint = `http://127.0.0.1:${supervisor.server.address().port}`;
+        const response = await fetch(endpoint + '/slow');
+        const reader = response.body.getReader();
+        const first = Buffer.from((await reader.read()).value).toString();
+        const old = supervisor.current;
+        fs.writeFileSync(entry, workerSource('v2'));
+        await waitFor(() => supervisor.current?.generation === 2 && !supervisor.reloading, 'long-drain replacement');
+        await waitFor(() => supervisor.standby === null, 'long-drain rollback expiry');
+        const status = await (await fetch(endpoint + '/supervisorz')).json();
+        assert.equal(status.retiredDrainTimeoutMs, 4000);
+        assert.equal(old.exited, false);
+        assert.equal(old.active, 1);
+
+        let rest = '';
+        for (;;)
+        {
+            const part = await reader.read();
+            if (part.done) break;
+            rest += Buffer.from(part.value).toString();
+        }
+        assert.equal(first + rest, 'v1-start\nv1-end\n');
+        await waitFor(() => old.exited, 'completed old response cleanup');
+        assert.equal(await (await fetch(endpoint + '/version')).text(), 'v2');
+    }
+    finally
+    {
+        await supervisor.close();
+        fs.rmSync(temp, { recursive: true, force: true });
+    }
+});
+
+test('retired worker with a wedged response still has a hard drain deadline', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-supervisor-wedged-drain-'));
+    const entry = path.join(temp, 'worker.mjs');
+    fs.writeFileSync(entry, workerSource('v1'));
+    const supervisor = new RouterSupervisor({ entry, watchDir: temp, port: 0,
+        rollbackWindowMs: 150, retiredDrainTimeoutMs: 600, canary: false });
+
+    try
+    {
+        await supervisor.start();
+        const endpoint = `http://127.0.0.1:${supervisor.server.address().port}`;
+        const response = await fetch(endpoint + '/hang');
+        const reader = response.body.getReader();
+        assert.equal(Buffer.from((await reader.read()).value).toString(), 'v1-start\n');
+        const old = supervisor.current;
+        fs.writeFileSync(entry, workerSource('v2'));
+        await waitFor(() => supervisor.current?.generation === 2 && !supervisor.reloading, 'wedged replacement');
+        await waitFor(() => supervisor.standby === null, 'wedged rollback expiry');
+        assert.equal(old.exited, false);
+        await waitFor(() => old.exited, 'wedged retired worker deadline');
+        assert.equal(await (await fetch(endpoint + '/version')).text(), 'v2');
+        await reader.cancel().catch(() => {});
+    }
+    finally
+    {
+        await supervisor.close();
+        fs.rmSync(temp, { recursive: true, force: true });
+    }
+});
+
+test('supervisor reloads when a nested adapter module changes', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-supervisor-nested-watch-'));
+    const entry = path.join(temp, 'worker.mjs');
+    const adapter = path.join(temp, 'adapters', 'fixture', 'index.mjs');
+    fs.mkdirSync(path.dirname(adapter), { recursive: true });
+    fs.writeFileSync(entry, workerSource('v1'));
+    fs.writeFileSync(adapter, 'export default 1;\n');
+    const supervisor = new RouterSupervisor({ entry, watchDir: temp, port: 0, rollbackWindowMs: 2000, canary: false });
+
+    try
+    {
+        await supervisor.start();
+        assert.equal(supervisor.current?.generation, 1);
+        fs.writeFileSync(adapter, 'export default 2;\n');
+        await waitFor(() => supervisor.current?.generation >= 2 && !supervisor.reloading, 'nested adapter-triggered reload');
     }
     finally
     {

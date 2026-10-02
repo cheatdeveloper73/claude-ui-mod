@@ -1,29 +1,115 @@
 # claude-ui-mod
 
-Custom UI injected into the **Claude Desktop** app on Windows, with a plugin
-runtime you can edit while the app is running. Save a file and the change is
-live: no restart, no page reload, no interruption to a Claude Code session
-that is mid-turn.
+**A hot-reloadable plugin runtime for Claude Desktop on Windows, with 33 plugins
+in the box.** Task rail, subagent HUD, send queue, provider picker, per-response
+throughput, and fixes for Claude Code Desktop bugs, injected into the app and
+editable while it runs: save a file and the change is live, with no restart and
+no interruption to a Claude Code session that is mid-turn.
+
+**Always-on voice assistant.** Say the wake phrase (`hey agent` by default),
+speak the prompt, and hear a spoken summary of the reply. Dictation,
+transcription and speech all run on your own machines, not through a cloud
+relay. Optional; see [voice-agent/README.md](voice-agent/README.md).
+
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![platform: Windows](https://img.shields.io/badge/platform-Windows-0078d4.svg)](#requirements)
+[![version: 1.2.0](https://img.shields.io/badge/version-1.2.0-informational.svg)](CHANGELOG.md)
+[![node: >=18](https://img.shields.io/badge/node-%3E%3D18-339933.svg)](#requirements)
 
 > Unofficial and unaffiliated with Anthropic. It rewrites files inside your
 > local Claude Desktop install. Read [SECURITY.md](SECURITY.md) before using it.
 
-```
-Insert                     open the dashboard (live controls for every plugin)
-node patch.js apply        inject into the newest installed app-<version>
-node patch.js revert       put the original app.asar and claude.exe back
-node selfcheck.js          compile + wiring + leak check, touches nothing
-```
+**33 plugins in six categories:** 8 bug fixes, 2 unlocks, 5 for providers and
+routing, 6 for agents and automation, 5 for usage and context, 7 for transcript
+and appearance. [At a glance](#at-a-glance) lists every one.
 
-## See it
+![all 33 plugins, grouped by category](docs/media/plugin-wall.gif)
 
 ![the whole window: task rail, usage meters, the dashboard, and the transcript restyled](docs/media/tour.gif)
 
-[Full-resolution MP4](docs/media/tour.mp4). Rendered from [`demo/`](demo) — a
+[Full-resolution MP4](docs/media/tour.mp4). Rendered from [`demo/`](demo), a
 Remotion mock of the app that pulls the plugins' real stylesheets straight out
-of `src/plugins`, so what you are looking at is the shipped CSS, not a redrawn
-approximation. What is scripted and what is real is spelled out in
+of `src/plugins`, so the GIF shows the shipped CSS, not a redrawn approximation.
+What is scripted and what is real is spelled out in
 [demo/README.md](demo/README.md).
+
+## Quickstart
+
+Quit Claude Desktop from the tray first, then:
+
+```bash
+git clone https://gitlab.com/blockshooter/claude-ui-mod && cd claude-ui-mod
+npm ci
+node patch.js apply
+```
+
+Start Claude and press **Insert** to open the dashboard. `node patch.js revert`
+puts the original files back. Setting it up with an AI agent? Point it at
+[AGENTS.md](AGENTS.md); every step there is a plain command with a check. Requirements and the update watcher are under
+[Install](#install).
+
+## Why
+
+The Code tab has no extension point, and what the app keeps in memory is thin:
+it holds almost nothing per subagent, loses the goal evaluator's verdicts, and
+steers every message typed mid-turn straight into the model. This project
+patches `app.asar` once, then moves everything else into files you can edit
+live.
+
+- **Reloads never touch your agents.** The page does not reload and Claude Code
+  CLI processes are never replaced, so a plugin edit can land in the middle of a
+  long run.
+- **State comes from the CLI's own files.** Tasks, transcripts, per-agent
+  transcripts and goal records are read from `~/.claude`, so the views survive a
+  stop-and-resume that the app's own views do not.
+- **One loopback router, one model selector.** Sessions talk to a local router
+  that picks the backend per request from the model id, so switching between
+  Claude and other models is the app's own live model switch.
+- **Nothing is hidden from you.** No telemetry, no update check, no
+  `contextBridge`, and a plugin is a plain CommonJS file you can read.
+
+## At a glance
+
+| category | plugins |
+|---|---|
+| [Bug fixes](#bug-fixes) | `file-pane-access` `fast-mode` `model-lock` `model-probe-skip` `message-time` `sendmessage-unban` `prompt-suggestions-off` `classic-stop` |
+| [Unlocks](#unlocks) | `unlock-code` `computer-use` |
+| [Providers and routing](#providers-and-routing) | `provider-picker` `provider-routing` `compaction-provider` `context-management` `auto-compact` |
+| [Agents and automation](#agents-and-automation) | `subagents` `campaigns` `goal` `queue` `voice-agent` `task-rail` |
+| [Usage and context](#usage-and-context) | `usage-bar` `context-pill` `throughput` `plan-usage-capture` `hide-usage-band` |
+| [Transcript and appearance](#transcript-and-appearance) | `thinking-default` `thinking-style` `transcript-type` `transcript-copy` `waiting-label` `branding` `dashboard` |
+
+## Highlights
+
+**voice-agent** — wake phrase, local dictation, spoken summaries. A recorder
+process writes every microphone block to disk before anything else sees it, so a
+restart never drops audio, and a prompt reaches the composer at most once.
+Claude's own tool permissions stay the authority after a voice prompt is
+submitted.
+
+**provider-picker** — provider tabs inside the app's own model picker, per
+conversation, with the native effort slider. OpenAI models run on the Codex
+login you already hold.
+
+![provider tabs inside the native model picker](docs/media/crop-provider-picker.gif)
+
+**subagents** — a HUD of this session's agents: who is running, what tool they
+are on, how long. Click one for its transcript and controls, and for what passed
+between it and its parent.
+
+![the subagent rail and an agent's transcript sheet](docs/media/crop-subagents.gif)
+
+**throughput** — real tokens per second, measured at the router from the
+provider's exact token counts, split into upstream hop, prefill and generation
+and attributed to the main session or the named subagent that produced it.
+
+![per-response and per-agent generation rate](docs/media/crop-throughput.gif)
+
+**queue** — Enter mid-turn is intercepted before the app sees it and the message
+lands in a rail above the prompt, with steer, edit and delete per row, and
+auto-send when the turn ends.
+
+![the explicit send queue above the composer](docs/media/crop-queue.gif)
 
 **task-rail** — rows fade in as the agent creates tasks, and a status flip
 re-fades the row and re-tweens the box. Bottom edge stays flush with the
@@ -31,10 +117,11 @@ composer.
 
 ![the task rail through two status flips](docs/media/crop-task-rail.gif)
 
-**usage-bar** — context from the CLI's own reply, the plan percentage off disk,
-the compaction mark drawn where the CLI says it fires.
+**usage-bar** — context from the CLI's own reply with the compaction mark drawn
+where the CLI says it fires, and plan and provider quota windows in the app's
+own usage ring.
 
-![context and rate-limit meters in the composer footer](docs/media/crop-usage-bar.gif)
+![context and rate-limit meters](docs/media/crop-usage-bar.gif)
 
 **dashboard** — Insert. The composer footer stays in shot: the setting lands in
 the running app as the switch is flipped, and the frames beside the panel are a
@@ -48,67 +135,181 @@ by forcing a font on the subtree.
 
 ![thinking blocks and transcript typography being restyled](docs/media/crop-transcript.gif)
 
-## What ships
+## Plugins
+
+33 plugins ship in `src/plugins/`. Most have a panel in the dashboard, and
+adding your own needs no re-patch: drop a directory into `src/plugins/` and it
+loads live. See [docs/plugin-api.md](docs/plugin-api.md).
+
+### Bug fixes
+
+Eight fixes for things Claude Code Desktop gets wrong, each one its own plugin.
+The first six are defects in the app's behaviour; the last two undo
+a wasted request and a visual change.
+
+| plugin | what goes wrong | the fix |
+|---|---|---|
+| `file-pane-access` | The Code file pane says "Couldn't find this file" for any path outside a session's granted roots, even when the file exists and Show in Explorer opens it. | Wraps the file-read handler. Only when the shell answers not found for a file that exists on disk (up to 10 MB, read-only, no UNC or device paths) does it answer with the shell's own response shape. Also resolves bare file-name links through the session transcript and relative links against the working directory's ancestors. |
+| `fast-mode` | Desktop keeps one global fast value, so a switch in one session showed in every other and was taken by the next worker start. | The switch belongs to the session it is shown on: recorded per session in `.state/fast-mode.json`, restored when the session comes on screen, applied to that session's next worker launch. On the OpenAI arm it is followed on the next request. |
+| `model-lock` | The Code UI reconciles a session to the account's persisted model a few seconds after it mounts, and the server rejects every injected model id, so a provider session snaps back to a Claude model with nobody touching the picker. | Drops a model write only when it replaces an injected model with one this install did not inject and no human was picking a model just before. Every Claude-to-Claude change passes untouched. |
+| `model-probe-skip` | Claude Code validates a live model switch with a real request under a hard 5 s deadline, so a routed model slower than that was refused with "Couldn't confirm model". | Names the target in the CLI's `modelPicker` setting through a flag-settings patch just before the switch, which makes the CLI skip the probe. Launch-time picks never probed, so only live switches are wrapped. |
+| `message-time` | The app dates a merged transcript entry from its latest background task event, so an old assistant message reads as recent. | Anchors each message's relative age to its CLI transcript record. |
+| `sendmessage-unban` | Desktop removes `SendMessage` from every Code session, so agents cannot message each other. | `patch.js` removes the ban for the next launch; this plugin removes the call-time half from workers that are already running, so their CLI processes and in-flight agents survive. |
+| `prompt-suggestions-off` | After a turn, Claude Code launches a second full-context model request only to predict the composer's ghost text. | Sets the CLI's own kill switch for every future worker and patches running workers through their settings control. |
+| `classic-stop` | The composer's stop mark changed when its icon-font glyph changed. | Restores the quiet outlined mark. The app still owns the button and the interrupt; the plugin replaces only the glyph inside it. |
+
+### Unlocks
 
 | plugin | what it does |
 |---|---|
-| `dashboard` | The settings overlay on **Insert**: sidebar of plugins, grouped controls, live 1:1 before/after preview frames. Persists to `.state/settings.json`. |
-| `provider-picker` | Provider tabs inside the native model picker. Extends the local model catalog so native draft selection and the native effort slider work per conversation. OpenAI runs on the Codex OAuth you already hold — no metered API key. Other providers come from the catalogue or from a [provider adapter](docs/provider-adapters.md). |
-| `compaction-provider` | Replaces Claude Code’s text-only GPT compaction turn with Codex V2’s native encrypted checkpoint. The router restores the opaque item on later GPT turns and keeps a portable text fallback for switching to Claude or Gemini. |
+| `unlock-code` | Lets a free-tier account use the Claude Code tab in Desktop. It is client-side: it rewrites the page's cached account record to add the `chat`, `claude_pro`, `claude_max`, `raven`, `claude_code` and `claude_code_desktop` capabilities and the `default_claude_max_20x` rate-limit tier, and clears the upgrade lock from model rows. It can hide the upgrade takeover and upsell modals. Sessions on routed (non-Claude) models also get a local-only credential, so they start without waiting on Anthropic's Code OAuth preflight; that credential only reaches the local router. Anthropic's own models stay bound by what the server grants the account. [SECURITY.md](SECURITY.md) lists exactly what it alters and how to turn it off. |
+| `computer-use` | Dashboard switches for Desktop's native Windows Computer Use backend (enabled, preferred mode, auto-unhide). Written live through the app's own preferences IPC and persisted to `claude_desktop_config.json`, so no restart is needed. Opt-in: it writes nothing until you flip its switch, so installing the mod never turns Computer Use on by itself. |
+
+### Providers and routing
+
+| plugin | what it does |
+|---|---|
+| `provider-picker` | Provider tabs inside the native model picker. Extends the local model catalog so native draft selection and the native effort slider work per conversation. OpenAI runs on the Codex login you already hold, with multiple ChatGPT accounts selectable in the dashboard. Other providers come from the catalogue or from a [provider adapter](docs/provider-adapters.md). |
+| `provider-routing` | Starts the router when a Claude Code session is spawned and points that session at it. This is the plugin that makes provider switching work at all; disable it and every session goes straight to Anthropic. It also decides what unpinned subagents launch on. |
+| `compaction-provider` | Replaces Claude Code's text-only GPT compaction turn with Codex V2's native encrypted checkpoint. The router restores the opaque item on later GPT turns and keeps a portable text fallback for switching to Claude or another provider. |
 | `context-management` | Codex's experimental context management, run from the router on the ChatGPT plan you already hold. GPT sessions get the model-only `notes` scratchpad, the budget guidance and reminders, and an optional `new_context` window reset. Upstream's instructions telling the model to conceal the tools are stripped. |
-| `task-rail` | A rail pinned left of the prompt composer showing the live task list of the Code session that window is displaying. |
-| `usage-bar` | Context and rate-limit meters in the empty middle of the composer footer. Hides the app's own usage band once it has read the reset time off it. |
-| `context-pill` | A pill that appears only once the session is carrying 300k tokens or more, warming and pulsing past a second threshold. Same CLI reply `usage-bar` reads, so the two cannot disagree. Dismiss snoozes it until context grows another 50k. |
-| `queue` | An explicit send queue. Mid-turn, Enter is intercepted before the app sees it and the message lands in a rail above the prompt with steer / edit / delete per row, plus auto-send when the turn fully ends. |
-| `subagents` | A HUD of this session's agents in the gutter under the chat title: who is running, what tool they are on, how long. Finished ones sit below as ghosts. Click one for its full transcript and controls, read from the CLI's own per-agent files so it survives a stop-and-resume. Ships a demo-data mode. |
-| `throughput` | Real tokens per second, measured at the router: exact provider token counts over this machine's own clocks, split into the upstream hop, the prefill, and the generation window. Live in-flight streams plus per-agent history, joined to the CLI transcript so each rate is attributed to the main session or to the named subagent that produced it. Persists to `provider-throughput-v1.jsonl`. |
+| `auto-compact` | Launch policy for the compaction window of new workers: a fallback window, per-model rows and presets up to 1M tokens. Shown beside what the displayed worker itself reports through `getContextUsage`; the policy is never presented as that worker's state, and a window can also be replaced on a running worker. |
+
+### Agents and automation
+
+| plugin | what it does |
+|---|---|
+| `subagents` | A HUD of this session's agents in the gutter under the chat title: who is running, what tool they are on, how long. Finished ones sit below as ghosts. Click one for its full transcript and controls, read from the CLI's own per-agent files so it survives a stop-and-resume. The sheet shows what the agent's definition pins (model and effort) and, in the gutter beside the transcript, its conversation with its direct parent. Ships a demo-data mode. |
+| `campaigns` | A dashboard workspace for owner-rooted campaigns: durable checkpoints, packages claimed and submitted by native agents through an in-process `campaign` tool server, candidates bound to the source revision they were built from, and acceptance only after independent review with observed check receipts. State lives in `.state/campaigns`. |
 | `goal` | An always-on band for the CLI's `/goal` stop-hook: the armed condition, how many times it has checked in, and the evaluator's verdicts. Read from the session transcript rather than the app's stream state, which loses them. Set, edit or clear a goal mid-turn from the band. |
-| `provider-routing` | Starts the router when a Claude Code session is spawned and points that session at it. No UI. This is the plugin that makes provider switching work at all; disable it and every session goes straight to Anthropic. |
+| `queue` | An explicit send queue. Mid-turn, Enter is intercepted before the app sees it and the message lands in a rail above the prompt with steer / edit / delete per row, plus auto-send when the turn fully ends. Delivery runs on the Desktop session manager, so a queue keeps draining when its session is not the one on screen. |
+| `voice-agent` | Optional fully local dictation and wake control. A per-user Windows companion and a separate recorder process capture the microphone, archive the audio durably, reach faster-whisper and acoustic emotion analysis on a compute host over an SSH loopback forward, insert or submit session-owned text, and play local Kokoro summaries. See [voice-agent/README.md](voice-agent/README.md). |
+| `task-rail` | A rail pinned left of the prompt composer showing the live task list of the Code session that window is displaying. Optionally stops the app from throwing its own task pane open on a session's first task. |
+
+### Usage and context
+
+| plugin | what it does |
+|---|---|
+| `usage-bar` | A composer context meter fed by the CLI's own `getContextUsage` reply, with a compaction mark where the CLI fires it. Account limits are drawn into the app's own usage ring and its popover according to the selected model: Claude plan windows, ChatGPT windows, and any adapter's quotas. Optionally hides the app's own usage band. |
+| `context-pill` | A pill that appears only once the session is carrying 300k tokens or more, warming and pulsing past a second threshold. Same CLI reply `usage-bar` reads, so the two cannot disagree. Dismiss snoozes it until context grows another 50k. |
+| `throughput` | Real tokens per second, measured at the router: exact provider token counts over this machine's own clocks, split into the upstream hop, the prefill, and the generation window. Live in-flight streams plus per-agent history, joined to the CLI transcript so each rate is attributed to the main session or to the named subagent that produced it. Persists to `provider-throughput-v1.jsonl`. |
 | `plan-usage-capture` | Reads Claude's own plan-usage response as the app fetches it, and persists the rate-limit numbers to `.state/claude-plan-resets.json`. That file is where the Claude quota meter and its reset countdown come from. |
-| `hide-usage-band` | Hides or dims Claude's own usage-limit banners in the composer, by keyword. Ships **off**; enable and configure it in the dashboard. Overlaps `usage-bar`'s own `hideBanner` toggle — use one or the other. |
+| `hide-usage-band` | Hides or dims Claude's own usage-limit banners in the composer, by keyword. Ships **off**; enable and configure it in the dashboard. Overlaps `usage-bar`'s own `hideBanner` toggle, so use one or the other. |
+
+### Transcript and appearance
+
+| plugin | what it does |
+|---|---|
 | `thinking-default` | Sets the transcript view to Thinking the first time a session appears in a window. One shot per session, so switching back by hand sticks. |
-| `thinking-style` | Typography and framing for thinking blocks. |
+| `thinking-style` | Typography, framing and inline Markdown for thinking blocks. |
 | `transcript-type` | Typeface and size for normal transcript text, by feeding the app's own `--chat-body` / `--chat-leading` tokens. |
+| `transcript-copy` | Two buttons that put the session on the clipboard tagged by role: the whole session, or only what was recorded since the previous export ended. Built from the CLI's transcript, not the DOM, so thinking, tool calls, tool output and injected context are kept. |
+| `waiting-label` | Replaces the native "Waiting for Claude…" status with the active model's name while a turn waits for inference. |
+| `branding` | Replaces Claude's Spark marks and the new-session composer artwork with bundled SVGs. The artwork is data: editing an SVG in the plugin directory reaches the live renderer, and the accent colour is a setting. |
+| `dashboard` | The settings overlay on **Insert**: sidebar of plugins, grouped controls, live 1:1 before/after preview frames. Persists to `.state/settings.json`. |
 
-**Insert → Providers & agents** controls GPT reasoning summaries, optional
-provider-supplied reasoning text, tab animation, and upstream identity logging.
-The visible GPT thinking is an OpenAI summary by default. The dashboard cannot
-unlock hidden raw reasoning. Request settings apply to the next model call and
-also cover GPT subagents; they do not change reasoning effort.
+## Providers
 
-**Insert → Context compaction** selects native Codex V2 or Claude Code's normal
-text-summary path for GPT sessions. Codex checkpoints are durable under the
-router state directory and bound to the CLI session id. Claude, Gemini and other
-providers continue using their normal Claude Code compaction path. The portable
-fallback is enabled by default so switching away from GPT after a checkpoint is
-safe.
+The router in `router/` listens on `127.0.0.1:8789`. The routing plugin starts it
+and supplies that endpoint when Desktop spawns a Code CLI, and every request is
+routed on `body.model`. Anything unclaimed goes to api.anthropic.com
+byte-identical.
 
-**Insert → Context management** turns on Codex's experimental context lane for
-GPT sessions. Notes are additive: the model gets a server-side scratchpad that
-survives a window reset, and nothing else about the turn changes. Window reset
-lets it call `new_context`, after which this router sends later turns from the
-cut point instead of the whole transcript, so continuity lives in its notes.
-The transcript archive is off by default: turning it on asks OpenAI to ingest and
-index the whole thread, not just what the model chose to write. Tool results are encrypted by
-the backend and readable only inside inference, so note contents never reach this
-machine. The tool descriptions are reserved and validated upstream, so they ship
-verbatim; the guidance this router injects is not, and it tells the model you may
-be told about its notes — so asking works. `GET /contextz` reports window state and a drift verdict that
-fires when Codex changes the feature upstream.
+| picker tab | models | transport and credential |
+|---|---|---|
+| Claude | the app's own model rows | passthrough, byte-identical |
+| OpenAI | GPT-6-Astra, GPT-6.1-Sol, GPT-6-Luna | OpenAI Responses API on your Codex subscription login; no metered API key |
+| Meta | Muse Spark 1.3 | Anthropic Messages endpoint registered through the catalogue; key in `.state/provider-secrets.json` |
+| Command Code | DeepSeek V4.1 Flash, DeepSeek V4 Flash, DeepSeek V4 Pro, GLM 5.3 Flash, GLM 5.3, Kimi K3, Qwen 3.8 Max, MiniMax M3 | the `router/adapters/command-code/` adapter, translating Anthropic Messages to OpenAI Chat Completions; key in `.state/provider-secrets.json` |
+
+**Command Code** serves open-weight models. Put your Command Code API key in
+`.state/provider-secrets.json` under the field `"command-code"` (the
+`COMMAND_CODE_API_KEY` environment variable also works and wins); the file is
+ignored by git and read per request, so a new key needs no restart. The adapter
+sends every request with `x-cmd-zdr: 1`, which asks for zero data retention;
+whether that is honoured is Command Code's side. Its limits meter reads the same
+read-only billing surface as Command Code's own `/usage` view and shows up in the
+usage ring as a **5-hour limit** and a **Weekly · all models** row. The router's
+limits payload also carries remaining credits (monthly, purchased and free), the
+plan and billing period, and per-model organisation spend limits. Spend in the
+Usage Atlas is priced from published market rates registered by the adapter.
+
+Anything else is a **catalogue entry** if the backend already speaks Anthropic
+Messages, or a **provider adapter** under `router/adapters/` if it needs real
+code. See [docs/provider-adapters.md](docs/provider-adapters.md). Command Code is
+the one adapter that ships; none is required.
+
+What the OpenAI arm does beyond translation:
+
+- **Prompt cache.** Every GPT conversation, subagents included, sends its own
+  stable `session-id` and `thread-id`, and Claude Code's deferred-tool protocol
+  is translated to Responses `additional_tools` items, so loading a tool
+  mid-conversation does not discard the cached prefix. Requests with reasoning
+  enabled send `reasoning.context: "all_turns"`.
+- **Accounts.** Add a ChatGPT account through `codex login`, switch between
+  stored accounts, remove one, or let the picker move to the account with the
+  lowest weekly usage once the active one passes a configurable threshold.
+  Replacement and token refresh serialize on one lock.
+- **Fast mode.** The composer's fast switch is followed on the next request, not
+  the next turn, and sends the priority service tier for models whose Codex
+  catalogue lists it. The switch is the orchestrator's alone: a subagent runs
+  priority only when its launch prompt opens with a `#fast` line.
+- **Compaction and context.** Native Codex V2 checkpoints and Codex context
+  management, both described below.
+- **Counting.** Preflight counts use a pinned local `o200k_base` tokenizer over
+  the translated request, including image-size estimates instead of base64
+  text. A provider adapter may supply a native counter instead. After a
+  response, both context displays use the CLI's provider-reported input total,
+  including cached input; the tooltip distinguishes this latest measured prompt
+  from a preflight estimate. Category breakdowns remain estimates.
+
+`router/supervisor.mjs` owns the public port and swaps workers blue-green: a
+saved change boots a candidate on a private port, accepts it only after
+`/healthz` and a semantic canary pass, then switches new requests while the
+previous generation drains. Sessions stay up across a router edit. A nested
+adapter edit counts as a router edit.
+
+Dashboard panels for the router:
+
+- **Insert → Providers & agents** controls ChatGPT accounts and auto-switch, GPT
+  reasoning summaries, optional provider-supplied reasoning text, tab animation,
+  and upstream identity logging. The visible GPT thinking is an OpenAI summary by
+  default; the dashboard cannot unlock hidden raw reasoning. Request settings
+  apply to the next model call and also cover GPT subagents; they do not change
+  reasoning effort.
+- **Insert → Context compaction** selects native Codex V2 or Claude Code's normal
+  text-summary path for GPT sessions. Codex checkpoints are durable under the
+  router state directory and bound to the CLI session id. Claude and other
+  providers keep their normal compaction path. The portable fallback is on by
+  default so switching away from GPT after a checkpoint is safe.
+- **Insert → Context management** turns on Codex's experimental context lane for
+  GPT sessions. Notes are additive: the model gets a server-side scratchpad that
+  survives a window reset, and nothing else about the turn changes. Window reset
+  lets it call `new_context`, after which the router sends later turns from the
+  cut point instead of the whole transcript, so continuity lives in its notes.
+  The budget follows the earlier of the configured Claude Code auto-compact
+  trigger and the model ceiling and reserves Codex's fallback buffer; manual,
+  automatic, or exhausted-window compaction resets the window without a summary
+  or another model call. The transcript archive is off by default: turning it on
+  asks OpenAI to ingest and index the whole thread, not just what the model chose
+  to write. Tool results are encrypted by the backend and readable only inside
+  inference, so note contents never reach this machine. The tool descriptions are
+  reserved and validated upstream, so they ship verbatim; the guidance this
+  router injects is not, and it tells the model you may be told about its notes,
+  so asking works. `GET /contextz` reports durable model-call and reset activity,
+  window state, both budget boundaries, and a drift verdict that fires when Codex
+  changes the feature upstream.
 
 Plugin settings live in `.state/settings.json` and that one file is **tracked**,
 so the configuration is recoverable and `git log -p .state/settings.json` is its
 history. Everything else under `.state/` stays ignored, credentials included, and
 the publish step excludes the settings file from the public mirrors. After
-restoring an older copy, run `dashboard.reload` and reload the renderer — the
+restoring an older copy, run `dashboard.reload` and reload the renderer; the
 store is authoritative in memory once read.
-
-Adding your own needs no re-patch — drop a directory into `src/plugins/` and it
-loads live. See [docs/plugin-api.md](docs/plugin-api.md).
 
 ## Usage Atlas
 
-The router keeps a permanent, deduplicated record of every response it relays —
+The router keeps a permanent, deduplicated record of every response it relays:
 exact provider token counts, the model that served it, and what it would have
 cost at that day's list price. It serves that back as a dashboard:
 
@@ -128,15 +329,15 @@ What is on it, and where each number comes from:
 | Spend | those token counts priced from `router/pricing.mjs`, recomputed on every read |
 | Audit trail | the last 100 responses, with no message content |
 
-Two things worth knowing before you read the numbers. **Cost is never stored** —
+Two things worth knowing before you read the numbers. **Cost is never stored**:
 it is derived from tokens on every request, so correcting a price in
 `pricing.mjs` retroactively fixes every historical day with no migration. And a
 model with no rate is reported as *unpriced* rather than as zero, so a gap in
 the price table reads as a gap rather than as free traffic.
 
 Meters only appear for providers you actually have. A fresh install with no
-Codex login and no adapter shows the Claude meter alone; the token, timeline and
-spend panels populate from the first response either way.
+Codex login and no adapter key shows the Claude meter alone; the token, timeline
+and spend panels populate from the first response either way.
 
 ## Requirements
 
@@ -144,14 +345,27 @@ spend panels populate from the first response either way.
 - Claude Desktop installed under `%LOCALAPPDATA%\AnthropicClaude`
 - Node.js 18 or newer on `PATH`
 
-Verified against app **1.26832.0** (Electron 42, Chromium 148). The patcher
+Optional, by feature:
+
+- **OpenAI models:** the Codex CLI, for `codex login`, and a ChatGPT plan that
+  includes Codex.
+- **Command Code models:** a Command Code API key in
+  `.state/provider-secrets.json`.
+- **Voice agent:** Python and an SSH-reachable Linux compute host; its pinned
+  dependencies and installation path are documented in
+  [voice-agent/README.md](voice-agent/README.md).
+
+Current development target is app **2.9939.4** (Electron 44.4.3, Chromium
+152.0.7977.130); the `SendMessage` patch audit also covers 2.7032.0. The first
+release was verified against 1.26832.0 (Electron 42, Chromium 148). The patcher
 reads what it needs out of the shipped bundle rather than hardcoding it, so
-minor updates are expected to keep working; the version-specific facts it
-relies on are listed in [docs/internals.md](docs/internals.md).
+minor updates are expected to keep working, and plugins that anchor on claude.ai
+markup are the part most likely to need a repair after an update. The
+version-specific facts are listed in [docs/internals.md](docs/internals.md).
 
 ## Install
 
-Claude Desktop must be fully quit — Windows keeps `app.asar` memory-mapped
+Claude Desktop must be fully quit: Windows keeps `app.asar` memory-mapped
 while it runs, and the running version cannot be replaced.
 
 ```bash
@@ -188,7 +402,7 @@ install.
 
 ## How it attaches
 
-Claude Desktop's main window is a shell page — title bar and error UI only. The
+Claude Desktop's main window is a shell page: title bar and error UI only. The
 real UI is claude.ai loaded into a `WebContentsView` whose preload is
 `.vite/build/mainView.js` inside `resources/app.asar`. That preload is used for
 every window the app makes (main, popped-out sessions, quick window), so
@@ -205,42 +419,27 @@ The archive is not repacked. New bytes are appended past the end of the data
 region and only the changed header entries are re-pointed, so all 6
 `app.asar.unpacked` entries and every other per-file integrity record stay
 byte-identical. Electron validates the asar header hash against a value baked
-into `claude.exe`, so the patcher repoints that field too — skipping it is what
+into `claude.exe`, so the patcher repoints that field too; skipping it is what
 produces a boot-time `FATAL: Integrity check failed` with no log and no crash
 dump.
+
+Besides the two appended loaders, the patcher edits one thing in the app's own
+code: where a build still carries Desktop's `SendMessage` bans (the registry
+append and the call-time deny), it neutralises each site, and it refuses to
+patch a build whose ban sites it does not find exactly once unless that build's
+header hash was audited by hand.
 
 ## Two baked files, everything else hot
 
 | file | reload |
 |---|---|
-| `src/main-hook.js` | **baked** — needs re-patch + app restart |
-| `src/preload-hook.js` | **baked** — needs re-patch + app restart |
+| `src/main-hook.js` | **baked**: needs re-patch + app restart |
+| `src/preload-hook.js` | **baked**: needs re-patch + app restart |
 | `src/runtime/host.js` | hot, on save (main process) |
 | `src/runtime/bridge.js` | hot, on save (renderer) |
 | `src/plugins/*/main.js` | hot, on save (main process) |
 | `src/plugins/*/renderer.js` | hot, on save (renderer) |
-
-The provider router is in `router/`. It listens on `127.0.0.1:8789`; the routing
-plugin starts it when needed and supplies that endpoint when Desktop spawns a
-Code CLI. `router/supervisor.mjs` owns the public port and swaps workers
-blue-green: a saved change boots a candidate on a private port, accepts it only
-after `/healthz` and a semantic canary pass, then switches new requests while
-the previous generation drains. Sessions stay up across a router edit.
-
-Every request is routed on `body.model`. Anything unclaimed goes to
-api.anthropic.com byte-identical. `gpt-*` is translated to the OpenAI Responses
-API and sent on the Codex subscription OAuth. Anything else is a **catalogue
-entry** if the backend already speaks Anthropic Messages, or a **provider
-adapter** under `router/adapters/` if it needs real code — see
-[docs/provider-adapters.md](docs/provider-adapters.md). No adapter ships by
-default and none is required.
-
-GPT preflight counts use a pinned local `o200k_base` tokenizer over the
-translated request, including image-size estimates instead of base64 text. A
-provider adapter may supply a native counter instead. After a response, both
-context displays use the CLI's provider-reported input total, including cached
-input; the tooltip distinguishes this latest measured prompt from a preflight
-estimate. Category breakdowns remain estimates.
+| `router/*.mjs`, except `supervisor.mjs` | blue-green worker swap after `/healthz` and a semantic canary |
 
 The two baked files are deliberately dumb loaders with no feature logic. If you
 are editing them to add a feature, it belongs in `host.js` or a plugin.
@@ -273,20 +472,32 @@ Claude Code persists its task list to
 root, so the rail updates as the agent creates and completes tasks.
 
 Which session is on screen comes from the URL, which carries the **desktop**
-session id (`local_<uuid>`) — a different id from the task-store key. The
+session id (`local_<uuid>`), a different id from the task-store key. The
 mapping lives in the desktop's own session json under
 `%APPDATA%\Claude\claude-code-sessions\`. A view with no id in its path is the
 new-session view and genuinely has no session; it resolves to null rather than
 to whatever was focused a moment ago.
 
+## Security
+
+This is a patched signed binary with a local proxy in front of your sessions.
+[SECURITY.md](SECURITY.md) lists exactly what the patcher changes, what each
+injected surface can reach (including what `unlock-code` rewrites in the page),
+which traffic the router forwards or translates and what it writes to disk, and
+how to report a vulnerability. The short version: plugins run with the
+privileges of the desktop app, the router sees your prompts on loopback, and
+there is no telemetry or update check.
+
 ## Docs
 
-- [docs/development.md](docs/development.md) — the hot-reload dev flow
-- [docs/plugin-api.md](docs/plugin-api.md) — plugin contracts, host RPC surface, introspection recipes
-- [docs/provider-adapters.md](docs/provider-adapters.md) — adding a provider, by catalogue entry or by adapter
-- [docs/internals.md](docs/internals.md) — verified Claude Desktop internals, and the dead ends not worth re-walking
+- [docs/development.md](docs/development.md): the hot-reload dev flow
+- [docs/plugin-api.md](docs/plugin-api.md): plugin contracts, host RPC surface, introspection recipes
+- [docs/provider-adapters.md](docs/provider-adapters.md): adding a provider, by catalogue entry or by adapter
+- [docs/internals.md](docs/internals.md): verified Claude Desktop internals, and the dead ends not worth re-walking
 - [docs/troubleshooting.md](docs/troubleshooting.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md)
+
+Issues and merge requests: <https://gitlab.com/blockshooter/claude-ui-mod>.
 
 ## Live injection into a running app: why it is not supported
 
@@ -305,7 +516,7 @@ fails with ENOENT. Post-hoc attach needs the app to have been launched with
 Native thread injection would work and is declined on purpose: the main process
 owns the stdio pipes of every running Claude Code CLI agent, so a crash there
 destroys exactly the long-running work this was built to preserve. For the same
-reason, quitting the app interrupts any in-flight agent turn — quit at a quiet
+reason, quitting the app interrupts any in-flight agent turn, so quit at a quiet
 moment. Task files and transcripts persist; a mid-run turn does not.
 
 Both files are kept because they are correct for an instance started with
@@ -314,4 +525,4 @@ explanation.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -24,7 +24,33 @@ const path = require('path');
 const os = require('os');
 
 module.exports = function (ctx) {
-    const STATE = path.join(ctx.dir, '..', '..', '..', '.state', 'queue.json');
+    const modDir = ctx.boot?.MOD_DIR || path.join(ctx.dir, '..', '..', '..');
+    const STATE = path.join(modDir, '.state', 'queue.json');
+    const SETTINGS = path.join(modDir, '.state', 'settings.json');
+    const SESSION = /^local_[0-9a-f-]{36}$/i;
+    const IMAGE_MIME = /^image\/(?:png|jpeg|gif|webp)$/;
+    const DEFAULTS = { enabled: true, autoSend: true, autoSendDelay: 350 };
+
+    function images(value) {
+        if (!Array.isArray(value)) return [];
+        const out = [];
+        for (const image of value) {
+            if (out.length >= 5) break;
+            if (!image || typeof image !== 'object') continue;
+            if (typeof image.base64 !== 'string' || !image.base64 || !IMAGE_MIME.test(image.mimeType || '')) continue;
+            const next = { base64: image.base64, mimeType: image.mimeType };
+            if (typeof image.filename === 'string' && image.filename) next.filename = image.filename;
+            out.push(next);
+        }
+        return out;
+    }
+
+    function queuedItem(item) {
+        const next = { id: item.id, text: item.text, at: Number(item.at) || Date.now() };
+        const attached = images(item.images);
+        if (attached.length) next.images = attached;
+        return next;
+    }
 
     // Cached, but re-read when the file changes underneath us: a second window
     // on the same session writes the same file, and holding the first read
@@ -39,12 +65,24 @@ module.exports = function (ctx) {
         stamp = now;
         try { data = JSON.parse(fs.readFileSync(STATE, 'utf8')); }
         catch (_) { data = {}; }
-        if (!data || typeof data !== 'object') data = {};
+        if (!data || typeof data !== 'object' || Array.isArray(data)) data = {};
         return data;
     }
 
+    function savedConfig() {
+        try {
+            const all = JSON.parse(fs.readFileSync(SETTINGS, 'utf8').replace(/^﻿/, ''));
+            return Object.assign({}, DEFAULTS, all && all.queue);
+        } catch (_) { return Object.assign({}, DEFAULTS); }
+    }
+    let config = savedConfig();
+    const shared = globalThis[Symbol.for('cuimod.queue.drains')]
+        || (globalThis[Symbol.for('cuimod.queue.drains')] = { sessions: new Set() });
+
     // Same write discipline as the dashboard: debounced, and atomic so a crash
-    // mid-write cannot leave a truncated queue behind.
+    // mid-write cannot leave a truncated queue behind. A successful send flushes
+    // synchronously: once delivery has answered, a crash must not resurrect the
+    // released item from older disk state and send it twice after restart.
     let timer = null;
     function flush() {
         timer = null;
@@ -54,64 +92,184 @@ module.exports = function (ctx) {
             fs.writeFileSync(tmp, JSON.stringify(data, null, 1));
             fs.renameSync(tmp, STATE);
             try { const st = fs.statSync(STATE); stamp = st.mtimeMs + ':' + st.size; } catch (_) { stamp = ''; }
-        } catch (e) { ctx.log('queue save failed: ' + ((e && e.message) || e)); }
+            return true;
+        } catch (e) {
+            ctx.log('queue save failed: ' + ((e && e.message) || e));
+            return false;
+        }
     }
+    function scheduleFlush() {
+        clearTimeout(timer);
+        timer = setTimeout(flush, 250);
+    }
+    function notify(sid, sentId) {
+        ctx.broadcast({ type: 'queue-changed', sessionId: sid, sentId: sentId || null });
+    }
+    function replace(sid, items, sentId, immediate) {
+        const d = read();
+        const next = Array.isArray(items) ? items : [];
+        if (next.length) d[sid] = next; else delete d[sid];
+        if (immediate) {
+            if (timer) clearTimeout(timer);
+            if (!flush()) scheduleFlush();
+        } else scheduleFlush();
+        notify(sid, sentId);
+        return next;
+    }
+    function current(sid) {
+        const value = read()[sid];
+        return Array.isArray(value) ? value : [];
+    }
+
     ctx.onDispose(() => { if (timer) { clearTimeout(timer); flush(); } });
 
     ctx.method('load', () => read());
+    // Kept for a renderer from the preceding hot generation. New code mutates by
+    // item so a background drain cannot be overwritten by a stale whole-array save.
     ctx.method('save', (p) => {
-        const d = read();
         const sid = p && p.sid;
-        if (!sid) return false;
-        const items = Array.isArray(p.items) ? p.items : [];
-        if (items.length) d[sid] = items; else delete d[sid];
-        clearTimeout(timer);
-        timer = setTimeout(flush, 250);
+        if (!SESSION.test(sid || '')) return false;
+        replace(sid, p.items);
         return true;
+    });
+    ctx.method('enqueue', (p) => {
+        const sid = p && p.sid;
+        const item = p && p.item;
+        if (!SESSION.test(sid || '') || !item || typeof item.id !== 'string' || typeof item.text !== 'string')
+            throw new Error('valid session and queue item required');
+        const items = current(sid);
+        return replace(sid, items.some((x) => x && x.id === item.id) ? items : items.concat([queuedItem(item)]));
+    });
+    ctx.method('update', (p) => {
+        const sid = p && p.sid;
+        if (!SESSION.test(sid || '') || typeof p.id !== 'string' || typeof p.text !== 'string')
+            throw new Error('valid session, item id and text required');
+        const replaceImages = Object.prototype.hasOwnProperty.call(p, 'images');
+        return replace(sid, current(sid).map((x) => {
+            if (!x || x.id !== p.id) return x;
+            const next = Object.assign({}, x, { text: p.text });
+            if (replaceImages) {
+                const attached = images(p.images);
+                if (attached.length) next.images = attached; else delete next.images;
+            }
+            return next;
+        }));
+    });
+    ctx.method('remove', (p) => {
+        const sid = p && p.sid;
+        if (!SESSION.test(sid || '') || typeof p.id !== 'string') throw new Error('valid session and item id required');
+        return replace(sid, current(sid).filter((x) => !x || x.id !== p.id));
     });
 
     // ---------------------------------------------------------------- editor
     // Every op re-finds the editor: the composer remounts on session switch, so
     // a cached reference would go stale exactly when it is needed.
-    const FIND = "(function(){"
+    const FIND_NODE = "(function(){"
         + " var els = document.querySelectorAll('.epitaxy-prompt-input .tiptap');"
         + " var best = null, bestRect = null;"
         + " for (var i = 0; i < els.length; i++) {"
         + "   var e = els[i];"
         + "   if (!e.editor) continue;"
-        + "   if (e.closest('.epitaxy-composer-width')) return e.editor;"
+        + "   if (e.closest('.epitaxy-composer-width')) return e;"
         + "   var r = e.getBoundingClientRect();"
         + "   if (r.width < 120) continue;"
         + "   if (!bestRect || r.width > bestRect.width + 8 ||"
         + "       (Math.abs(r.width - bestRect.width) <= 8 && r.bottom > bestRect.bottom)) { best = e; bestRect = r; }"
         + " }"
-        + " return best ? best.editor : null; })()";
+        + " return best; })()";
 
-    function snippet(body) {
-        return '(() => { try { var ed = ' + FIND + ';'
-            + ' if (!ed) return { ok: false, reason: "no-editor" };'
+    // Attachment state is a React hook closure, separate from TipTap. The live
+    // 2026-09-21 composer passes a staging facade through the prompt fiber's
+    // props; the pinned older release retains the same facade in hook state.
+    // Match capabilities rather than minified names, and keep the walk bounded.
+    const FIND_ATTACHMENTS = "(function(root){"
+        + " if (!root) return null;"
+        + " function isState(v) { return !!v && typeof v === 'object'"
+        + "   && typeof v.takeForSend === 'function' && typeof v.waitForImagesReady === 'function'"
+        + "   && typeof v.addImageFiles === 'function'"
+        + "   && (typeof v.getImages === 'function' || Array.isArray(v.images)); }"
+        + " function scan(v, depth, seen) {"
+        + "   if (isState(v)) return v;"
+        + "   if (!v || depth <= 0 || (typeof v !== 'object' && typeof v !== 'function') || seen.has(v)) return null;"
+        + "   seen.add(v); var ds; try { ds = Object.getOwnPropertyDescriptors(v); } catch (_) { return null; }"
+        + "   var ks = Reflect.ownKeys(ds);"
+        + "   for (var i = 0; i < ks.length && i < 80; i++) { var d = ds[ks[i]];"
+        + "     if (!d || !Object.prototype.hasOwnProperty.call(d, 'value')) continue;"
+        + "     var hit = scan(d.value, depth - 1, seen); if (hit) return hit; }"
+        + "   return null; }"
+        + " var key = Object.keys(root).find(function(k){ return k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0; });"
+        + " var fiber = key ? root[key] : null;"
+        + " for (var depth = 0; fiber && depth < 240; depth++, fiber = fiber.return) {"
+        + "   var found = scan(fiber.memoizedProps, 3, new Set()); if (found) return found;"
+        + "   for (var hook = fiber.memoizedState, n = 0; hook && n < 400; hook = hook.next, n++) {"
+        + "     found = scan(hook.memoizedState, 3, new Set()); if (found) return found; }"
+        + " } return null; })(node.closest('.epitaxy-prompt'))";
+
+    function snippet(body, async) {
+        return '(' + (async ? 'async ' : '') + '() => { try { var node = ' + FIND_NODE + ';'
+            + ' var ed = node && node.editor; if (!ed) return { ok: false, reason: "no-editor" };'
             + body
             + ' } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } })()';
     }
 
     const GET = snippet(
-        ' var t = ed.getText();'
-        + ' return { ok: true, text: t, empty: !t || !t.trim(), focused: !!ed.isFocused };'
+        ' var text = ed.getText(); var doc = JSON.stringify(ed.getJSON());'
+        + ' var state = ' + FIND_ATTACHMENTS + ';'
+        + ' var shelf = node.closest(".epitaxy-prompt").querySelector(".epitaxy-attachment-shelf");'
+        + ' if (!state) return shelf ? { ok: false, reason: "attachment-state-unavailable" }'
+        + '   : { ok: true, text: text, images: [], empty: !text || !text.trim(), focused: !!ed.isFocused };'
+        + ' function list(s) { var value = typeof s.getImages === "function" ? s.getImages() : s.images;'
+        + '   return Array.isArray(value) ? value : []; }'
+        + ' var before = list(state), ids = before.map(function(image){ return image && image.id; });'
+        + ' if (before.some(function(image){ return image && image.status === "loading"; })) {'
+        + '   await state.waitForImagesReady(); await new Promise(function(resolve){ setTimeout(resolve, 0); });'
+        + '   state = ' + FIND_ATTACHMENTS + '; if (!state) return { ok: false, reason: "attachment-state-unavailable" }; }'
+        + ' var current = list(state);'
+        + ' if (JSON.stringify(ids) !== JSON.stringify(current.map(function(image){ return image && image.id; }))'
+        + '     || doc !== JSON.stringify(ed.getJSON()) || text !== ed.getText())'
+        + '   return { ok: false, reason: "composer-changed" };'
+        + ' var hasAny = typeof state.hasStagedAttachmentsNow === "function" ? state.hasStagedAttachmentsNow() : !!state.hasAttachments;'
+        + ' if (hasAny && !current.length) return { ok: false, reason: "unsupported-attachment" };'
+        + ' var attached = [];'
+        + ' for (var i = 0; i < current.length; i++) { var image = current[i], source = image && image.block && image.block.source;'
+        + '   if (!image || image.status !== "ready" || !source || source.type !== "base64"'
+        + '       || typeof source.data !== "string" || !source.data || !/^image\\/(?:png|jpeg|gif|webp)$/.test(source.media_type || ""))'
+        + '     return { ok: false, reason: "image-not-ready" };'
+        + '   attached.push({ base64: source.data, mimeType: source.media_type, filename: image.name || undefined }); }'
+        + ' return { ok: true, text: text, images: attached, empty: (!text || !text.trim()) && !attached.length, focused: !!ed.isFocused };',
+        true
     );
-    const CLEAR = snippet(' ed.commands.clearContent(true); return { ok: true }; ');
+    const CLEAR = snippet(
+        ' var state = ' + FIND_ATTACHMENTS + ';'
+        + ' if (state) { var value = typeof state.getImages === "function" ? state.getImages() : state.images;'
+        + '   var hasAny = typeof state.hasStagedAttachmentsNow === "function" ? state.hasStagedAttachmentsNow() : !!state.hasAttachments;'
+        + '   if (hasAny || Array.isArray(value) && value.length) state.takeForSend(); }'
+        + ' ed.commands.clearContent(true); return { ok: true }; '
+    );
 
-    function setScript(text) {
+    function setScript(text, attached) {
         // setContent with a plain string would be parsed as HTML; the text is
         // fed as an explicit paragraph doc so "<" and "&" survive verbatim and
-        // blank lines stay blank lines.
+        // blank lines stay blank lines. Images return through the native staging
+        // hook, which owns compression, previews, limits, and the attachment shelf.
         return snippet(
-            ' var lines = ' + JSON.stringify(String(text).split('\n')) + ';'
+            ' var attached = ' + JSON.stringify(attached) + ';'
+            + ' var state = attached.length ? ' + FIND_ATTACHMENTS + ' : null;'
+            + ' if (attached.length && !state) return { ok: false, reason: "attachment-state-unavailable" };'
+            + ' var lines = ' + JSON.stringify(String(text).split('\n')) + ';'
             + ' var doc = { type: "doc", content: lines.map(function (l) {'
             + '   return l.length ? { type: "paragraph", content: [{ type: "text", text: l }] }'
             + '                   : { type: "paragraph" }; }) };'
             + ' ed.commands.setContent(doc, true);'
+            + ' if (attached.length) { var files = attached.map(function(image, index){'
+            + '   var raw = atob(image.base64), bytes = new Uint8Array(raw.length);'
+            + '   for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);'
+            + '   var ext = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.slice(6);'
+            + '   return new File([bytes], image.filename || ("queued-image-" + (index + 1) + "." + ext), { type: image.mimeType }); });'
+            + '   var added = state.addImageFiles(files);'
+            + '   if (added !== files.length) return { ok: false, reason: "image-restore-failed" }; }'
             + ' ed.commands.focus("end");'
-            + ' return { ok: true };'
+            + ' return { ok: true, images: attached.length };'
         );
     }
 
@@ -271,9 +429,8 @@ module.exports = function (ctx) {
         });
     }
 
-    ctx.method('backgroundForeground', async (p) => {
-        const sid = p && p.sid;
-        if (typeof sid !== 'string' || !/^local_[0-9a-f-]{36}$/i.test(sid)) return { ok: false, reason: 'bad session id' };
+    async function backgroundForeground(sid) {
+        if (!SESSION.test(sid || '')) return { ok: false, reason: 'bad session id' };
         const mgr = sessionManager();
         if (!mgr) return { ok: false, reason: 'no session manager' };
         const sess = mgr.sessions.get(sid);
@@ -297,11 +454,169 @@ module.exports = function (ctx) {
         if (r.timedOut) return { ok: false, reason: 'timeout', tool: tu.name, toolUseId: tu.id };
         if (r.error) return { ok: false, reason: r.error, tool: tu.name, toolUseId: tu.id };
         return { ok: true, backgrounded: r.value !== false, tool: tu.name, toolUseId: tu.id };
+    }
+    ctx.method('backgroundForeground', (p) => backgroundForeground(p && p.sid));
+
+    // -------------------------------------------------------------- auto-send
+    /* Turn-end delivery belongs in main, not in the view showing the composer.
+     * Renderer timers are throttled when the window is hidden, and a renderer
+     * tracks only the session in its URL. The session manager owns every live
+     * query regardless of focus, and its isCliProvablyIdle() predicate is the
+     * same authority Desktop uses before deciding whether a send is immediate.
+     * Polling here is a fallback-safe edge detector: busy clears the deadline;
+     * the first idle observation starts the configured grace period. */
+    const readyAt = new Map();
+    const holds = new Map();
+
+    function held(sid) {
+        const h = holds.get(sid);
+        if (!h) return false;
+        if (h.until > Date.now()) return true;
+        holds.delete(sid);
+        return false;
+    }
+
+    function idleSession(sid) {
+        const mgr = sessionManager();
+        const sess = mgr?.sessions.get(sid);
+        if (!sess?.query || typeof mgr.isCliProvablyIdle !== 'function') return null;
+        try { return mgr.isCliProvablyIdle(sess) ? { mgr, sess } : null; }
+        catch (_) { return null; }
+    }
+
+    /* A steer sent while the model is streaming text is held by the desktop
+     * until the stream reaches a boundary, yet sendMessage pushes it into the
+     * message buffer and emits it to the renderer at once (app 2.7032.0). The
+     * web store decides where an arriving user message goes: into the steered
+     * bar ("sends after this response") only while its bucket's
+     * pendingQueuedSends is non-zero, otherwise straight into the transcript,
+     * which puts it above the text still streaming. The native composer calls
+     * the store's noteQueuedSend(sessionId) before every send; a send made
+     * from main has to do the same, or the echo lands out of order.
+     *
+     * The store is module-scoped, not on a context provider, so it is reached
+     * as the function a component selected into its hook state. A method
+     * shorthand keeps its name through minification. The action no-ops when
+     * no turn is pending, and the store resets the count at turn end, so a
+     * send that then fails leaks nothing past the turn. */
+    const NOTE_QUEUED = (sid) => '(function (sid) {'
+        + ' var stack = [], nodes = document.querySelectorAll("body > *");'
+        + ' for (var i = 0; i < nodes.length; i++) {'
+        + '   var k = Object.keys(nodes[i]).find(function (x) { return x.indexOf("__reactContainer$") === 0; });'
+        + '   var r = k && nodes[i][k]; if (r) stack.push(r.stateNode && r.stateNode.current || r); }'
+        + ' for (var visited = 0; stack.length && visited < 100000; visited++) {'
+        + '   var f = stack.pop(); if (!f) continue;'
+        + '   for (var h = f.memoizedState, j = 0; h && typeof h === "object" && j < 200; h = h.next, j++) {'
+        + '     if (typeof h.memoizedState === "function" && h.memoizedState.name === "noteQueuedSend") {'
+        + '       h.memoizedState(sid); return { ok: true }; } }'
+        + '   if (f.sibling) stack.push(f.sibling); if (f.child) stack.push(f.child); }'
+        + ' return { ok: false, reason: "noteQueuedSend not found" };'
+        + '})(' + JSON.stringify(sid) + ')';
+
+    async function noteQueuedSend(sender, sid) {
+        const r = await withTimeout(Promise.resolve().then(() => sender.executeJavaScript(NOTE_QUEUED(sid), false)), 500);
+        return r.value || { ok: false, reason: r.error || 'timeout' };
+    }
+
+    async function deliver(sid, id, priority, requireIdle, beforeSend) {
+        if (shared.sessions.has(sid)) return { ok: false, reason: 'send already in flight' };
+        shared.sessions.add(sid);
+        try {
+            const live = requireIdle ? idleSession(sid) : (() => {
+                const mgr = sessionManager();
+                const sess = mgr?.sessions.get(sid);
+                return mgr && sess?.query ? { mgr, sess } : null;
+            })();
+            if (!live) return { ok: false, reason: requireIdle ? 'session is not idle' : 'session is unavailable' };
+            if (requireIdle && held(sid)) return { ok: false, reason: 'message is being edited' };
+            const item = current(sid).find((x) => x && x.id === id);
+            if (!item) return { ok: false, reason: 'queue item is gone' };
+            const options = { initiator: 'user' };
+            if (priority) options.priority = priority;
+            const attached = images(item.images);
+            if (beforeSend) await beforeSend();
+            const result = await live.mgr.sendMessage(sid, item.text, attached.length ? attached : undefined, options);
+            if (result?.delivered === false) return { ok: false, reason: result.reason || 'delivery failed' };
+            const items = replace(sid, current(sid).filter((x) => !x || x.id !== id), id, true);
+            return { ok: true, items, delivery: result || null };
+        } catch (e) {
+            return { ok: false, reason: String((e && e.message) || e) };
+        } finally { shared.sessions.delete(sid); }
+    }
+
+    ctx.method('configure', (p) => {
+        config = Object.assign({}, DEFAULTS, p || {});
+        if (!config.enabled || !config.autoSend) readyAt.clear();
+        scan();
+        return true;
     });
+    ctx.method('hold', (p) => {
+        const sid = p && p.sid;
+        if (!SESSION.test(sid || '')) return false;
+        if (typeof p.id === 'string' && p.id) holds.set(sid, { id: p.id, until: Date.now() + 5000 });
+        else holds.delete(sid);
+        return true;
+    });
+    ctx.method('steer', async (p, event) => {
+        const sid = p && p.sid;
+        const id = p && p.id;
+        if (!SESSION.test(sid || '') || typeof id !== 'string') return { ok: false, reason: 'valid session and item id required' };
+        let foreground = null;
+        let priority = 'next';
+        if (p.freeForeground !== false) {
+            foreground = await backgroundForeground(sid);
+            if (!foreground?.backgrounded) priority = 'now';
+        }
+        const sender = event && event.sender;
+        let echo = null;
+        const result = await deliver(sid, id, priority, false,
+            sender ? async () => { echo = await noteQueuedSend(sender, sid); } : null);
+        return Object.assign(result, { foreground, priority, echo });
+    });
+
+    function scan() {
+        const queues = read();
+        if (!config.enabled || !config.autoSend) { readyAt.clear(); return; }
+        const now = Date.now();
+        for (const sid of Object.keys(queues)) {
+            const items = Array.isArray(queues[sid]) ? queues[sid] : [];
+            if (!SESSION.test(sid) || !items.length || held(sid) || !idleSession(sid)) {
+                readyAt.delete(sid);
+                continue;
+            }
+            if (!readyAt.has(sid)) readyAt.set(sid, now + Math.max(0, Number(config.autoSendDelay) || 0));
+            if (readyAt.get(sid) > now || shared.sessions.has(sid)) continue;
+            const id = items[0] && items[0].id;
+            if (typeof id !== 'string') { readyAt.delete(sid); continue; }
+            deliver(sid, id, null, true).then((result) => {
+                readyAt.delete(sid);
+                if (!result.ok && result.reason !== 'session is not idle' && result.reason !== 'message is being edited')
+                    ctx.log('auto-send failed for ' + sid + ': ' + result.reason);
+            });
+        }
+        for (const sid of [...readyAt.keys()]) if (!Array.isArray(queues[sid]) || !queues[sid].length) readyAt.delete(sid);
+    }
+
+    ctx.method('status', () => {
+        const mgr = sessionManager();
+        return {
+            manager: { found: !!mgr, sendMessage: typeof mgr?.sendMessage === 'function',
+                idlePredicate: typeof mgr?.isCliProvablyIdle === 'function' },
+            queues: Object.fromEntries(Object.entries(read()).filter(([, value]) => Array.isArray(value) && value.length)
+                .map(([key, value]) => [key, value.length])),
+            ready: [...readyAt.keys()],
+            sending: [...shared.sessions],
+            held: [...holds.keys()].filter(held),
+            config: { enabled: !!config.enabled, autoSend: !!config.autoSend,
+                autoSendDelay: Math.max(0, Number(config.autoSendDelay) || 0) },
+        };
+    });
+    ctx.every(200, scan);
+    scan();
 
     const run = (wc, code) => wc.executeJavaScript(code, false);
 
     ctx.method('editorGet', (p, event) => run(event.sender, GET));
     ctx.method('editorClear', (p, event) => run(event.sender, CLEAR));
-    ctx.method('editorSet', (p, event) => run(event.sender, setScript((p && p.text) || '')));
+    ctx.method('editorSet', (p, event) => run(event.sender, setScript((p && p.text) || '', images(p && p.images))));
 };

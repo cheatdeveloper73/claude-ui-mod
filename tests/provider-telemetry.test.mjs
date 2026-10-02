@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { UsageLedger, normalizeUsage } from '../router/telemetry.mjs';
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-telemetry-'));
 const file = path.join(temp, 'usage.jsonl');
 const broken = path.join(temp, 'broken.jsonl');
-after(() => { for (const f of [file, broken]) if (fs.existsSync(f)) fs.unlinkSync(f); fs.rmdirSync(temp); });
+after(() => fs.rmSync(temp, { recursive: true, force: true }));
 
 test('normalization separates current context from output reasoning', () => {
     assert.deepEqual(normalizeUsage({
@@ -76,4 +77,23 @@ test('a torn final line cannot consume the next durable record', () => {
         usage: { input_tokens: 3, output_tokens: 1 },
     }), true);
     assert.equal(new UsageLedger(broken).snapshot().exactRecords, 2);
+});
+
+test('compressed archives replay before the writable active tail', () => {
+    const active = path.join(temp, 'rotated.jsonl');
+    const first = new UsageLedger(active);
+    const value = id => ({
+        provider: 'openai', responseId: id, sessionId: 'session-archive',
+        requestedModel: 'gpt-requested', servedModel: 'gpt-served',
+        source: 'fixture.usage', exact: true, usage: { input_tokens: 2, output_tokens: 1 },
+    });
+    assert.equal(first.record(value('resp_archived')), true);
+    const archive = path.join(temp, 'rotated.archive-2026-09-21T00-00-00.000Z.jsonl.gz');
+    fs.writeFileSync(archive, zlib.gzipSync(fs.readFileSync(active)));
+    fs.unlinkSync(active);
+
+    const second = new UsageLedger(active);
+    assert.equal(second.snapshot().exactRecords, 1);
+    assert.equal(second.record(value('resp_active')), true);
+    assert.equal(new UsageLedger(active).snapshot().exactRecords, 2);
 });

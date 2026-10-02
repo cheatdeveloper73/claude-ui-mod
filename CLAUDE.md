@@ -29,7 +29,7 @@ across tasks is how three plugins ended up in one uncommitted pile.
 - End the message with:
 
   ```
-  Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+  Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
   ```
 
 ## Two baked files, everything else hot
@@ -42,6 +42,7 @@ across tasks is how three plugins ended up in one uncommitted pile.
 | `src/runtime/bridge.js` | hot, on save (renderer) |
 | `src/plugins/*/main.js` | hot, on save (main process) |
 | `src/plugins/*/renderer.js` | hot, on save (renderer) |
+| `src/plugins/branding/*.svg` | hot through the branding plugin's validated asset watch |
 | `router/*.mjs`, except `supervisor.mjs` | blue-green worker swap after `/healthz` plus the semantic canary; previous generation stays warm for rollback |
 | `router/supervisor.mjs` | **STABLE LISTENER** — deliberate process replacement; excluded from its own watch |
 | `router/adapters/*/` | loaded at worker boot; a change is a worker swap like any other `router/*.mjs` |
@@ -73,18 +74,11 @@ last-good fallback on malformed edits. Unknown aliases fail closed instead of
 falling through to Anthropic. Provider credentials belong only in ignored
 `.state/provider-secrets.json`, and the catalogue is the only place a
 *catalogue* backend is registered — adding an entry there is what enables a
-route. Qwen has been removed twice by owner decision and is currently out: gone
-2026-08-31, back 2026-09-01, gone again 2026-09-02 because the native tab strip
-fits four tabs and Meta took the fifth. Reinstating is a catalogue edit and
-nothing else, which is the point. The *first* removal commit cited security
-without naming the concern, so that reason is still unrecorded — it is not the
-reason for the current state.
+route.
 
-A merge reinstated the entries on 2026-09-03 by carrying a stale branch's
-private catalogue forward. It was not caught by any gate: `compatible.mjs`
-concatenates that file into the routing table, so the lane was live again with
-nothing failing. Treat a private-catalogue entry arriving through a merge the
-same as a router change.
+Treat a private-catalogue entry arriving through a merge the same as a
+router change; no gate fails when a stale branch carries one in.
+
 
 ## The public boundary is a directory, not a branch
 
@@ -110,8 +104,8 @@ fails if the shipped picker offers something no shipped arm claims.
 An earlier attempt made this boundary a long-lived branch. It went stale in
 three days and was abandoned 59 commits later. Do not reintroduce that shape.
 
-`origin` is a public GitLab repo and `github` a public mirror. Staging happens
-on the private GitHub remotes. Never push to a public remote without being asked.
+`origin` is a public GitLab repo and `github` a public mirror. Never push to a
+public remote without being asked.
 
 ```bash
 node selfcheck.js          # compile + wiring + leak check; touches nothing

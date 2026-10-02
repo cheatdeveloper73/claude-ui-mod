@@ -62,6 +62,17 @@ upstream.on('stream', (stream, headers) => {
             setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 20);
             return;
         }
+        if (mode === 'tool-idle')
+        {
+            const events = [
+                created(),
+                { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_idle', name: 'Read' } },
+                { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"file_path":"fixture"}' },
+                { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', call_id: 'call_idle', name: 'Read' } },
+            ];
+            for (const event of events) stream.write(frame(event));
+            return;
+        }
         if (mode === 'thinking-loss')
         {
             stream.write(frame(created()));
@@ -92,6 +103,7 @@ Object.assign(process.env, {
     CODEX_AUTH_FILE: auth,
     CODEX_RESPONSES_URL: upstreamURL,
     CODEX_STREAM_HEARTBEAT_MS: '30',
+    CODEX_STREAM_IDLE_TIMEOUT_MS: '250',
     MODEL_ROUTER_UPSTREAM: 'http://127.0.0.1:1',
     MODEL_ROUTER_ADAPTER_DIR: adapterDir,
     MODEL_ROUTER_STATE_DIR: temp,
@@ -129,6 +141,14 @@ try
     assert.match(text, /event: message_stop/);
     assert.doesNotMatch(text, /event: error/);
 
+    mode = 'tool-idle';
+    const idleStarted = Date.now();
+    response = await send();
+    text = await response.text();
+    assert.match(text, /"stop_reason":"tool_use"/);
+    assert.match(text, /event: message_stop/);
+    assert.ok(Date.now() - idleStarted < 1000, 'idle tool stream did not recover promptly');
+
     mode = 'provider-failed';
     response = await send();
     text = await response.text();
@@ -148,7 +168,7 @@ try
     mode = 'thinking-loss';
     await assert.rejects(() => send().then(value => value.text()));
 
-    assert.equal(requests, 6);
+    assert.equal(requests, 7);
     console.log('PASS OpenAI HTTP/2 stream lifecycle: transport, heartbeat, tool recovery, terminal short-circuit');
 }
 finally

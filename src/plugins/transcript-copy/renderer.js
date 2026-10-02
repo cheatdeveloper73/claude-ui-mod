@@ -1,7 +1,14 @@
 /* claude-ui-mod :: transcript-copy (renderer)
  *
- * One button, one toast. The work is all in main.js; this decides where the
- * button sits, what the toast says, and which settings the dashboard offers.
+ * Two buttons, one toast. The work is all in main.js; this decides where the
+ * buttons sit, what the toast says, and which settings the dashboard offers.
+ *
+ * The second button copies only what the session recorded after the previous
+ * export ended, for handing the same conversation to another chat window twice.
+ * It works out where that was by lining the transcript on the clipboard up
+ * against this session; see main.js. It shares every formatting setting with the
+ * first -- a delta the far side cannot read the same way as the export before it
+ * is worse than no delta.
  *
  * The button is fixed to a viewport corner rather than anchored to anything the
  * app draws. That is deliberate: every selector into the Code UI is a silent
@@ -28,26 +35,42 @@ const root = host.attachShadow({ mode: 'open' });
 const style = document.createElement('style');
 root.append(style);
 
-const pill = document.createElement('button');
-pill.className = 'pill';
-pill.type = 'button';
-
-const glyph = document.createElement('span');
-glyph.className = 'ic';
-glyph.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">'
+const COPY_SVG = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">'
     + '<rect x="5.2" y="2.2" width="8.6" height="11.6" rx="1.6"/>'
     + '<path d="M10.8 2.2H3.8A1.6 1.6 0 0 0 2.2 3.8v8.4"/></svg>';
 
-const label = document.createElement('span');
-label.className = 'lb';
-label.textContent = 'Copy transcript';
+// The same sheet of paper with only its lower half drawn solid: the delta is
+// the tail of the thing the first button copies whole.
+const DELTA_SVG = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">'
+    + '<rect x="5.2" y="2.2" width="8.6" height="11.6" rx="1.6" stroke-dasharray="2.2 2"/>'
+    + '<path d="M7.2 9.4h4.6M7.2 11.6h4.6"/>'
+    + '<path d="M10.8 2.2H3.8A1.6 1.6 0 0 0 2.2 3.8v8.4"/></svg>';
 
-pill.append(glyph, label);
+function makePill(svg, text, cls) {
+    const b = document.createElement('button');
+    b.className = 'pill' + (cls ? ' ' + cls : '');
+    b.type = 'button';
+    const g = document.createElement('span');
+    g.className = 'ic';
+    g.innerHTML = svg;
+    const l = document.createElement('span');
+    l.className = 'lb';
+    l.textContent = text;
+    b.append(g, l);
+    return b;
+}
+
+const bar = document.createElement('div');
+bar.className = 'bar';
+
+const pill = makePill(COPY_SVG, 'Copy transcript');
+const deltaPill = makePill(DELTA_SVG, 'Copy delta', 'delta');
+bar.append(pill, deltaPill);
 
 const toast = document.createElement('div');
 toast.className = 'toast';
 
-root.append(pill, toast);
+root.append(bar, toast);
 document.documentElement.appendChild(host);
 ctx.onDispose(() => { try { host.remove(); } catch (_) {} });
 
@@ -60,11 +83,19 @@ function css(v) {
     font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
     box-sizing: border-box;
 }
-.pill {
+/* One anchor for both buttons, so a corner or offset change moves the pair.
+   Reversed at the right-hand corners so "Copy transcript" is always the one
+   nearest the edge and the delta grows inward. */
+.bar {
     position: fixed;
     ${bottom ? 'bottom' : 'top'}: ${v.offsetY}px;
     ${right ? 'right' : 'left'}: ${v.offsetX}px;
     z-index: 2147483000;
+    display: inline-flex; align-items: center; gap: 8px;
+    flex-direction: ${right ? 'row-reverse' : 'row'};
+}
+.bar.hide { display: none; }
+.pill {
     display: inline-flex; align-items: center; gap: 7px;
     padding: ${v.compact ? '7px' : '7px 12px 7px 10px'};
     border-radius: 999px;
@@ -82,6 +113,10 @@ function css(v) {
 .pill:active { transform: scale(.97); }
 .pill[disabled] { opacity: ${(v.opacity * 0.45).toFixed(2)}; cursor: default; }
 .pill.hide { display: none; }
+/* Set from the hover peek: this session has nothing recorded past the last
+   export, so the click would only tell you so. */
+.pill.dim { opacity: ${(v.opacity * 0.5).toFixed(2)}; }
+.pill.dim:hover { opacity: ${Math.min(1, v.opacity + 0.15).toFixed(2)}; }
 .pill.work .ic { animation: spin .7s linear infinite; }
 .pill.ok { color: hsl(var(--accent-secondary-100, 140 50% 45%)); }
 .pill.err { color: hsl(var(--danger-100, 0 60% 60%)); }
@@ -141,28 +176,50 @@ const n = (x) => Number(x || 0).toLocaleString('en-US');
 
 // ------------------------------------------------------------------ the copy
 let stateTimer = null;
-async function copy() {
+
+// How the delta found the end of the previous export. Worth saying out loud:
+// the clipboard and the last copy made here can disagree, and which one
+// answered decides whether the paste lands where the user thinks it does. The
+// clipboard case says how many turns it lined up on, because that number is the
+// evidence -- one turn of overlap is a coincidence, thirty is the same export.
+function howText(r) {
+    if (r.how === 'clipboard') return 'lined up on ' + n(r.matched) + ' turns already on your clipboard';
+    if (r.how === 'mark') return 'resumed from where the last copy ended';
+    if (r.how === 'full') return 'nothing to line up against — whole session';
+    return null;
+}
+
+async function copy(delta) {
     if (busy) return;
+    const btn = delta ? deltaPill : pill;
     const sid = cuimod.sessionId;
     if (!sid) { flash('No session on screen', 'Open a Code session first.', true); return; }
 
     busy = true;
-    pill.classList.remove('ok', 'err');
-    pill.classList.add('work');
+    btn.classList.remove('ok', 'err');
+    btn.classList.add('work');
     clearTimeout(stateTimer);
 
     let r = null;
-    try { r = await cuimod.rpc('transcript-copy.copy', { cliSid: sid, options: values || {} }); }
-    catch (e) { r = { ok: false, reason: (e && e.message) || String(e) }; }
+    try {
+        r = await cuimod.rpc(delta ? 'transcript-copy.copyDelta' : 'transcript-copy.copy',
+            { cliSid: sid, options: values || {} });
+    } catch (e) { r = { ok: false, reason: (e && e.message) || String(e) }; }
 
     busy = false;
-    pill.classList.remove('work');
+    btn.classList.remove('work');
 
-    if (!r || !r.ok) {
-        pill.classList.add('err');
-        flash('Copy failed', (r && r.reason) || 'unknown error', true);
+    if (r && r.empty) {
+        // Not a failure, and specifically not a clipboard write: the earlier
+        // export is still on the clipboard and still the right thing to paste.
+        deltaPill.classList.add('dim');
+        flash('Nothing new to copy', 'The clipboard was left alone.' + (r.sinceAt ? ' Last copy ' + r.sinceAt + '.' : ''));
+    } else if (!r || !r.ok) {
+        btn.classList.add('err');
+        flash(delta ? 'No delta copied' : 'Copy failed', (r && r.reason) || 'unknown error', true);
     } else {
-        pill.classList.add('ok');
+        btn.classList.add('ok');
+        deltaPill.classList.remove('dim');
         const c = r.counts || {};
         const bits = [n(r.entries) + ' entries', size(r.bytes)];
         if (c.thinking) bits.push(n(c.thinking) + ' thinking');
@@ -170,33 +227,57 @@ async function copy() {
         if (c.image) bits.push(n(c.image) + ' images');
         if (r.agents) bits.push(n(r.agents) + ' subagents');
         if (r.dropped) bits.push(n(r.dropped) + ' older entries left out');
-        flash('Transcript copied', bits.join('  ·  '));
+        if (delta && howText(r)) bits.push(howText(r));
+        flash(delta ? (r.how === 'full' ? 'Whole transcript copied' : 'Delta copied') : 'Transcript copied', bits.join('  ·  '));
     }
-    stateTimer = setTimeout(() => pill.classList.remove('ok', 'err'), 1600);
+    stateTimer = setTimeout(() => { pill.classList.remove('ok', 'err'); deltaPill.classList.remove('ok', 'err'); }, 1600);
 }
 ctx.onDispose(() => clearTimeout(stateTimer));
 
+// Reading the clipboard is the user's clipboard, so it happens on hover and
+// after a copy -- never on a timer.
+let peekAt = 0;
+async function peek() {
+    const sid = cuimod.sessionId;
+    if (!sid || busy || Date.now() - peekAt < 1200) return;
+    peekAt = Date.now();
+    let r = null;
+    try { r = await cuimod.rpc('transcript-copy.deltaPeek', { cliSid: sid, options: values || {} }); }
+    catch (_) { return; }
+    if (!r) return;
+    deltaPill.classList.toggle('dim', !r.ok);
+    deltaPill.title = r.ok
+        ? n(r.entries) + ' new entries · ' + size(r.bytes) + (howText(r) ? ' · ' + howText(r) : '')
+        : (r.reason || 'nothing new');
+}
+
 // Clicking the button must not pull focus out of the composer: a half-typed
 // prompt loses its caret otherwise, and copying is not a reason to interrupt.
-pill.addEventListener('mousedown', (e) => e.preventDefault());
-pill.addEventListener('click', copy);
+for (const b of [pill, deltaPill]) b.addEventListener('mousedown', (e) => e.preventDefault());
+pill.addEventListener('click', () => copy(false));
+deltaPill.addEventListener('click', () => copy(true));
+deltaPill.addEventListener('mouseenter', peek);
 
-// The hotkey is registered on window in the isolated world, so it fires before
-// the page sees the key. Alt+Shift avoids every editing chord the composer owns.
+// The hotkeys are registered on window in the isolated world, so they fire
+// before the page sees the key. Alt+Shift avoids every editing chord the
+// composer owns.
 ctx.track(window, 'keydown', (e) => {
-    if (!values || !values.hotkey || !values.enabled) return;
+    if (!values || !values.enabled) return;
     if (!e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey) return;
-    if (e.code !== 'KeyC') return;
-    e.preventDefault();
-    e.stopPropagation();
-    copy();
+    if (e.code === 'KeyC' && values.hotkey) { e.preventDefault(); e.stopPropagation(); copy(false); return; }
+    if (e.code === 'KeyD' && values.deltaHotkey && values.deltaButton) {
+        e.preventDefault();
+        e.stopPropagation();
+        copy(true);
+    }
 }, { capture: true });
 
 // A view with no session (the new-chat screen) has nothing to copy, so the
-// button goes away rather than sitting there failing.
+// buttons go away rather than sitting there failing.
 function syncVisible() {
     const on = !!(values && values.enabled) && !!cuimod.sessionId;
-    pill.classList.toggle('hide', !on);
+    bar.classList.toggle('hide', !on);
+    deltaPill.classList.toggle('hide', !(values && values.deltaButton));
     if (!on) toast.classList.remove('show');
 }
 cuimod.onSessionChange(syncVisible);
@@ -225,10 +306,12 @@ function apply(v) {
 const spec = {
     plugin: 'transcript-copy',
     title: 'Copy transcript',
-    description: 'One button that puts the whole session on the clipboard, tagged by role.',
+    description: 'Puts the session on the clipboard tagged by role — whole, or only what is new since the last copy.',
     defaults: {
         enabled: true,
         hotkey: true,
+        deltaButton: true,
+        deltaHotkey: true,
         corner: 'bottom-right',
         offsetX: 24,
         offsetY: 132,
@@ -254,10 +337,16 @@ const spec = {
         toolResultMax: 4000,
         textMax: 0,
         tailEntries: 0,
+
+        deltaAnchor: 'auto',
+        deltaFallback: 'none',
     },
     controls: [
-        { key: 'enabled', type: 'toggle', label: 'Show button', group: 'Button' },
+        { key: 'enabled', type: 'toggle', label: 'Show buttons', group: 'Button' },
         { key: 'hotkey', type: 'toggle', label: 'Alt+Shift+C', hint: 'Copies without reaching for the button.', group: 'Button' },
+        { key: 'deltaButton', type: 'toggle', label: 'Show "Copy delta"',
+          hint: 'Copies only what the session recorded after the previous export ended.', group: 'Button' },
+        { key: 'deltaHotkey', type: 'toggle', label: 'Alt+Shift+D', hint: 'The delta, without reaching for the button.', group: 'Button' },
         { key: 'corner', type: 'combo', label: 'Corner', group: 'Button', options: [
             { value: 'bottom-right', label: 'Bottom right' },
             { value: 'bottom-left', label: 'Bottom left' },
@@ -299,6 +388,21 @@ const spec = {
         { key: 'timestamps', type: 'toggle', label: 'Timestamps', group: 'Shape' },
         { key: 'models', type: 'toggle', label: 'Model and effort', group: 'Shape' },
 
+        { key: 'deltaAnchor', type: 'combo', label: 'Work out the delta from', group: 'Delta', options: [
+            { value: 'auto', label: 'The clipboard, then the last copy' },
+            { value: 'clipboard', label: 'The clipboard only' },
+            { value: 'mark', label: 'The last copy only' },
+        ], hint: 'The clipboard is the honest answer to "what has the other window already seen", because '
+               + 'it is what you pasted: the transcript on it is lined up against this session turn by '
+               + 'turn, and everything past the overlap is the delta. Nothing is written into the export '
+               + 'to make that work, so a hand-trimmed or reflowed paste lines up the same. With no '
+               + 'transcript on the clipboard it falls back to remembering where the last copy ended.' },
+        { key: 'deltaFallback', type: 'combo', label: 'When neither lines up', group: 'Delta', options: [
+            { value: 'none', label: 'Copy nothing and say so' },
+            { value: 'full', label: 'Copy the whole session' },
+        ], hint: 'The default refuses rather than dropping an entire session into a window that was '
+               + 'expecting a few turns.' },
+
         { key: 'toolInputMax', type: 'slider', label: 'Tool input cap', min: 0, max: 20000, step: 250, unit: ' chars',
           hint: '0 copies every tool input in full.', group: 'Limits' },
         { key: 'toolResultMax', type: 'slider', label: 'Tool result cap', min: 0, max: 40000, step: 500, unit: ' chars',
@@ -310,13 +414,18 @@ const spec = {
 
         { key: '_now', type: 'custom', label: 'Copy now', hint: 'Uses the session the window is showing.', group: 'Limits',
           node() {
-              const b = document.createElement('div');
-              b.textContent = 'Copy to clipboard';
-              b.style.cssText = 'padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer;'
-                  + 'border:1px solid color-mix(in srgb, hsl(var(--text-100)) 14%, transparent);'
-                  + 'background:color-mix(in srgb, hsl(var(--text-100)) 6%, transparent);';
-              b.addEventListener('click', () => copy());
-              return b;
+              const wrap = document.createElement('div');
+              wrap.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+              for (const [text, delta] of [['Copy to clipboard', false], ['Copy delta', true]]) {
+                  const b = document.createElement('div');
+                  b.textContent = text;
+                  b.style.cssText = 'padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer;'
+                      + 'border:1px solid color-mix(in srgb, hsl(var(--text-100)) 14%, transparent);'
+                      + 'background:color-mix(in srgb, hsl(var(--text-100)) 6%, transparent);';
+                  b.addEventListener('click', () => copy(delta));
+                  wrap.append(b);
+              }
+              return wrap;
           } },
 
         { key: '_sample', type: 'custom', label: 'Sample output', wide: true, group: 'Sample',

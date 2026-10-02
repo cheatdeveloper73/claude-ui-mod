@@ -85,16 +85,21 @@ module.exports = function (ctx) {
         });
     }
 
-    // The router dispatches on the model id, and this has to reach the same
-    // answer without asking it. The two compiled-in arms are recognised by
-    // name; anything else takes its provider from the leading segment of the
-    // bare id, which is the convention every catalogue entry and adapter model
-    // already follows. Naming providers here is what made this file need
-    // editing every time one was added.
+    // The two compiled-in arms are recognisable by model name. Adapter model ids
+    // do not have to name their owner, so the provider-picker catalogue is the
+    // authority for them; the leading segment remains a fallback for a generic
+    // provider while the picker is unavailable.
+    function modelKey(model) {
+        return String(model || '').toLowerCase()
+            .replace(/\[1m\]/g, '')
+            .replace(/^(?:claude-)+/, '')
+            .replace(/:(?:none|minimal|low|medium|high|xhigh|max|ultra|pro)$/, '');
+    }
+
     function providerForModel(model) {
         const raw = String(model || '').toLowerCase();
         if (/gpt|codex|openai/.test(raw)) return 'openai';
-        const bare = raw.replace(/^claude-/, '').replace(/\[1m\]/g, '');
+        const bare = modelKey(raw);
         // Anthropic's own families, including the ones whose weekly quota is
         // model-scoped rather than plan-wide. Omitting one does not degrade to
         // the Claude arm -- the leading segment below turns it into a pool
@@ -103,6 +108,18 @@ module.exports = function (ctx) {
         if (!bare || /^(claude|opus|sonnet|haiku|fable|design)/.test(bare)) return 'claude';
         const head = bare.split(/[-.:/]/)[0];
         return head || 'claude';
+    }
+
+    async function resolvedProviderForModel(model) {
+        const fallback = providerForModel(model);
+        if (fallback === 'openai' || fallback === 'claude') return fallback;
+        try {
+            const catalogue = await ctx.boot?.host?.dispatch('provider-picker.catalogue');
+            const key = modelKey(model);
+            const match = catalogue?.models?.find(entry => modelKey(entry.wireId || entry.id) === key);
+            if (typeof match?.provider === 'string' && match.provider) return match.provider;
+        } catch (_) {}
+        return fallback;
     }
 
     // A provider with several quota families has to be narrowed to the one that
@@ -123,8 +140,7 @@ module.exports = function (ctx) {
         return narrowed.length ? narrowed : mine;
     }
 
-    function compactAnalytics(value, model) {
-        const provider = providerForModel(model);
+    function compactAnalytics(value, model, provider = providerForModel(model)) {
         const meters = metersForModel(value?.meters || [], provider, model).map((meter) => ({
             key: meter.key,
             provider: meter.provider,
@@ -152,11 +168,15 @@ module.exports = function (ctx) {
         return promise;
     }
 
-    async function readAllLimits(force, providers, model) {
+    async function readAllLimits(force, model) {
         const plan = readPlan();
         try {
-            const value = await analytics(force, providers ? 'all' : 'claude');
-            const provider = providerForModel(model);
+            // Resolve catalogue ownership before choosing the router scope. The
+            // renderer cannot infer an adapter from an opaque model id on its
+            // first observation, and a Claude-only request omits that adapter's
+            // limits exactly when the popover first opens.
+            const provider = await resolvedProviderForModel(model);
+            const value = await analytics(force, provider === 'claude' ? 'claude' : 'all');
             // `pool` is whichever adapter provider serves this model, looked up
             // by its own key in the limits payload. Naming a provider here is
             // what made this file need editing every time one was added.
@@ -169,7 +189,7 @@ module.exports = function (ctx) {
                 provider,
                 openai: provider === 'openai' ? value.limits?.openai || null : null,
                 pool,
-                analytics: compactAnalytics(value, model),
+                analytics: compactAnalytics(value, model, provider),
             };
         } catch (err) {
             const error = String(err && err.message);
@@ -188,7 +208,7 @@ module.exports = function (ctx) {
         if (!event?.sender || event.sender.isDestroyed()) return null;
         return event.sender.executeJavaScript(pageSource, false);
     });
-    ctx.method('allLimits', (params) => readAllLimits(params?.force === true, params?.providers === true, params?.model));
+    ctx.method('allLimits', (params) => readAllLimits(params?.force === true, params?.model));
     ctx.method('openDashboard', () => {
         ctx.electron.shell.openExternal(ROUTER + '/usage/');
         return true;

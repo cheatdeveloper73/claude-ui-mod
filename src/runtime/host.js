@@ -205,6 +205,7 @@ module.exports = function createHost(boot) {
         try {
             return fs.readdirSync(path.join(MOD_DIR, 'src', 'plugins'), { withFileTypes: true })
                 .filter((e) => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('_'))
+                .filter((e) => !fs.existsSync(path.join(MOD_DIR, 'src', 'plugins', e.name, 'DISABLED.json')))
                 .map((e) => e.name)
                 .sort();
         } catch (_) { return []; }

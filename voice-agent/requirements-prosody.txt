@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+transformers==5.7.0
+numpy>=1.26,<3
+soundfile>=0.13,<1

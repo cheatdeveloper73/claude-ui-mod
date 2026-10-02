@@ -2,6 +2,7 @@
 // response; no prompts, content, credentials, or request bodies ever enter it.
 import fs from 'node:fs';
 import path from 'node:path';
+import { replayJsonl } from './jsonl-archive.mjs';
 
 const TOKEN_FIELDS = [
     'input_tokens',
@@ -136,15 +137,7 @@ export class UsageLedger
 
     load()
     {
-        let text = '';
-        try { text = fs.readFileSync(this.file, 'utf8'); } catch (_) { return; }
-        for (const line of text.split('\n'))
-        {
-            if (!line.trim()) continue;
-            let entry;
-            try { entry = JSON.parse(line); } catch (_) { continue; }
-            this.apply(entry);
-        }
+        replayJsonl(this.file, entry => this.apply(entry));
     }
 
     apply(entry)

@@ -76,6 +76,21 @@ export function runRouterCanary()
     for (const frame of recoveredFrames) parseRecovered(frame);
     invariant(recoveredEvents.at(-1)?.type === 'message_stop' && !recoveredEvents.some(event => event.type === 'error'), 'tool recovery did not terminate cleanly');
 
+    const refusalFixture = [
+        { type: 'response.created', response: { usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'response.failed', response: { error: {
+            code: 'invalid_prompt', message: 'This content was flagged for possible cybersecurity risk.',
+        } } },
+    ];
+    const refusalFrames = [];
+    const refusal = new ResponsesToAnthropic('claude-gpt-6-astra[1m]', frame => refusalFrames.push(frame));
+    for (const event of refusalFixture) refusal.handle(event);
+    const refusalEvents = [];
+    const parseRefusal = sseParser(event => refusalEvents.push(event));
+    for (const frame of refusalFrames) parseRefusal(frame);
+    invariant(refusalEvents.at(-1)?.type === 'message_stop' && !refusalEvents.some(event => event.type === 'error'), 'cyber refusal did not terminate as a message');
+    invariant(refusalEvents.find(event => event.type === 'message_delta')?.delta?.stop_details?.category === 'cyber', 'cyber refusal category was lost');
+
     const pingEvents = [];
     sseParser(event => pingEvents.push(event))(anthropicPing(), true);
     invariant(pingEvents[0]?.type === 'ping', 'heartbeat is not a valid Anthropic SSE event');
@@ -84,9 +99,19 @@ export function runRouterCanary()
     invariant(message.content.some(block => block.type === 'thinking'), 'nonstream reasoning is missing');
     invariant(message.content.some(block => block.type === 'tool_use' && block.name === 'Read'), 'nonstream tool use is missing');
     invariant(message.stop_reason === 'tool_use', 'nonstream stop reason is wrong');
+    const refusalMessage = collectAnthropicMessage('claude-gpt-6-astra[1m]', refusalFixture);
+    invariant(refusalMessage.stop_reason === 'refusal' && refusalMessage.stop_details?.category === 'cyber', 'nonstream cyber refusal details were lost');
 
     const compactPrompt = 'Your task is to create a detailed summary of the conversation so far, paying close attention to the user\'s explicit requests and your previous actions.';
-    invariant(isClaudeCompactionRequest({ messages: [{ role: 'user', content: compactPrompt }] })?.kind === 'full', 'Claude compaction request is not recognized');
+    const compactWrapper = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+`;
+    invariant(isClaudeCompactionRequest({ messages: [{ role: 'user', content: compactWrapper + compactPrompt }] })?.kind === 'full', 'wrapped Claude compaction request is not recognized');
     const compact = collectRemoteCompaction([
         { type: 'response.output_item.done', item: { type: 'compaction', id: 'cmp_canary', encrypted_content: 'opaque' } },
         { type: 'response.completed', response: { id: 'resp_compact_canary' } },
@@ -95,7 +120,7 @@ export function runRouterCanary()
     const summaryWire = anthropicSummaryResponse('claude-gpt-5.6-sol[1m]', 'checkpoint', { input_tokens: 1, output_tokens: 1 }, true);
     invariant(summaryWire.includes('event: message_start') && summaryWire.includes('event: message_stop'), 'compaction summary lifecycle is incomplete');
 
-    return { ok: true, checks: 17 };
+    return { ok: true, checks: 19 };
 }
 
 const isEntryPoint = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

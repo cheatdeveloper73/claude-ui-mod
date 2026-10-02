@@ -53,6 +53,15 @@ function sanitizeOpenAI(value, observedAt)
             }))
             : [],
         resetCredits: finite(value?.rate_limit_reset_credits?.available_count),
+        // Usage credits are independent of subscription windows and reset credits.
+        // Preserve only explicitly reported fields; absence is unknown.
+        credits: value?.credits && typeof value.credits === 'object' ? {
+            hasCredits: typeof value.credits.has_credits === 'boolean' ? value.credits.has_credits : null,
+            unlimited: typeof value.credits.unlimited === 'boolean' ? value.credits.unlimited : null,
+            overageLimitReached: typeof value.credits.overage_limit_reached === 'boolean' ? value.credits.overage_limit_reached : null,
+            balance: typeof value.credits.balance === 'string' && /^\d+(?:\.\d+)?$/.test(value.credits.balance)
+                ? value.credits.balance : finite(value.credits.balance),
+        } : null,
     };
 }
 

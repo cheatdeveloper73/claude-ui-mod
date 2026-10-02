@@ -4,7 +4,9 @@
 const slot = '__cuimod_provider_native';
 const previous = window[slot];
 if (previous && previous.version === version) return previous.snapshot();
-if (previous) previous.dispose(false);
+// Retire the old projection while it still knows which rows it injected. The
+// successor's ids cannot identify a model removed by the latest discovery.
+if (previous) previous.dispose();
 
 // App 1.44121.4 moved the Desktop Code surface onto the "ccd" catalogue
 // section; "code" is still served but nothing in this window renders it.
@@ -12,18 +14,30 @@ const SURFACES = new Set(['ccd', 'code']);
 const ids = new Set(models.map(m => m.wireId));
 const byId = new Map(models.map(m => [m.wireId, m]));
 const normalizeModelId = (id) => {
-    const text = String(id ?? '');
-    const cleaned = text.replace(/(\[1m\]|:\w+)$/i, '');
-    const deduped = cleaned.replace(/^claude-(?=claude-)/i, '');
-    return /^claude-/i.test(deduped) ? deduped : `claude-${deduped}`;
+    const text = String(id ?? '').trim();
+    return text
+        .replace(/\[1m\]/ig, '')
+        .replace(/:(none|minimal|low|medium|high|xhigh|max|ultra|pro)$/i, '')
+        .replace(/^claude-(?=claude-)/i, '');
 };
-const resolveModel = (id) => {
-    const normalized = normalizeModelId(id);
-    return byId.get(normalized) || byId.get(id);
-};
-const providerOf = (id) => resolveModel(id)?.provider || 'claude';
-const ours = id => byId.has(id);
+const canonicalId = id => normalizeModelId(id).replace(/^(?:claude-)+/i, '').toLowerCase();
+const byCanonicalId = new Map(models.map(model => [canonicalId(model.wireId), model]));
+const resolveModel = id => byId.get(id) || byCanonicalId.get(canonicalId(id));
+const registeredPatterns = (typeof registered === 'undefined' ? [] : registered)
+    .map(row => ({ provider: row.provider, pattern: new RegExp(row.pattern) }));
+const providerOf = (id) => resolveModel(id)?.provider
+    || registeredPatterns.find(row => row.pattern.test(canonicalId(id)))?.provider || 'claude';
+const ours = id => byId.has(id) || twinIds.has(id);
 const providerIds = new Set(providers.map(provider => provider.id));
+// The native row's own fast_mode shape (read from the live ccd catalogue on
+// claude-opus-5, 2026-09-30). The composer shows its fast switch only for a
+// model whose entry carries this.
+const FAST_TOGGLE = { type: 'toggle', name: 'Fast mode', options: [
+    { id: 'fast', name: 'Enable fast mode', selector_label: 'Fast' }, { id: 'off', name: 'Off' },
+] };
+// CLI 2.1.284's model catalogue gives these the fast_mode capability, and the
+// CLI sends speed:"fast" for them, but the server's ccd section omits the toggle.
+const NATIVE_FAST = new Set(['claude-opus-5-5']);
 const entries = models.map(m => ({
     id: m.wireId, name: m.name, short_name: m.name, section: 'main',
     ...(Number.isFinite(m.context) ? { context_window: m.context, supports_1m_context: m.context >= 1000000 } : {}),
@@ -32,11 +46,22 @@ const entries = models.map(m => ({
         type: 'effort',
         description: 'Higher effort gives the model more time to reason.',
         effort_options: m.efforts.map(e => ({
-            id: e, name: { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max' }[e],
+            id: e, name: { none: 'Instant', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max', ultra: 'Ultra', pro: 'Pro' }[e] || e,
             recommended: e === m.defaultEffort,
         })),
     } } : {}),
+    ...(m.fastMode ? { fast_mode: FAST_TOGGLE } : {}),
 }));
+// The fast switch looks its model up with the context tag stripped
+// (fastModeFor(Uc(id)), Uc = /\[[^\]]+\]$/ removed), while every other footer
+// lookup uses the raw id and finds the tagged row. A fast-capable tagged row
+// therefore needs an untagged twin. `legacy` keeps the twin out of the popup,
+// which renders only main and overflow rows, and out of the model list.
+const fastTwins = new Map(entries.filter(e => e.fast_mode && /\[[^\]]+\]$/.test(e.id))
+    .map(e => [e.id, { ...e, id: e.id.replace(/\[[^\]]+\]$/, ''), section: 'legacy' }]));
+const withFastTwins = list => list.concat(list.flatMap(e => fastTwins.has(e.id) ? [fastTwins.get(e.id)] : []));
+const twinIds = new Set([...fastTwins.values()].map(twin => twin.id));
+const withNativeFast = m => NATIVE_FAST.has(m.id) && !m.fast_mode ? { ...m, fast_mode: FAST_TOGGLE } : m;
 const queryClients = new Map();
 const scopes = new Map();
 // The 1.44121.4 model selector renders from the catalogue section it is handed,
@@ -81,7 +106,7 @@ function selected() {
 }
 
 function projectSection(section) {
-    const base = natives.get(section.id) || section.models.filter(m => !ours(m.id));
+    const base = (natives.get(section.id) || section.models.filter(m => !ours(m.id))).map(withNativeFast);
     // Catalogue entries keep their own provider, and one of them deliberately
     // shadows a native id, so the Claude tab is the native list plus our
     // claude-provider entries -- not the native list alone.
@@ -94,7 +119,7 @@ function projectSection(section) {
         const model = base.find(m => m.id === current) || entries.find(e => e.id === current);
         if (model) list.push(model);
     }
-    return list;
+    return withFastTwins(list);
 }
 
 function extend(client, query) {

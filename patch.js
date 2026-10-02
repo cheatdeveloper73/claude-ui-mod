@@ -81,6 +81,104 @@ function buildPayloads(originalPreload) {
     return { pre, main, channel: prefix };
 }
 
+// Desktop removes agent-to-agent messaging twice, at two layers, and both have
+// to go or the symptom just changes shape.
+//
+//   registry  `U.disallowedTools = [...U.disallowedTools ?? [], "SendMessage"]`
+//             closes the spawn-options chain with no guard. A disallowed tool
+//             is dropped inside the CLI's XA() before deferred classification,
+//             so the name never reaches ToolSearch's pool: `select:SendMessage`
+//             answers "no matching deferred tools" — the shape of a missing
+//             feature, not of a denial.
+//
+//   call      a PreToolUse hook matches the tool name and returns deny. It
+//             never inspects `to`, so a send to an in-process subagent or a
+//             teammate is refused with a message about terminal sessions being
+//             unreachable. Lifting only the registry ban surfaces the tool and
+//             then fails every call.
+//
+// Nothing substitutes for either. mcp__ccd_session_mgmt__send_message addresses
+// Desktop *sessions*; SendMessage addresses *agents*.
+//
+// With the deny branch neutralised, SendMessage falls through the same chain as
+// any other tool: `n.Jn` still refuses it in a remote-dispatched tree, and the
+// directory pre-card still runs. Only the blanket refusal goes.
+//
+// Every identifier here is minified per build, so match statement shape and
+// resolve the SendMessage literal from the same chunk. Each edit asserts
+// exactly one site — a Desktop update that reshapes either one fails the patch
+// loudly rather than quietly restoring half the ban.
+function unbanSendMessage(source, log) {
+    const { header } = asar.readHeader(source);
+    const build = header.files?.['.vite']?.files?.build?.files;
+    if (!build) throw new Error('.vite/build not found in asar');
+
+    const out = {};
+    const found = { registry: 0, call: 0 };
+    for (const name of Object.keys(build)) {
+        if (!name.endsWith('.js') || build[name].unpacked) continue;
+        const rel = '.vite/build/' + name;
+        const src = asar.readFile(source, rel).toString('utf8');
+        const decl = src.match(/(?:^|[^\w$])([A-Za-z_$][\w$]*)\s*=\s*"SendMessage"/);
+        if (!decl) continue;
+
+        let next = src;
+        let hits = 0;
+
+        const banned = new RegExp(
+            '([A-Za-z_$][\\w$]*)\\.disallowedTools=\\[\\.\\.\\.\\1\\.disallowedTools\\?\\?\\[\\],'
+            + decl[1] + '\\]',
+            'g');
+        next = next.replace(banned, () => { found.registry++; hits++; return 'void 0'; });
+
+        // The condition, not the branch: a dead `if (false)` is provably
+        // equivalent to deleting it and needs no brace or template matching.
+        const denied = /(?:[A-Za-z_$][\w$]*\.tool_name==="SendMessage"|"SendMessage"===[A-Za-z_$][\w$]*\.tool_name)/g;
+        next = next.replace(denied, () => { found.call++; hits++; return 'false'; });
+
+        if (!hits) continue;
+        out[rel] = Buffer.from(next, 'utf8');
+        log('unbanned SendMessage in ' + rel
+            + ' (registry ' + found.registry + ', call ' + found.call + ')');
+    }
+    // Desktop removed both blanket bans in 2.7032.0 and has not brought them
+    // back. Accept only archives whose pristine header hash was inspected by
+    // hand; a later build with zero matches needs a fresh audit, because zero
+    // matches is also what a renamed ban looks like.
+    //
+    // 2.9939.4 is the second audited build. It reshaped the call-site deny
+    // rather than removing it: the PreToolUse entry is now `matcher:
+    // `^${Ps}$`` with Ps = "SendMessage", and its body returns {} unless
+    // Fs(tool_input) holds. Fs is true only when `to` is a non-string, carries
+    // `:`, `/` or `\`, ends `.sock`, or matches /^local_/i — that is, when the
+    // target is a *session* or a socket path, which is the cross-session guard
+    // Desktop has always had and which this patch never touched. An agent name
+    // fails every arm, so agent-to-agent sends are not refused.
+    //
+    // The registry side is gone outright. The only arrays still carrying the
+    // literal are is=["SendMessage","ListAgents","ListPeers"], read solely by
+    // the ds name-set that fs() prefix-matches, and the dotted tool catalogue
+    // string — neither reaches a disallowedTools append. Every append in the
+    // build lists AskUserQuestion, SubscribePR, the unattended session
+    // lifecycle set, or the onboarding pair.
+    const AUDITED = {
+        '62f0a21d5a95750273b3a44900009019f73c521c976711c5fdd6ffbba6daf288': '2.7032.0',
+        'c5274bb77257bc824d5d02bb10eb503a0ad1a693ebee05dc953ab9d130701ad5': '2.9939.4',
+    };
+    const audited = AUDITED[asar.headerHash(source)];
+    if (found.registry === 0 && found.call === 0 && audited) {
+        log('SendMessage blanket bans absent in audited Desktop ' + audited);
+        return out;
+    }
+    if (found.registry !== 1) {
+        throw new Error('expected exactly 1 SendMessage disallowedTools append, found ' + found.registry);
+    }
+    if (found.call !== 1) {
+        throw new Error('expected exactly 1 SendMessage PreToolUse deny, found ' + found.call);
+    }
+    return out;
+}
+
 function patchOne(a, log = console.log) {
     // Always inject into pristine bytes so re-running never double-appends.
     let source = a.asar;
@@ -97,8 +195,11 @@ function patchOne(a, log = console.log) {
     const { pre, main, channel } = buildPayloads(originalPreload);
     if (!channel) log('! ' + a.name + ': LocalSessions onEvent channel not found; session detection falls back to URL');
 
+    const unban = unbanSendMessage(source, log);
+
     const tmp = a.asar + '.cuimod-tmp';
     const newHeaderHash = asar.writePatched(source, tmp, {
+        ...unban,
         [PRELOAD_ENTRY]: Buffer.from(originalPreload + '\n' + MARKER + '\n' + pre, 'utf8'),
         [MAIN_ENTRY]: Buffer.from(originalMain + '\n' + MARKER + '\n' + main, 'utf8'),
     });
@@ -108,6 +209,12 @@ function patchOne(a, log = console.log) {
     if (!asar.readFile(tmp, '.vite/build/mainWindow.js').equals(asar.readFile(source, '.vite/build/mainWindow.js'))) {
         fs.rmSync(tmp, { force: true });
         throw new Error(a.name + ': verification failed, untouched entry changed');
+    }
+    for (const rel of Object.keys(unban)) {
+        if (!asar.readFile(tmp, rel).equals(unban[rel])) {
+            fs.rmSync(tmp, { force: true });
+            throw new Error(a.name + ': verification failed, SendMessage unban did not land in ' + rel);
+        }
     }
     if (!asar.readFile(tmp, PRELOAD_ENTRY).includes(MARKER) || !asar.readFile(tmp, MAIN_ENTRY).includes(MARKER)) {
         fs.rmSync(tmp, { force: true });
@@ -173,7 +280,7 @@ function status() {
     });
 }
 
-module.exports = { appDirs, isPatched, patchOne, apply, revert, status, running, MARKER, ROOT };
+module.exports = { appDirs, isPatched, patchOne, apply, revert, status, running, unbanSendMessage, MARKER, ROOT };
 
 if (require.main === module) {
     const args = process.argv.slice(2);

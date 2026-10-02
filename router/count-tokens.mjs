@@ -2,6 +2,10 @@ import crypto from 'node:crypto';
 
 let encoderPromise;
 const cache = new Map();
+const ENCODE_CHUNK_CHARS = 4096;
+const EXACT_TEXT_LIMIT = 64 * 1024;
+const SAMPLE_CHARS = 256;
+const SAMPLE_COUNT = 16;
 
 // Read dimensions only; never decode pixels or run third-party image parsers.
 // Every JPEG segment advances within the supplied bytes, including malformed
@@ -48,6 +52,42 @@ async function encoder() {
     return encoderPromise;
 }
 
+function encodeBounded(enc, text) {
+    if (text.length <= ENCODE_CHUNK_CHARS) return enc.encode(text, [], []).length;
+    let tokens = 0;
+    for (let at = 0; at < text.length;) {
+        let end = Math.min(text.length, at + ENCODE_CHUNK_CHARS);
+        // Never split a UTF-16 surrogate pair. Chunk boundaries can add a tiny
+        // number of BPE tokens, but they cap bytePairMerge's work and prevent a
+        // multi-megabyte count request from freezing every inference stream.
+        if (end < text.length && end > at) {
+            const code = text.charCodeAt(end - 1);
+            if (code >= 0xD800 && code <= 0xDBFF) end--;
+        }
+        tokens += enc.encode(text.slice(at, end), [], []).length;
+        at = end;
+    }
+    return tokens;
+}
+
+function encodeEstimated(enc, text) {
+    if (text.length <= EXACT_TEXT_LIMIT) return encodeBounded(enc, text);
+    let sampledChars = 0;
+    let sampledTokens = 0;
+    const lastStart = Math.max(0, text.length - SAMPLE_CHARS);
+    for (let i = 0; i < SAMPLE_COUNT; i++) {
+        let start = Math.round(lastStart * i / Math.max(1, SAMPLE_COUNT - 1));
+        if (start > 0) {
+            const code = text.charCodeAt(start - 1);
+            if (code >= 0xD800 && code <= 0xDBFF) start++;
+        }
+        const sample = text.slice(start, Math.min(text.length, start + SAMPLE_CHARS));
+        sampledChars += sample.length;
+        sampledTokens += encodeBounded(enc, sample);
+    }
+    return Math.ceil(text.length * sampledTokens / Math.max(1, sampledChars));
+}
+
 // Current GPT vision sizing rules, including screenshots carried in tool results:
 // https://developers.openai.com/api/docs/guides/images-vision#model-sizing-behavior
 export function imageTokens(width, height, model, detail = 'auto') {
@@ -92,7 +132,7 @@ export async function estimateOpenAIInput(payload) {
     const key = crypto.createHash('sha256').update(payload.model + '\n' + media + '\n' + text).digest('hex');
     if (cache.has(key)) return cache.get(key);
     const enc = await encoder();
-    const tokens = enc.encode(text, [], []).length + media;
+    const tokens = encodeEstimated(enc, text) + media;
     // Wire-envelope overhead is estimated; real terminal usage remains the
     // authority after a response. Only hashes and counts are retained here.
     cache.set(key, tokens);

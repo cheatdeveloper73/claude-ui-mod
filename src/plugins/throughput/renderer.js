@@ -97,9 +97,11 @@ const CSS = `
 .tp .now .big { font-variant-numeric: tabular-nums; font-size: 34px; line-height: 1;
                 font-weight: 300; letter-spacing: -.02em; color: hsl(var(--text-100, 60 14% 97%)); }
 .tp .now .unit { font-size: 11px; padding-bottom: 3px; color: hsl(var(--text-500, 48 5% 57%)); }
-.tp .now .side { margin-left: auto; text-align: right; font-size: 11px; line-height: 1.5;
+/* Not "side": the panel can render inside the dashboard's shadow root, whose
+ * .side rule is its 200px sidebar. */
+.tp .now .sd { margin-left: auto; text-align: right; font-size: 11px; line-height: 1.5;
                  color: hsl(var(--text-500, 48 5% 57%)); }
-.tp .now .side em { font-style: normal; font-variant-numeric: tabular-nums;
+.tp .now .sd em { font-style: normal; font-variant-numeric: tabular-nums;
                     color: hsl(var(--text-200, 60 8% 88%)); }
 
 .tp .list { display: flex; flex-direction: column; border-radius: 9px; overflow: hidden;
@@ -166,7 +168,7 @@ function build() {
     const now = el('div', 'now');
     const big = el('div', 'big', '—');
     const unit = el('div', 'unit', 'tok/s');
-    const side = el('div', 'side');
+    const side = el('div', 'sd');
     now.append(big, unit, side);
 
     const live = section('In flight', '');

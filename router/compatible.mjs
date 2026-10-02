@@ -93,13 +93,21 @@ function loadSecrets()
         const raw = fs.readFileSync(SECRETS_FILE, 'utf8');
         if (raw !== secrets.raw)
         {
-            const values = JSON.parse(raw.replace(/^﻿/, ''));
+            let values;
+            try { values = JSON.parse(raw.replace(/^﻿/, '')); }
+            catch (_) { throw new Error('provider secrets file is not valid JSON'); }
             if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('provider secrets must be an object');
             secrets = { raw, values };
         }
         secretsError = null;
     }
-    catch (error) { secretsError = String(error?.message || error); }
+    // /healthz publishes this string. A JSON.parse message quotes the text it
+    // choked on, which here is a credential file, and an fs error carries the
+    // absolute path, so only messages written above are passed through.
+    catch (error) { secretsError = error?.code === 'ENOENT' ? 'provider secrets file is missing'
+        : error?.code ? 'provider secrets file could not be read'
+        : /^provider secrets (file is not valid JSON|must be an object)$/.test(error?.message) ? error.message
+        : 'provider secrets file could not be read'; }
     return secrets.values;
 }
 

@@ -50,6 +50,7 @@ function observe(node, opts, fn) {
 // ---------------------------------------------------------------- session id
 const seen = [];
 let sessionId = null;
+let sessionGeneration = 0;
 const sessionSubs = new Set();
 const taskSubs = new Set();
 let tasks = [];
@@ -86,53 +87,141 @@ const onEventChannel = boot.eipc('claude.web', 'LocalSessions', 'onEvent');
 // hint that something moved — never a source of "which session is on screen".
 onDispose(boot.appOn(onEventChannel, () => { scheduleResolve(); }));
 
-function urlCandidates() {
+function locationKey() { return location.pathname + location.search; }
+
+function urlCandidates(value = locationKey()) {
     const out = [];
     let m;
     UUID_ANY.lastIndex = 0;
-    const s = location.pathname + location.search;
-    while ((m = UUID_ANY.exec(s)) !== null) out.push(m[0]);
+    while ((m = UUID_ANY.exec(value)) !== null) out.push(m[0]);
     return out;
 }
 
+const deadlines = new Set();
+function within(promise, ms = 5000) {
+    let entry;
+    const timeout = new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('renderer request timed out')), ms);
+        entry = { timer, reject };
+        deadlines.add(entry);
+    });
+    return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+        clearTimeout(entry.timer);
+        deadlines.delete(entry);
+    });
+}
+onDispose(() => {
+    for (const entry of deadlines) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error('renderer disposed'));
+    }
+    deadlines.clear();
+});
+
 let resolveTimer = null;
-let resolving = false;
-function scheduleResolve() {
+let resolveGeneration = 0;
+let resolveFlight = null;
+let resolveQueued = false;
+function scheduleResolve(wait = 200) {
     if (resolveTimer) return;
-    resolveTimer = setTimeout(() => { resolveTimer = null; doResolve(); }, 200);
+    resolveTimer = setTimeout(() => { resolveTimer = null; doResolve(); }, wait);
 }
 onDispose(() => clearTimeout(resolveTimer));
 
-async function doResolve() {
-    if (resolving || disposed) return;
-    resolving = true;
-    try {
-        // The URL is the only source of truth for which session is on screen.
-        // A view with no id in its address — the new-session view — genuinely
-        // has no session, and must resolve to null rather than to whatever was
-        // focused a moment ago. `seen` stays a trigger, never an answer.
-        const id = await boot.rpc('tasks.resolve', { candidates: urlCandidates() });
-        if (id !== sessionId) {
-            // null is a real answer — a fresh chat has no session yet, and the
-            // rail must empty rather than keep showing the previous one.
-            sessionId = id || null;
-            await refreshTasks();
-            for (const fn of sessionSubs) { try { fn(sessionId); } catch (_) {} }
-        }
-    } catch (_) {} finally {
-        resolving = false;
-    }
+function publishSession(value) {
+    const next = value || null;
+    if (next === sessionId) return;
+    sessionId = next;
+    sessionGeneration++;
+    tasks = [];
+    for (const fn of sessionSubs) { try { fn(sessionId); } catch (_) {} }
+    if (sessionId) refreshTasks();
 }
 
+function resolveOwned(owner) {
+    return !disposed && owner.generation === resolveGeneration && owner.url === locationKey();
+}
+
+async function doResolve() {
+    if (disposed) return false;
+    const generation = resolveGeneration;
+    if (resolveFlight?.generation === generation) {
+        resolveQueued = true;
+        return resolveFlight.promise;
+    }
+
+    // The URL plus generation owns this answer. The generation is required for
+    // A -> B -> A navigation: matching the final URL would make the first A look
+    // current again even though its request belongs to a retired visit.
+    const owner = { generation, url: locationKey(), promise: null };
+    resolveFlight = owner;
+    const run = (async () => {
+        try {
+            const id = await within(boot.rpc('tasks.resolve', { candidates: urlCandidates(owner.url) }));
+            if (!resolveOwned(owner)) return false;
+            publishSession(id);
+            return true;
+        } catch (_) { return false; }
+        finally {
+            // A retired request must not clear or reschedule the current visit's
+            // bookkeeping when it eventually resolves, rejects or times out.
+            if (resolveFlight !== owner) return;
+            resolveFlight = null;
+            if (resolveQueued && resolveOwned(owner)) {
+                resolveQueued = false;
+                scheduleResolve(0);
+            }
+        }
+    })();
+    owner.promise = run;
+    return run;
+}
+
+let taskFlight = null;
+let taskQueued = false;
 async function refreshTasks() {
-    if (!sessionId) { tasks = []; return; }
-    try { tasks = await boot.rpc('tasks.list', { sessionId }); } catch (_) { tasks = []; }
+    const owner = { sessionId, generation: sessionGeneration, promise: null };
+    if (!owner.sessionId) { tasks = []; return false; }
+    if (taskFlight?.generation === owner.generation) {
+        taskQueued = true;
+        return taskFlight.promise;
+    }
+    taskFlight = owner;
+    const run = (async () => {
+        try {
+            const value = await within(boot.rpc('tasks.list', { sessionId: owner.sessionId }));
+            if (disposed || owner.generation !== sessionGeneration || owner.sessionId !== sessionId) return false;
+            tasks = Array.isArray(value) ? value : [];
+            for (const fn of taskSubs) { try { fn(); } catch (_) {} }
+            return true;
+        } catch (_) {
+            if (!disposed && owner.generation === sessionGeneration && owner.sessionId === sessionId) {
+                tasks = [];
+                for (const fn of taskSubs) { try { fn(); } catch (_) {} }
+            }
+            return false;
+        } finally {
+            if (taskFlight !== owner) return;
+            taskFlight = null;
+            if (taskQueued && !disposed && owner.generation === sessionGeneration) {
+                taskQueued = false;
+                queueMicrotask(refreshTasks);
+            }
+        }
+    })();
+    owner.promise = run;
+    return run;
 }
 
 // ---------------------------------------------------------------- plugin api
 const api = {
     get sessionId() { return sessionId; },
-    onSessionChange(fn) { sessionSubs.add(fn); if (sessionId) { try { fn(sessionId); } catch (_) {} } },
+    onSessionChange(fn) {
+        if (typeof fn !== 'function') return () => {};
+        sessionSubs.add(fn);
+        if (sessionId) { try { fn(sessionId); } catch (_) {} }
+        return () => sessionSubs.delete(fn);
+    },
     onTasksChange(fn) { taskSubs.add(fn); },
     async getTasks() { return tasks; },
     openTasksDir(id) { return boot.rpc('tasks.openDir', { sessionId: id || sessionId }); },
@@ -192,18 +281,25 @@ for (const p of plugins) {
 
 // The URL is the authoritative session marker, and the app navigates with
 // pushState, which fires no event — so it has to be polled.
-let lastLoc = location.pathname + location.search;
-every(500, () => {
-    const now = location.pathname + location.search;
+let lastLoc = locationKey();
+function observeLocation() {
+    const now = locationKey();
     if (now === lastLoc) return;
     lastLoc = now;
-    scheduleResolve();
-});
+    resolveGeneration++;
+    resolveFlight = null;
+    resolveQueued = false;
+    // Foreign session data disappears as soon as navigation is observed. The
+    // replacement id arrives later through the generation-owned resolver.
+    publishSession(null);
+    scheduleResolve(0);
+}
+every(500, observeLocation);
 
 // A fresh chat is addressable before its desktop json exists, so resolution can
 // legitimately fail for a beat. Keep asking until it lands.
 every(1000, () => { if (!sessionId) scheduleResolve(); });
-track(window, 'popstate', scheduleResolve);
+track(window, 'popstate', observeLocation);
 
 boot.log('bridge ready, plugins=[' + active.join(', ') + ']');
 doResolve();
@@ -212,15 +308,17 @@ return {
     onEvent(payload) {
         if (!payload) return;
         if (payload.type === 'tasks-changed') {
-            if (!sessionId || (payload.sessionIds || []).indexOf(sessionId) !== -1) {
-                refreshTasks().then(() => {
-                    for (const fn of taskSubs) { try { fn(); } catch (_) {} }
-                });
-            }
+            if (!sessionId || (payload.sessionIds || []).indexOf(sessionId) !== -1) refreshTasks();
         }
     },
     dispose() {
         disposed = true;
+        resolveGeneration++;
+        sessionGeneration++;
+        resolveFlight = null;
+        taskFlight = null;
+        resolveQueued = false;
+        taskQueued = false;
         for (let i = disposers.length - 1; i >= 0; i--) {
             try { disposers[i](); } catch (_) {}
         }

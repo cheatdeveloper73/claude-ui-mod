@@ -7,6 +7,8 @@ export const H = 900;
 
 export const TITLEBAR = 36;
 export const SIDEBAR = 240;
+export const TITLE_H = 28;                      // the chat's own title strip
+export const REGION_TOP = TITLEBAR + TITLE_H;   // top of the transcript region
 
 export const COL_W = 700;                       // the composer / transcript column
 export const COL_X = SIDEBAR + Math.round((W - SIDEBAR - COL_W) / 2);

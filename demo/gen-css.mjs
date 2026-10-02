@@ -1,9 +1,11 @@
 /* Pull the real CSS out of the plugin sources so the demo cannot drift from
  * what the mod actually renders. Writes src/generated-css.js.
  *
- * task-rail and dashboard hold a plain `const CSS = ` template literal.
- * usage-bar builds its CSS from a pure function of its settings, so that one is
- * evaluated with the plugin's own defaults.
+ * Three shapes of stylesheet occur in the plugins:
+ *   - a plain `const CSS = ` template literal (task-rail, dashboard, throughput),
+ *   - an arrow function of the plugin's settings (subagents, queue, and
+ *     usage-bar's HOST_CSS), evaluated here with the plugin's own defaults,
+ *   - usage-bar's barCss, which HOST_CSS calls, taken from the same file.
  *
  * The plugins run inside a shadow root; the demo does not. Every rule is
  * therefore scoped to a wrapper class, `:host` becomes that class, and keyframe
@@ -19,28 +21,52 @@ const plugins = path.join(here, '..', 'src', 'plugins');
 
 const read = (name) => fs.readFileSync(path.join(plugins, name, 'renderer.js'), 'utf8');
 
+const BT = '`';
+
 function literal(src, decl) {
     const i = src.indexOf(decl);
     if (i === -1) throw new Error('declaration not found: ' + decl);
     const start = i + decl.length;
-    const end = src.indexOf('\n`;', start);
+    const end = src.indexOf('\n' + BT + ';', start);
     if (end === -1) throw new Error('unterminated literal after: ' + decl);
     const body = src.slice(start, end);
     if (body.includes('${')) throw new Error('literal after ' + decl + ' interpolates; evaluate it instead');
     return body;
 }
 
-function fnBody(src, signature) {
-    const i = src.indexOf(signature);
-    if (i === -1) throw new Error('function not found: ' + signature);
+// A template literal that interpolates is evaluated with the free names the
+// plugin would have had at rest: its own defaults, speed 1, no reduced motion.
+function evalLiteral(src, decl, names) {
+    const i = src.indexOf(decl);
+    if (i === -1) throw new Error('declaration not found: ' + decl);
+    const start = i + decl.length;
+    const end = src.indexOf('\n' + BT + ';', start);
+    if (end === -1) throw new Error('unterminated literal after: ' + decl);
+    const keys = Object.keys(names);
+    // eslint-disable-next-line no-new-func
+    return new Function(...keys, 'return ' + BT + src.slice(start, end) + BT + ';')(...Object.values(names));
+}
+
+// The balanced {...} that starts at or after `from`.
+function block(src, from) {
     let depth = 0;
-    let j = src.indexOf('{', i);
-    const from = j;
+    let j = src.indexOf('{', from);
+    const open = j;
     for (; j < src.length; j++) {
         if (src[j] === '{') depth++;
         else if (src[j] === '}' && --depth === 0) break;
     }
-    return src.slice(from + 1, j);
+    return src.slice(open, j + 1);
+}
+
+// `const DEF = { ... };` evaluated as an object literal.
+// eslint-disable-next-line no-new-func
+const defOf = (src) => new Function('return ' + block(src, src.indexOf('const DEF = {')))();
+
+function fnBody(src, signature) {
+    const i = src.indexOf(signature);
+    if (i === -1) throw new Error('function not found: ' + signature);
+    return block(src, i).slice(1, -1);
 }
 
 // ---------------------------------------------------------------- scoping
@@ -69,7 +95,9 @@ function prefixSelector(sel, cls) {
 
 // Walks top-level blocks. @keyframes bodies pass through untouched, @media
 // bodies are scoped recursively, everything else gets its selector prefixed.
+// Comments are stripped first: some of the plugins' comments contain braces.
 function scope(css, cls) {
+    css = css.replace(/\/\*[\s\S]*?\*\//g, '');
     let out = '';
     let i = 0;
     while (i < css.length) {
@@ -107,26 +135,55 @@ const FREEZE = (cls) => `
 const prepare = (css, cls, suffix) => scope(renameKeyframes(css, suffix), cls) + FREEZE(cls);
 
 // ---------------------------------------------------------------- build
-const railCss = prepare(literal(read('task-rail'), 'const CSS = `'), 'cui-rail', '__rail');
-const dashCss = prepare(literal(read('dashboard'), 'const CSS = `'), 'cui-dash', '__dash');
+const railCss = prepare(literal(read('task-rail'), 'const CSS = ' + BT), 'cui-rail', '__rail');
+const dashCss = prepare(literal(read('dashboard'), 'const CSS = ' + BT), 'cui-dash', '__dash');
+const tpCss = prepare(literal(read('throughput'), 'const CSS = ' + BT), 'cui-tp', '__tp');
 
+// usage-bar: HOST_CSS is the whole shadow sheet — .wrap's own placement rules
+// plus barCss, which it calls. Both come from the plugin, with its own spec
+// defaults as the settings.
 const usageSrc = read('usage-bar');
 // eslint-disable-next-line no-new-func
-const barCss = new Function('p', 'v', fnBody(usageSrc, 'function barCss(p, v)'));
-const usageDefaults = {
-    width: 96, thickness: 4, gap: 12, idle: 0.55, intensity: 1, glow: false,
-    warn: 0.6, danger: 0.85,
-    ctxCalm: '#8ecae6', ctxWarn: '#a9a0f0', ctxHot: '#cf8ef5',
-    limCalm: '#9fd8a8', limWarn: '#f3cb8a', limHot: '#f5949a',
-};
-const usageCss = prepare(barCss('', usageDefaults), 'cui-usage', '__usage');
+const barCssFn = new Function(
+    'return function barCss(prefix, value) {' + fnBody(usageSrc, 'function barCss(prefix, value)') + '}',
+)();
+// eslint-disable-next-line no-new-func
+const usageDefaults = new Function(
+    'return ' + block(usageSrc, usageSrc.indexOf('defaults: {', usageSrc.indexOf('const spec = {'))),
+)();
+const usageCss = prepare(
+    evalLiteral(usageSrc, 'const HOST_CSS = (value) => ' + BT, { value: usageDefaults, barCss: barCssFn }),
+    'cui-usage',
+    '__usage',
+);
+
+const saSrc = read('subagents');
+const saCss = prepare(
+    evalLiteral(saSrc, 'const CSS = () => ' + BT, {
+        V: defOf(saSrc),
+        MS: (n) => n,
+        CHAT_CLAMP: Number(saSrc.match(/const CHAT_CLAMP = (\d+)/)[1]),
+    }),
+    'cui-sa',
+    '__sa',
+);
+
+const qSrc = read('queue');
+const qCss = prepare(
+    evalLiteral(qSrc, 'const CSS = () => ' + BT, { V: defOf(qSrc), MS: (n) => n }),
+    'cui-q',
+    '__q',
+);
 
 const out = `// GENERATED by gen-css.mjs from ../src/plugins — do not edit by hand.
 export const RAIL_CSS = ${JSON.stringify(railCss)};
 export const DASH_CSS = ${JSON.stringify(dashCss)};
 export const USAGE_CSS = ${JSON.stringify(usageCss)};
+export const TP_CSS = ${JSON.stringify(tpCss)};
+export const SA_CSS = ${JSON.stringify(saCss)};
+export const Q_CSS = ${JSON.stringify(qCss)};
+export const USAGE_DEFAULTS = ${JSON.stringify(usageDefaults)};
 `;
 fs.writeFileSync(path.join(here, 'src', 'generated-css.js'), out);
-console.log('rail  ' + railCss.length + 'B');
-console.log('dash  ' + dashCss.length + 'B');
-console.log('usage ' + usageCss.length + 'B');
+for (const [n, c] of [['rail', railCss], ['dash', dashCss], ['usage', usageCss], ['tp', tpCss], ['sa', saCss], ['queue', qCss]])
+    console.log(n.padEnd(6) + c.length + 'B');

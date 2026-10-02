@@ -18,15 +18,21 @@
  * depending on stylesheet order. --chat-leading is a UNITLESS multiplier there,
  * not a length.
  *
- * Four tokens have to be redefined, not one. The app's font graph is
+ * Seven tokens have to be redefined, not one. The app declares
  *   --font-ui = var(--font-anthropic-sans)
- *   --font-claude-response / --font-user-message / --font-sans-serif = var(--font-ui)
- * so overriding --font-ui covers those — but --family-ui (11 consumers) and
- * --cds-font-sans (5) are independent tokens that resolve to the same stack by a
- * different route, and anything reading them kept rendering anthropic-sans. That
- * was the "inconsistently applied" symptom: it depended on which components were
- * on screen. Overriding --font-anthropic-sans covers the whole --font-ui chain at
- * its root; the other two are set alongside it.
+ *   --font-claude-response = var(--font-anthropic-serif)
+ *   --font-user-message / --font-sans-serif = var(--font-ui)
+ * on :root. The last three reach the transcript as already-resolved inherited
+ * stacks, so changing --font-ui there does not change components that consume
+ * them directly. --family-ui and --cds-font-sans are independent again. Set all
+ * seven transcript text tokens together or response headings, bold response
+ * utilities, user messages, and miscellaneous sans consumers can retain stock
+ * faces depending on which components are on screen.
+ *
+ * Tokens are not the final boundary: the live UI also assigns font-family on
+ * individual Markdown components. Apply the selected face to semantic text leaves
+ * as well. Do not blanket every descendant; icon spans use a PUA font, while code
+ * and math need their own shaping faces.
  *
  * Mono and serif tokens are deliberately left alone, so code blocks stay mono and
  * thinking-style keeps whichever face it picks.
@@ -78,8 +84,20 @@ function apply(v) {
     --chat-leading: ${v.leading};
     --font-anthropic-sans: ${v.face};
     --font-ui: ${v.face};
+    --font-claude-response: ${v.face};
+    --font-user-message: ${v.face};
+    --font-sans-serif: ${v.face};
     --family-ui: ${v.face};
     --cds-font-sans: ${v.face};
+    font-family: ${v.face};
+}
+.epitaxy-root .epitaxy-transcript-typography.epitaxy-transcript-typography :where(
+    .epitaxy-markdown, .text-body,
+    p, h1, h2, h3, h4, h5, h6,
+    strong, b, em, i, del, s, a,
+    ol, ul, li, dl, dt, dd, blockquote,
+    table, thead, tbody, tfoot, tr, th, td
+) {
     font-family: ${v.face};
 }
 `;

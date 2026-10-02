@@ -6,9 +6,9 @@
  * handed to the CLI immediately (priority "next"), which is why nothing ever
  * accumulates in the app's own queued-message bar on this build. This plugin
  * takes that decision back. While a turn is running, Enter (and the send button)
- * are swallowed before the app sees them, the composer's text is moved into a
- * queue of our own, and nothing reaches the model until either the turn ends or
- * you press Steer.
+ * are swallowed before the app sees them, the composer's text and images are
+ * moved into a queue of our own, and nothing reaches the model until either the
+ * turn ends or you press Steer.
  *
  * Everything about the queue is ours: the rail that hangs off the top of the
  * prompt box, the ordering, the persistence, the auto-send-at-turn-end rule.
@@ -44,16 +44,14 @@ let V = Object.assign({}, DEF);
 
 // ------------------------------------------------------------------ state
 let sid = null;                 // desktop session id (local_<uuid>) from the URL
-let items = [];                 // [{ id, text, at }] for the session on screen
+let items = [];                 // [{ id, text, images?, at }] for the session on screen
 let store = {};                 // every session's queue, as loaded from disk
 let running = false;            // is the session mid-turn
 let editing = null;             // id of the item currently loaded in the composer
 let armedTrash = null;          // id whose trash button is one click from firing
 let armedTimer = null;
-let autoTimer = null;
 let loaded = false;
 
-const SEND = cuimod.eipc('claude.web', 'LocalSessions', 'sendMessage');
 const GET_SESSION = cuimod.eipc('claude.web', 'LocalSessions', 'getSession');
 
 const uid = () => 'q' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
@@ -364,13 +362,17 @@ const CSS = () => `
     color: hsl(var(--text-500, 48 5% 57%));
     min-width: 10px; text-align: right;
 }
+.body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .txt {
-    flex: 1 1 auto; min-width: 0;
     font-size: ${V.size}px; line-height: 1.42;
     color: hsl(var(--text-200, 55 8% 85%));
     white-space: pre-wrap; overflow: hidden;
     display: -webkit-box; -webkit-box-orient: vertical;
     -webkit-line-clamp: ${Math.max(1, Math.round(V.lines))};
+}
+.media {
+    font-size: 9.5px; line-height: 1.3; letter-spacing: .035em;
+    color: color-mix(in srgb, var(--acc) 78%, hsl(var(--text-300, 50 7% 75%)));
 }
 .acts { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
 .b {
@@ -474,8 +476,8 @@ function build() {
     autoBtn.addEventListener('click', () => {
         V.autoSend = !V.autoSend;
         pushSetting('autoSend', V.autoSend);
+        syncConfig();
         paintAuto();
-        if (V.autoSend && !running) scheduleDrain();
     });
     hd.append(cntTag, el('div', 'spacer'), autoBtn);
     rowsBox = el('div', 'rows');
@@ -524,11 +526,36 @@ function paintCount(bump) {
     if (bump) { void n.offsetWidth; n.classList.add('bump'); }
 }
 
+function imageCount(it) {
+    return Array.isArray(it && it.images) ? it.images.length : 0;
+}
+
+function paintRowBody(row, it) {
+    let body = row.querySelector('.body');
+    if (!body) {
+        body = el('div', 'body');
+        const acts = row.querySelector('.acts');
+        row.insertBefore(body, acts || null);
+    }
+    let txt = body.querySelector('.txt');
+    if (!txt) { txt = el('div', 'txt'); body.prepend(txt); }
+    const count = imageCount(it);
+    const copy = it.text || (count ? (count === 1 ? 'Image' : 'Images') : '');
+    if (txt.textContent !== copy) txt.textContent = copy;
+    let media = body.querySelector('.media');
+    if (count) {
+        if (!media) { media = el('div', 'media'); body.append(media); }
+        media.textContent = count + (count === 1 ? ' image attached' : ' images attached');
+    } else if (media) media.remove();
+}
+
 function rowNode(it, index) {
     const row = el('div', 'row');
     row.dataset.id = it.id;
     row.append(el('div', 'ord', String(index + 1)));
-    row.append(el('div', 'txt', it.text));
+    const body = el('div', 'body');
+    row.append(body);
+    paintRowBody(row, it);
 
     const acts = el('div', 'acts');
     const mk = (cls, icon, title, fn) => {
@@ -574,8 +601,7 @@ function render(opts) {
         } else {
             const ord = row.querySelector('.ord');
             if (ord) ord.textContent = String(i + 1);
-            const txt = row.querySelector('.txt');
-            if (txt && txt.textContent !== it.text) txt.textContent = it.text;
+            paintRowBody(row, it);
         }
         row.classList.toggle('editing', editing === it.id);
         const eb = row.querySelector('.b.edit');
@@ -685,10 +711,27 @@ function place() {
 }
 
 // ------------------------------------------------------------------ persistence
-function persist() {
-    if (!sid) return;
-    store[sid] = items;
-    cuimod.rpc('queue.save', { sid, items }).catch(() => {});
+function adopt(targetSid, next, opts) {
+    const value = Array.isArray(next) ? next : [];
+    store[targetSid] = value;
+    if (sid !== targetSid) return;
+    items = value;
+    render(opts);
+}
+
+let refreshGeneration = 0;
+async function refreshStore(sentId) {
+    const generation = ++refreshGeneration;
+    const next = await cuimod.rpc('queue.load').catch(() => null);
+    if (generation !== refreshGeneration || !next || typeof next !== 'object') return;
+    store = next;
+    items = (sid && Array.isArray(store[sid])) ? store[sid] : [];
+    render({ sentId: sentId || null, bump: !!sentId });
+}
+
+function syncConfig() {
+    cuimod.rpc('queue.configure', { enabled: !!V.enabled, autoSend: !!V.autoSend,
+        autoSendDelay: Math.max(0, Number(V.autoSendDelay) || 0) }).catch(() => {});
 }
 
 // The dashboard owns the settings file; this only reaches into it for the one
@@ -703,62 +746,47 @@ function pushSetting(key, value) {
 
 // ------------------------------------------------------------------ actions
 async function enqueueFromComposer() {
+    const targetSid = sid;
+    if (!targetSid) return false;
     const r = await cuimod.rpc('queue.editorGet').catch(() => null);
-    if (!r || !r.ok) return false;
+    if (!r || !r.ok) {
+        if (r?.reason) toast(r.reason === 'composer-changed'
+            ? 'The composer changed while its images were being prepared. Try again.'
+            : r.reason === 'unsupported-attachment'
+                ? 'This queue currently accepts text and images, not file attachments.'
+                : 'Could not read the composer attachments.');
+        return false;
+    }
     const text = String(r.text || '');
-    if (!text.trim()) return false;
-    items = items.concat([{ id: uid(), text, at: Date.now() }]);
-    await cuimod.rpc('queue.editorClear').catch(() => {});
-    persist();
-    render({ bump: true });
+    const images = Array.isArray(r.images) ? r.images : [];
+    if (!text.trim() && !images.length) return false;
+    const item = { id: uid(), text, images, at: Date.now() };
+    const next = await cuimod.rpc('queue.enqueue', { sid: targetSid, item }).catch((e) => {
+        toast('queue failed: ' + ((e && e.message) || e));
+        return null;
+    });
+    if (!next) return false;
+    if (sid === targetSid) await cuimod.rpc('queue.editorClear').catch(() => {});
+    adopt(targetSid, next, { bump: true });
     return true;
 }
 
 async function steer(id) {
-    const it = items.find((x) => x.id === id);
-    if (!it || !sid) return;
+    const targetSid = sid;
+    if (!items.some((x) => x.id === id) || !targetSid) return;
     if (editing === id) await cancelEdit();
-    // A steer is meant to land the moment it is clicked. Priority "next" is
-    // only read at a tool boundary, so a turn sitting in a tool that does not
-    // return swallows it — and the desktop will even hold a "next" itself when
-    // no tool is running, waiting for that boundary.
-    //
-    // Two ways out, and the tool decides which. Bash and a foreground Agent
-    // own a task the CLI can move to the background: the call returns at once
-    // and its work carries on, which is worth the round trip. Everything else
-    // — TaskOutput waiting out a 600s block, a fetch, an MCP call — owns no
-    // task and cannot be moved, so the message goes as "now", which aborts the
-    // turn where it stands and is dequeued first. That is the bare abort, not
-    // the interrupt control request: running subagents are left alive.
-    // See queue/main.js for both mechanisms.
-    let priority = 'next';
-    if (V.freeForeground) {
-        // Best effort, and never in the way: main.js caps its own wait, and a
-        // failure here still sends. The message is the point.
-        const r = await cuimod.rpc('queue.backgroundForeground', { sid }).catch(() => null);
-        if (r && r.ok && r.backgrounded && r.tool) toast('backgrounded ' + r.tool + ' to steer');
-        else priority = 'now';
-    }
-    try {
-        await cuimod.appInvoke(SEND, sid, it.text, undefined, undefined, undefined, priority);
-    } catch (e) {
-        toast('steer failed: ' + ((e && e.message) || e));
+    // Main owns the send and the durable removal as one operation. That keeps a
+    // turn-end drain and a click from releasing the same item, and a successful
+    // send is flushed before the renderer can disappear or switch sessions.
+    const result = await cuimod.rpc('queue.steer', { sid: targetSid, id,
+        freeForeground: !!V.freeForeground }).catch((e) => ({ ok: false, reason: (e && e.message) || e }));
+    if (!result?.ok) {
+        toast('steer failed: ' + (result?.reason || 'unknown error'));
         return;
     }
-    items = items.filter((x) => x.id !== id);
-    persist();
-    render({ sentId: id, bump: true });
-}
-
-async function sendNormal(id) {
-    const it = items.find((x) => x.id === id);
-    if (!it || !sid) return false;
-    try { await cuimod.appInvoke(SEND, sid, it.text); }
-    catch (e) { toast('send failed: ' + ((e && e.message) || e)); return false; }
-    items = items.filter((x) => x.id !== id);
-    persist();
-    render({ sentId: id, bump: true });
-    return true;
+    if (result.foreground?.backgrounded && result.foreground.tool)
+        toast('backgrounded ' + result.foreground.tool + ' to steer');
+    adopt(targetSid, result.items, { sentId: id, bump: true });
 }
 
 function armTrash(id) {
@@ -766,9 +794,10 @@ function armTrash(id) {
         clearTimeout(armedTimer);
         armedTrash = null;
         if (editing === id) cancelEdit();
-        items = items.filter((x) => x.id !== id);
-        persist();
-        render({ bump: true });
+        const targetSid = sid;
+        if (targetSid) cuimod.rpc('queue.remove', { sid: targetSid, id })
+            .then((next) => adopt(targetSid, next, { bump: true }))
+            .catch((e) => toast('remove failed: ' + ((e && e.message) || e)));
         return;
     }
     armedTrash = id;
@@ -783,36 +812,63 @@ async function toggleEdit(id) {
     const it = items.find((x) => x.id === id);
     if (!it) return;
     const r = await cuimod.rpc('queue.editorGet').catch(() => null);
-    if (r && r.ok && !r.empty) {
+    if (!r || !r.ok) {
+        toast('Could not read the composer attachments.');
+        return;
+    }
+    if (!r.empty) {
         toast('Clear the composer before editing this message.');
         return;
     }
     editing = id;
     document.documentElement.setAttribute(EDIT_ATTR, '');
-    await cuimod.rpc('queue.editorSet', { text: it.text }).catch(() => {});
+    cuimod.rpc('queue.hold', { sid, id }).catch(() => {});
+    const restored = await cuimod.rpc('queue.editorSet', { text: it.text, images: it.images || [] }).catch(() => null);
+    if (!restored?.ok) {
+        endEditState();
+        await cuimod.rpc('queue.editorClear').catch(() => {});
+        toast('Could not restore the queued images into the composer.');
+        return;
+    }
     render();
 }
 
 function endEditState() {
+    const heldSid = sid;
     editing = null;
     document.documentElement.removeAttribute(EDIT_ATTR);
+    if (heldSid) cuimod.rpc('queue.hold', { sid: heldSid, id: null }).catch(() => {});
 }
 
 async function commitEdit() {
     const id = editing;
-    if (!id) return;
+    const targetSid = sid;
+    if (!id || !targetSid) return;
     const r = await cuimod.rpc('queue.editorGet').catch(() => null);
+    if (!r || !r.ok) {
+        toast(r?.reason === 'composer-changed'
+            ? 'The composer changed while its images were being prepared. Try again.'
+            : 'Could not read the composer attachments.');
+        return;
+    }
     endEditState();
-    const text = r && r.ok ? String(r.text || '') : '';
-    if (text.trim()) {
-        items = items.map((x) => (x.id === id ? Object.assign({}, x, { text }) : x));
+    const text = String(r.text || '');
+    const images = Array.isArray(r.images) ? r.images : [];
+    let next = null;
+    if (text.trim() || images.length) {
+        next = await cuimod.rpc('queue.update', { sid: targetSid, id, text, images }).catch((e) => {
+            toast('update failed: ' + ((e && e.message) || e));
+            return null;
+        });
     } else {
         // Emptying the composer and confirming is how you drop it while editing.
-        items = items.filter((x) => x.id !== id);
+        next = await cuimod.rpc('queue.remove', { sid: targetSid, id }).catch((e) => {
+            toast('remove failed: ' + ((e && e.message) || e));
+            return null;
+        });
     }
-    await cuimod.rpc('queue.editorClear').catch(() => {});
-    persist();
-    render({ bump: true });
+    if (sid === targetSid) await cuimod.rpc('queue.editorClear').catch(() => {});
+    if (next) adopt(targetSid, next, { bump: true });
 }
 
 async function cancelEdit() {
@@ -865,24 +921,9 @@ for (const type of ['pointerdown', 'mousedown', 'click']) {
 }
 
 // ------------------------------------------------------------------ turn watch
-function scheduleDrain() {
-    clearTimeout(autoTimer);
-    // Nulled when it fires: the "idle with a queue" path below tests autoTimer
-    // for truthiness, and a spent timer id stayed truthy forever — so after the
-    // first drain that path never armed again.
-    autoTimer = setTimeout(() => { autoTimer = null; drainHead(); }, Math.max(0, V.autoSendDelay));
-}
-ctx.onDispose(() => clearTimeout(autoTimer));
-
-// One at a time: the head goes out, which starts a new turn, and the next one
-// waits for that turn to end in its turn. Draining the whole queue at once would
-// coalesce them into a single prompt.
-async function drainHead() {
-    if (!V.enabled || !V.autoSend || editing || running) return;
-    if (!items.length) return;
-    await sendNormal(items[0].id);
-}
-
+// The renderer still tracks running state because that decides whether Enter is
+// intercepted. Delivery itself is main-process work; focus and visibility have
+// no bearing on it.
 let pollBusy = false;
 async function pollSession() {
     if (pollBusy) return;
@@ -890,20 +931,17 @@ async function pollSession() {
     try {
         const next = (location.pathname.match(/local_[0-9a-f-]{36}/) || [null])[0];
         if (next !== sid) {
-            sid = next;
             if (editing) endEditState();
+            sid = next;
             armedTrash = null;
             items = (sid && store[sid]) || [];
             render();
+            refreshStore();
         }
         if (!sid) { running = false; return; }
         const s = await cuimod.appInvoke(GET_SESSION, sid).catch(() => null);
-        const was = running;
         running = !!(s && s.isRunning);
-        if (was && !running) scheduleDrain();
-        if (!was && running) { clearTimeout(autoTimer); autoTimer = null; }
-        // A queue left over from a reload, with the session already idle.
-        if (!running && !was && V.autoSend && items.length && !editing && !autoTimer) scheduleDrain();
+        if (editing) cuimod.rpc('queue.hold', { sid, id: editing }).catch(() => {});
     } finally { pollBusy = false; }
 }
 
@@ -915,6 +953,7 @@ ctx.track(window, 'resize', () => place());
 // ------------------------------------------------------------------ settings
 function apply(v) {
     V = Object.assign({}, DEF, v || {});
+    syncConfig();
     pageStyle.textContent = V.enabled ? pageRules() : '';
     if (!V.enabled) { endEditState(); teardown(); return; }
     restyle();
@@ -1066,6 +1105,14 @@ ctx.onDispose(() => {
 if (REG.subs.size === 0) apply(DEF);
 
 // ------------------------------------------------------------------ boot
+ctx.onDispose(cuimod.appOn('cuimod:event', (_event, payload) => {
+    if (payload?.type !== 'queue-changed') return;
+    refreshStore(payload.sessionId === sid ? payload.sentId : null);
+}));
+ctx.onDispose(() => {
+    if (editing && sid) cuimod.rpc('queue.hold', { sid, id: null }).catch(() => {});
+});
+
 cuimod.rpc('queue.load')
     .then((d) => { store = d || {}; })
     .catch(() => { store = {}; })

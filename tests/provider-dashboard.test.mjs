@@ -116,7 +116,7 @@ test('Claude-only analytics does not poll paid alternate providers', async () =>
 });
 
 test('dashboard API joins all providers and exposes no credentials', async () => {
-    const response = await fetch(origin + '/usage/api');
+    const response = await fetch(origin + '/usage/api?range=all');
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('cache-control'), 'no-store');
     const value = await response.json();
@@ -149,6 +149,16 @@ test('sanitized raw usage and limits endpoints remain available', async () => {
     assert.equal(usage.version, 1);
     assert.equal(limits.version, 1);
     assert.deepEqual(Object.keys(limits).sort(), ['observedAt', 'openai', 'version']);
+});
+
+test('pool pin control is optional when no adapter provides it', async () => {
+    const response = await fetch(origin + '/poolpinz');
+    assert.equal(response.status, 501);
+    const value = await response.json();
+    assert.equal(value.error.type, 'not_supported_error');
+
+    const dashboard = await fetch(origin + '/usage/');
+    assert.equal(dashboard.status, 200);
 });
 
 test('every range is bounded, exact and falls back closed on invalid input', async () => {

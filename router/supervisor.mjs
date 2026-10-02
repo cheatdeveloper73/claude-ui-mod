@@ -1,6 +1,6 @@
 // Stable front door for blue-green router reloads. Edited backend code boots on
 // a private port first; only a healthy worker receives new requests, while the
-// previous worker drains every stream it already owns.
+// previous worker drains active responses under a separate hard deadline.
 import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -8,6 +8,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { rejectRequest } from './request-guard.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENTRY = process.env.MODEL_ROUTER_WORKER_ENTRY || path.join(HERE, 'index.mjs');
@@ -17,7 +18,8 @@ const STATE_DIR = process.env.MODEL_ROUTER_STATE_DIR || path.join(os.homedir(), 
 const HEALTH_TIMEOUT_MS = 10000;
 const HEALTH_INTERVAL_MS = 100;
 const RELOAD_DEBOUNCE_MS = 180;
-const ROLLBACK_WINDOW_MS = 10 * 60 * 1000;
+const ROLLBACK_WINDOW_MS = 2 * 60 * 1000;
+const RETIRED_DRAIN_TIMEOUT_MS = 60 * 60 * 1000;
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -69,6 +71,7 @@ export class RouterSupervisor
         this.canarySpawn = options.canarySpawn || childProcess.spawn;
         this.canary = options.canary === false ? null : (options.canary || CANARY);
         this.rollbackWindowMs = options.rollbackWindowMs ?? ROLLBACK_WINDOW_MS;
+        this.retiredDrainTimeoutMs = options.retiredDrainTimeoutMs ?? RETIRED_DRAIN_TIMEOUT_MS;
         this.current = null;
         this.standby = null;
         this.workers = new Set();
@@ -117,14 +120,16 @@ export class RouterSupervisor
         const child = this.spawn(process.execPath, [this.entry], {
             windowsHide: true,
             stdio: ['ignore', 'ignore', 'pipe'],
-            env: { ...process.env, MODEL_ROUTER_WORKER_PORT: String(port) },
+            env: { ...process.env, MODEL_ROUTER_WORKER_PORT: String(port),
+                MODEL_ROUTER_PUBLIC_PORT: String(this.server.address()?.port ?? this.port) },
         });
-        const worker = { child, port, generation, active: 0, retired: false, exited: false, stderr: '', expiryTimer: null };
+        const worker = { child, port, generation, active: 0, retired: false, exited: false, stderr: '', expiryTimer: null, drainTimer: null };
         this.workers.add(worker);
         child.stderr?.on('data', chunk => { worker.stderr = (worker.stderr + chunk).slice(-4096); });
         child.once('exit', (code, signal) => {
             worker.exited = true;
             clearTimeout(worker.expiryTimer);
+            clearTimeout(worker.drainTimer);
             this.workers.delete(worker);
             if (this.standby === worker) this.standby = null;
             if (this.current === worker)
@@ -171,15 +176,22 @@ export class RouterSupervisor
     {
         if (!worker || worker.exited) return;
         clearTimeout(worker.expiryTimer);
+        clearTimeout(worker.drainTimer);
         if (this.standby === worker) this.standby = null;
         try { worker.child.kill(); } catch (_) {}
     }
 
     stopWhenDrained(worker)
     {
-        if (!worker) return;
+        if (!worker || worker.exited) return;
         worker.retired = true;
-        if (worker.active === 0) this.stopWorker(worker);
+        if (worker.active === 0) { this.stopWorker(worker); return; }
+        if (worker.drainTimer) return;
+        worker.drainTimer = setTimeout(() => {
+            log(`retired worker ${worker.generation} exceeded active-drain deadline; stopping ${worker.active} request(s)`);
+            this.stopWorker(worker);
+        }, this.retiredDrainTimeoutMs);
+        worker.drainTimer.unref?.();
     }
 
     keepStandby(worker)
@@ -192,6 +204,9 @@ export class RouterSupervisor
         clearTimeout(worker.expiryTimer);
         worker.expiryTimer = setTimeout(() => {
             if (this.standby === worker) this.standby = null;
+            // Rollback expires before a long buffered response can finish. Remove
+            // the rollback target now, but let active requests drain under a
+            // separate hard deadline so wedged workers cannot live forever.
             this.stopWhenDrained(worker);
         }, this.rollbackWindowMs);
         worker.expiryTimer.unref?.();
@@ -262,6 +277,10 @@ export class RouterSupervisor
 
     handle(request, response)
     {
+        // Before /supervisorz, /rollbackz or the proxy: this is the process that
+        // owns the public port, so it is the one that still sees the browser's
+        // own Host. The worker only ever sees the Host rewritten below.
+        if (rejectRequest(request, response, [request.socket.localPort])) return;
         const urlPath = (request.url || '').split('?')[0];
         if (request.method === 'GET' && urlPath === '/supervisorz')
         {
@@ -271,6 +290,7 @@ export class RouterSupervisor
                 currentGeneration: this.current?.generation ?? null,
                 standbyGeneration: this.standby?.generation ?? null,
                 rollbackWindowMs: this.rollbackWindowMs,
+                retiredDrainTimeoutMs: this.retiredDrainTimeoutMs,
             }));
             return;
         }
@@ -305,6 +325,10 @@ export class RouterSupervisor
             if (worker.retired && worker !== this.standby && worker.active === 0) this.stopWorker(worker);
         };
         const headers = { ...request.headers, host: `127.0.0.1:${worker.port}` };
+        const healthRequest = request.method === 'GET' && (request.url || '').split('?')[0] === '/healthz';
+        let incomingEnded = false;
+        let healthFellBack = false;
+        let healthTimer = null;
         const upstream = http.request({
             host: '127.0.0.1',
             port: worker.port,
@@ -312,14 +336,17 @@ export class RouterSupervisor
             path: request.url,
             headers,
         }, incoming => {
+            clearTimeout(healthTimer);
             const outgoing = { ...incoming.headers, 'x-cuimod-router-generation': String(worker.generation), 'x-cuimod-router-supervisor': '1' };
             response.writeHead(incoming.statusCode || 502, outgoing);
             incoming.on('error', error => { if (!response.writableEnded) response.destroy(error); });
-            incoming.on('end', release);
+            incoming.on('end', () => { incomingEnded = true; release(); });
             incoming.pipe(response);
         });
         upstream.on('error', error => {
+            clearTimeout(healthTimer);
             release();
+            if (healthFellBack) return;
             if (response.headersSent) { response.destroy(error); return; }
             response.writeHead(502, {
                 'Content-Type': 'application/json',
@@ -330,22 +357,46 @@ export class RouterSupervisor
         });
         request.on('aborted', () => { upstream.destroy(); release(); });
         request.on('error', error => { upstream.destroy(error); release(); });
-        response.on('close', release);
+        response.on('close', () => {
+            // A timed-out client can close its response after its request body was
+            // fully received. Without this, the worker-side request survives and
+            // repeated probes accumulate until the worker has dozens of orphaned
+            // sockets and no event-loop capacity left for inference.
+            if (!incomingEnded) upstream.destroy();
+            release();
+        });
+        if (healthRequest)
+        {
+            healthTimer = setTimeout(() => {
+                if (response.headersSent) return;
+                healthFellBack = true;
+                upstream.destroy();
+                release();
+                response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
+                    'X-Cuimod-Router-Supervisor': '1' });
+                response.end(JSON.stringify({ ok: true, supervisor: true, degraded: true,
+                    currentGeneration: worker.generation }));
+            }, 1000);
+            healthTimer.unref?.();
+        }
         request.pipe(upstream);
     }
 
     async start()
     {
-        await this.reload();
-        if (!this.current) throw new Error('no healthy router worker');
         try
         {
             await new Promise((resolve, reject) => {
                 this.server.once('error', reject);
                 this.server.listen(this.port, '127.0.0.1', resolve);
             });
-            this.watcher = fs.watch(this.watchDir, (_event, filename) => {
-                const name = String(filename || '');
+            // Reserve the public port before doing any expensive worker startup.
+            // A duplicate contender now loses immediately instead of loading a
+            // full worker and its ledgers only to discover EADDRINUSE afterward.
+            await this.reload();
+            if (!this.current) throw new Error('no healthy router worker');
+            this.watcher = fs.watch(this.watchDir, { recursive: true }, (_event, filename) => {
+                const name = String(filename || '').replace(/\\/g, '/');
                 if (!name.endsWith('.mjs') || name === path.basename(fileURLToPath(import.meta.url))) return;
                 this.scheduleReload();
             });

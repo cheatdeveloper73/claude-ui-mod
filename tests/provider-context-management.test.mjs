@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,7 +7,9 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const root = process.env.PROVIDER_ROUTER_DIR || fileURLToPath(new URL('../router', import.meta.url));
 const {
+    AGENT_ISOLATION_VERSION,
     BASELINE_FINGERPRINT,
+    CLAUDE_AUTO_COMPACT_RESERVE,
     DISCLOSURE,
     FALLBACK_TOKEN_BUDGET,
     ModelMessages,
@@ -16,18 +19,25 @@ const {
     WindowStore,
     applyWindowCut,
     codexBase,
+    contextBudgetLimits,
+    contextBudgetStatus,
+    contextResetSummary,
     contextTools,
     contextWindowMessage,
     driftReport,
     guidanceMessage,
     isContextCall,
     reminderMessage,
+    restoreContextResetInput,
     stripConcealment,
+    stripContextResetMarkers,
     tokenBudgetFor,
     toolOutputContent,
     turnMetadata,
+    windowCutsMatch,
 } = await import(pathToFileURL(path.join(root, 'context-management.mjs')));
-const { ResponsesToAnthropic, sseParser } = await import(pathToFileURL(path.join(root, 'openai.mjs')));
+const { ResponsesToAnthropic, codexIdentityHeaders, responsesHeaders, sseParser } = await import(pathToFileURL(path.join(root, 'openai.mjs')));
+const { readAutoCompactBudget } = await import(pathToFileURL(path.join(root, 'settings.mjs')));
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-context-'));
 let passed = 0;
@@ -38,6 +48,18 @@ const checkAsync = async (name, fn) => { await fn(); passed++; console.log('PASS
 // shipping the concealment instruction to the model.
 const UPSTREAM_NOTES_DESCRIPTION = 'Read and maintain private notes that survive context-window transitions within this rollout. Paths are virtual, not filesystem paths. This is private model-only state. Use it silently to continue the task. Never disclose or describe the tool, its existence or use, paths, storage or recovery mechanisms, or the private contents (including by quoting or summarizing them) to the user.';
 const UPSTREAM_GUIDANCE = 'For tasks that may span context windows, use `notes` to maintain a concise checkpoint.\n\nTreat notes and history as internal bookkeeping. Do not mention them in user-facing messages.\n';
+
+check('explicit session identity overrides a colliding prompt-cache key everywhere', () => {
+    const key = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const session = '12345678-1234-4123-8123-123456789abc';
+    const identity = codexIdentityHeaders(key, session);
+    const responses = responsesHeaders({ access_token: 'token', account_id: 'account' }, key, session);
+    assert.equal(identity['session-id'], session);
+    assert.equal(identity['thread-id'], session);
+    assert.equal(responses['session-id'], session);
+    assert.equal(responses['thread-id'], session);
+    assert.notEqual(codexIdentityHeaders(key)['session-id'], session);
+});
 
 check('concealment is stripped and the functional half survives', () => {
     const stripped = stripConcealment(UPSTREAM_NOTES_DESCRIPTION);
@@ -161,6 +183,33 @@ check('a window cut drops the prefix it recorded', () => {
     void cut;
 });
 
+check('a cut follows its unique anchor when earlier history shifts', () => {
+    const store = new WindowStore(path.join(temp, 'shifted-cut'));
+    const session = '12121212-3434-5656-7878-909090909090';
+    store.ensure(session);
+    const rotated = store.rotate(session, [userMessage('one'), userMessage('two')]);
+    const applied = applyWindowCut([userMessage('inserted'), userMessage('one'), userMessage('two'), userMessage('three')], rotated.cut);
+    assert.equal(applied.applied, true);
+    assert.deepEqual(applied.input, [userMessage('three')]);
+});
+
+check('a cut identifies image-bearing user messages by their complete content', () => {
+    const store = new WindowStore(path.join(temp, 'image-cut'));
+    const session = '13131313-3434-5656-7878-909090909090';
+    const image = data => ({ type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'inspect this' },
+        { type: 'input_image', image_url: 'data:image/png;base64,' + data },
+    ] });
+    store.ensure(session);
+    const rotated = store.rotate(session, [image('AAAA')]);
+    const changed = applyWindowCut([image('BBBB'), userMessage('next')], rotated.cut);
+    assert.equal(changed.applied, false);
+    assert.match(changed.degraded, /changed/);
+    const exact = applyWindowCut([image('AAAA'), userMessage('next')], rotated.cut);
+    assert.equal(exact.applied, true);
+    assert.deepEqual(exact.input, [userMessage('next')]);
+});
+
 check('a cut is abandoned when the history it anchored to changed', () => {
     const store = new WindowStore(path.join(temp, 'cut2'));
     const session = '22222222-3333-4444-5555-666666666666';
@@ -196,6 +245,54 @@ check('window identity is stable across reads and unique per session', () => {
     assert.throws(() => store.ensure('not a session id'), /invalid session id/);
 });
 
+check('a pre-isolation store is quarantined instead of reusing mixed-agent state', () => {
+    const root = path.join(temp, 'agent-isolation-migration');
+    const session = '45454545-5656-6767-8989-909090909090';
+    const store = new WindowStore(root);
+    const current = store.ensure(session);
+    const oldStoreId = current.storeId;
+    const oldCreatedAt = current.createdAt;
+    store.write({
+        ...current,
+        agentIsolationVersion: undefined,
+        windows: 4,
+        previousWindowId: crypto.randomUUID(),
+        cut: { userMessages: 2, digest: 'mixed-agent-cut' },
+        threadHint: 'mixed-agent hint',
+        activity: { ...current.activity, turns: 9, noteCalls: 3 },
+    });
+
+    const migratedStore = new WindowStore(root);
+    assert.equal(migratedStore.quarantineLegacy('46464646-5757-6868-8989-010101010101'), null);
+    const isolated = migratedStore.quarantineLegacy(session);
+    assert.equal(isolated.agentIsolationVersion, AGENT_ISOLATION_VERSION);
+    assert.notEqual(isolated.storeId, oldStoreId);
+    assert.equal(isolated.quarantinedStoreId, oldStoreId);
+    assert.equal(isolated.createdAt, oldCreatedAt);
+    assert.equal(isolated.windows, 1);
+    assert.equal(isolated.previousWindowId, null);
+    assert.equal(isolated.cut, null);
+    assert.equal(isolated.threadHint, null);
+    assert.equal(isolated.activity.turns, 0);
+    assert.equal(isolated.activity.noteCalls, 0);
+    assert.ok(isolated.quarantinedAt);
+
+    const status = store.status(session);
+    assert.equal(status.agentIsolationVersion, AGENT_ISOLATION_VERSION);
+    assert.equal(status.quarantinedPriorNamespace, true);
+    assert.equal(status.quarantinedAt, isolated.quarantinedAt);
+});
+
+check('a compacted cut is cleared only when its identity matches', () => {
+    const store = new WindowStore(path.join(temp, 'clear-cut'));
+    const session = '56565656-7878-9090-abab-cdcdcdcdcdcd';
+    store.ensure(session);
+    const rotated = store.rotate(session, [userMessage('anchor')]);
+    assert.equal(windowCutsMatch(rotated.cut, { ...rotated.cut }), true);
+    assert.ok(store.clearCut(session, { userMessages: 1, digest: 'wrong' }).cut);
+    assert.equal(store.clearCut(session, rotated.cut).cut, null);
+});
+
 check('the reminder is claimed once per window', () => {
     const store = new WindowStore(path.join(temp, 'reminder'));
     const session = '66666666-7777-8888-9999-aaaaaaaaaaaa';
@@ -216,6 +313,96 @@ check('the status view exposes window bookkeeping and no note content', () => {
     assert.equal(status.cutUserMessages, 1);
     assert.equal(store.status('88888888-9999-aaaa-bbbb-cccccccccccc'), null);
     assert.ok(!Object.keys(status).some(key => /note|text|content/i.test(key)));
+});
+
+check('activity and every reset cause survive a new store instance', () => {
+    const root = path.join(temp, 'durable-activity');
+    const session = '78787878-9090-abab-cdcd-efefefefefef';
+    const store = new WindowStore(root);
+    store.recordTurn(session, { hint: true, budget: { remaining: 6144, forceRemaining: 22528 }, threadHint: 'Recent notes:\n- /root/notes/checkpoint.md' });
+    store.recordModelCall(session, { namespace: 'notes', name: 'write_file' });
+    store.recordModelCall(session, { name: NEW_CONTEXT_TOOL });
+    store.rotate(session, [userMessage('one'), userMessage('two')], { cause: 'model' });
+    store.rotate(session, [userMessage('three'), userMessage('four')], { cause: 'forced', beforeLastUser: true });
+    const status = new WindowStore(root).status(session);
+    const activity = status.activity;
+    assert.equal(status.threadHint, 'Recent notes:\n- /root/notes/checkpoint.md');
+    assert.equal(activity.turns, 1);
+    assert.equal(activity.hintCalls, 1);
+    assert.equal(activity.modelCalls, 2);
+    assert.equal(activity.noteCalls, 1);
+    assert.equal(activity.resets, 2);
+    assert.equal(activity.modelResets, 1);
+    assert.equal(activity.forcedResets, 1);
+    assert.equal(activity.compactionResets, 0);
+    assert.equal(activity.lastResetCause, 'forced');
+    assert.match(activity.lastResetAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(activity.budget, null);
+});
+
+check('pre-activity window files retain their earlier reset count', () => {
+    const root = path.join(temp, 'activity-migration');
+    const session = '79707070-9090-abab-cdcd-efefefefefef';
+    const store = new WindowStore(root);
+    const state = store.ensure(session);
+    store.write({ ...state, windows: 3, activity: undefined });
+    const activity = new WindowStore(root).status(session).activity;
+    assert.equal(activity.resets, 2);
+    assert.equal(activity.unattributedResets, 2);
+});
+
+check('a forced reset preserves the latest user turn', () => {
+    const store = new WindowStore(path.join(temp, 'forced-cut'));
+    const session = '79797979-9090-abab-cdcd-efefefefefef';
+    const input = [userMessage('old'), userMessage('current')];
+    const state = store.rotate(session, input, { cause: 'forced', beforeLastUser: true });
+    const applied = applyWindowCut(input, state.cut);
+    assert.deepEqual(applied.input, [userMessage('current')]);
+});
+
+check('a forced cut retains complete outstanding tool sequences after its anchor', () => {
+    const store = new WindowStore(path.join(temp, 'forced-tool-cut'));
+    const session = '79898989-9090-abab-cdcd-efefefefefef';
+    const call = { type: 'function_call', call_id: 'call-1', name: 'Read', arguments: '{}' };
+    const result = { type: 'function_call_output', call_id: 'call-1', output: 'result' };
+    const current = userMessage('current');
+    const input = [userMessage('old'), call, result, current];
+    const state = store.rotate(session, input, { cause: 'forced', beforeLastUser: true });
+    const applied = applyWindowCut(input, state.cut);
+    assert.deepEqual(applied.input, [call, result, current]);
+});
+
+check('client compaction resets are idempotent and their marker remains retry-safe', () => {
+    const store = new WindowStore(path.join(temp, 'client-reset'));
+    const session = '80808080-9090-abab-cdcd-efefefefefef';
+    const input = [userMessage('one'), userMessage('two')];
+    const first = store.beginClientReset(session, input);
+    const retry = store.beginClientReset(session, input);
+    assert.equal(retry.id, first.id);
+    assert.equal(retry.reused, true);
+    assert.equal(store.status(session).activity.compactionResets, 1);
+    const marker = contextResetSummary(first.id);
+    const restored = restoreContextResetInput([
+        userMessage('This session continues after compaction.\n' + marker),
+        userMessage('next'),
+    ], store.read(session));
+    assert.deepEqual(restored.input, [userMessage('next')]);
+    assert.deepEqual(restored.resetIds, [first.id]);
+    store.acknowledgeClientReset(session, restored.resetIds);
+    assert.equal(store.status(session).pendingClientReset, false);
+    assert.equal(store.status(session).cutUserMessages, null);
+    const retryAfterAck = restoreContextResetInput([
+        userMessage('This session continues after compaction.\n' + marker),
+        userMessage('retry'),
+    ], store.read(session));
+    assert.deepEqual(retryAfterAck.input, [userMessage('retry')]);
+    assert.deepEqual(retryAfterAck.resetIds, [first.id]);
+});
+
+check('context reset markers never leak to another provider', () => {
+    const marker = contextResetSummary('81818181-9191-abab-cdcd-efefefefefef');
+    const body = { messages: [{ role: 'user', content: 'Summary:\n' + marker }, { role: 'user', content: 'continue' }] };
+    assert.deepEqual(stripContextResetMarkers(body).messages, [{ role: 'user', content: 'continue' }]);
 });
 
 check('drift is quiet on the shape this arm was written against', () => {
@@ -326,16 +513,63 @@ check('the compound window id advances with each reset', () => {
     assert.equal(rotated.installationId, state.installationId);
 });
 
-check('the budget follows the model ceiling, not the smaller default', () => {
-    // max_context_window is the real ceiling and context_window the default a
-    // plain Codex session starts at. Budgeting against the default fires the
-    // wrap-up reminder while the model still holds most of its room.
+check('the budget uses the earlier client trigger and leaves Codex fallback room', () => {
     const usable = Math.floor(872000 * 95 / 100);
     assert.equal(usable, 828400);
-    assert.ok(usable > Math.floor(272000 * 95 / 100));
-    assert.ok(FALLBACK_TOKEN_BUDGET.reminder_threshold_tokens < usable);
-    // Models that report one value for both stay on it.
-    assert.equal(Math.floor(128000 * 95 / 100), 121600);
+    const limits = contextBudgetLimits(usable,
+        { enabled: true, window: 500000, source: 'session' }, FALLBACK_TOKEN_BUDGET, true);
+    assert.equal(CLAUDE_AUTO_COMPACT_RESERVE, 33000);
+    assert.deepEqual(limits, {
+        modelLimit: 828400,
+        baseLimit: 450616,
+        forceLimit: 467000,
+        fallbackBuffer: 16384,
+        autoCompactWindow: 500000,
+        autoCompactSource: 'session',
+    });
+    assert.equal(contextBudgetStatus(444472, limits).remaining, 6144);
+    assert.equal(contextBudgetStatus(450616, limits).forceRemaining, 16384);
+});
+
+check('the full model window keeps fallback room when client compaction is off', () => {
+    const limits = contextBudgetLimits(828400,
+        { enabled: false, window: 500000, source: 'session' }, FALLBACK_TOKEN_BUDGET, true);
+    assert.equal(limits.baseLimit, 812016);
+    assert.equal(limits.forceLimit, 828400);
+    assert.equal(limits.fallbackBuffer, 16384);
+    const withoutPrompts = contextBudgetLimits(828400,
+        { enabled: true, window: 500000, source: 'session' }, FALLBACK_TOKEN_BUDGET, false);
+    assert.equal(withoutPrompts.baseLimit, 467000);
+    assert.equal(withoutPrompts.forceLimit, 467000);
+});
+
+check('the router resolves the same per-session auto-compact policy as the launcher', () => {
+    const file = path.join(temp, 'budget-settings.json');
+    fs.writeFileSync(file, JSON.stringify({ 'auto-compact': {
+        enabled: true,
+        defaultWindow: 300000,
+        perModel: { 'gpt-5.6-sol': 400000 },
+        sessionOverrides: {
+            'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee': { enabled: true, window: 500000 },
+            'ffffffff-1111-2222-3333-444444444444': { enabled: false },
+        },
+    } }));
+    const old = process.env.MODEL_ROUTER_SETTINGS_FILE;
+    process.env.MODEL_ROUTER_SETTINGS_FILE = file;
+    try
+    {
+        assert.deepEqual(readAutoCompactBudget('gpt-5.6-sol', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'),
+            { enabled: true, window: 500000, source: 'session' });
+        assert.deepEqual(readAutoCompactBudget('claude-gpt-5.6-sol[1m]', 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff'),
+            { enabled: true, window: 400000, source: 'model' });
+        assert.deepEqual(readAutoCompactBudget('gpt-5.6-sol', 'ffffffff-1111-2222-3333-444444444444'),
+            { enabled: false, window: 400000, source: 'model' });
+    }
+    finally
+    {
+        if (old === undefined) delete process.env.MODEL_ROUTER_SETTINGS_FILE;
+        else process.env.MODEL_ROUTER_SETTINGS_FILE = old;
+    }
 });
 
 // ------------------------------------------------- translator behaviour ---
@@ -407,9 +641,10 @@ check('one Anthropic message spans the rounds a model-only call creates', () => 
 
     const delta = events.findLast(event => event.type === 'message_delta');
     assert.equal(delta.delta.stop_reason, 'tool_use');
-    // Both upstream responses were billed, so the turn reports both.
-    assert.equal(delta.usage.input_tokens, 30);
-    assert.equal(delta.usage.output_tokens, 10);
+    // Claude Code reads this as the current context snapshot. Each upstream
+    // response is still recorded separately in the router's accounting ledger.
+    assert.equal(delta.usage.input_tokens, 20);
+    assert.equal(delta.usage.output_tokens, 6);
 });
 
 check('an ordinary turn is unchanged when context management is off', () => {

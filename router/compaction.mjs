@@ -11,6 +11,18 @@ const COMPACTION_PROMPTS = [
     'Your task is to create a detailed summary of the RECENT portion of the conversation',
 ];
 
+// Claude Code 2.1.245+ puts this wrapper before both compaction prompts. It is
+// part of the dedicated summarizer transaction, not user text; accepting only
+// this exact wrapper preserves the ordinary-message collision guard.
+const COMPACTION_WRAPPER = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+`;
+
 const textOfContent = content => {
     if (typeof content === 'string') return content;
     if (!Array.isArray(content)) return '';
@@ -24,7 +36,8 @@ const responseItemText = item => item?.type === 'message'
 
 export function compactionPromptKind(text)
 {
-    const value = String(text || '').trimStart();
+    let value = String(text || '').trimStart();
+    if (value.startsWith(COMPACTION_WRAPPER)) value = value.slice(COMPACTION_WRAPPER.length);
     const at = COMPACTION_PROMPTS.findIndex(prompt => value.startsWith(prompt));
     return at === 0 ? 'full' : at === 1 ? 'recent' : null;
 }
@@ -32,10 +45,12 @@ export function compactionPromptKind(text)
 export function isClaudeCompactionRequest(body)
 {
     if (!body || !Array.isArray(body.messages) || !body.messages.length) return null;
-    const last = body.messages.at(-1);
+    let index = body.messages.length - 1;
+    while (index >= 0 && ['system', 'developer'].includes(body.messages[index]?.role)) index--;
+    const last = body.messages[index];
     if (last?.role !== 'user') return null;
     const kind = compactionPromptKind(textOfContent(last.content));
-    return kind ? { kind, messageIndex: body.messages.length - 1 } : null;
+    return kind ? { kind, messageIndex: index } : null;
 }
 
 export function removeCompactionPrompt(input)
@@ -54,43 +69,71 @@ export function removeCompactionPrompt(input)
 
 export function buildRemoteCompactionPayload(payload)
 {
-    return {
+    const out = {
         ...payload,
         input: removeCompactionPrompt(payload.input).concat([{ type: 'compaction_trigger' }]),
         store: false,
         stream: true,
-        include: ['reasoning.encrypted_content'],
     };
+    if (payload.reasoning?.effort === 'none') delete out.include;
+    else out.include = ['reasoning.encrypted_content'];
+    return out;
+}
+
+const TERMINAL_EVENTS = new Set(['response.completed', 'response.incomplete', 'response.failed', 'error']);
+
+function terminalEvents(events, label)
+{
+    const values = Array.isArray(events) ? events : [];
+    const at = values.findIndex(event => TERMINAL_EVENTS.has(event?.type));
+    if (at === -1) throw new Error(`${label} stream ended before response.completed`);
+    if (at !== values.length - 1) throw new Error(`${label} received output after terminal event`);
+    return { values: values.slice(0, at + 1), terminal: values[at] };
+}
+
+function validCompactionItem(item)
+{
+    return item?.type === 'compaction' && typeof item.encrypted_content === 'string'
+        && item.encrypted_content.trim().length > 0;
+}
+
+function compactionItemIn(history)
+{
+    const items = (history || []).filter(item => item?.type === 'compaction');
+    return items.length === 1 && validCompactionItem(items[0]) ? items[0] : null;
 }
 
 export function collectRemoteCompaction(events)
 {
-    const items = (events || [])
+    const owned = terminalEvents(events, 'remote compaction');
+    const terminal = owned.terminal;
+    if (terminal.type === 'response.failed' || terminal.type === 'error')
+        throw new Error(terminal.response?.error?.message || terminal.message || terminal.error?.message || 'remote compaction failed');
+    if (terminal.type !== 'response.completed') throw new Error('remote compaction stream ended before response.completed');
+    const items = owned.values
         .filter(event => event?.type === 'response.output_item.done' && event.item?.type === 'compaction')
         .map(event => event.item);
-    const terminal = (events || []).findLast(event => event?.type === 'response.completed');
-    const failed = (events || []).findLast(event => event?.type === 'response.failed' || event?.type === 'error');
-    if (failed) throw new Error(failed.response?.error?.message || failed.message || failed.error?.message || 'remote compaction failed');
-    if (!terminal) throw new Error('remote compaction stream ended before response.completed');
-    if (items.length !== 1 || typeof items[0].encrypted_content !== 'string' || !items[0].encrypted_content)
-        throw new Error(`remote compaction expected one encrypted item, got ${items.length}`);
+    if (items.length !== 1 || !validCompactionItem(items[0]))
+        throw new Error(`remote compaction expected one valid encrypted item, got ${items.length}`);
     return { item: items[0], response: terminal.response || {} };
 }
 
 export function collectResponseText(events)
 {
-    const failed = (events || []).findLast(event => event?.type === 'response.failed' || event?.type === 'error');
-    if (failed) throw new Error(failed.response?.error?.message || failed.message || failed.error?.message || 'fallback summary failed');
-    const terminal = (events || []).findLast(event => event?.type === 'response.completed');
-    if (!terminal) throw new Error('fallback stream ended before response.completed');
-    const text = (events || []).filter(event => event?.type === 'response.output_text.delta')
+    const owned = terminalEvents(events, 'fallback summary');
+    const terminal = owned.terminal;
+    if (terminal.type === 'response.failed' || terminal.type === 'error')
+        throw new Error(terminal.response?.error?.message || terminal.message || terminal.error?.message || 'fallback summary failed');
+    if (terminal.type !== 'response.completed') throw new Error('fallback stream ended before response.completed');
+    const text = owned.values.filter(event => event?.type === 'response.output_text.delta')
         .map(event => event.delta || '').join('').trim();
     if (!text) throw new Error('fallback summary returned no text');
     return { text, response: terminal.response || {} };
 }
 
-export function buildFallbackPayload(model, compactionItem, key)
+export function buildFallbackPayload(model, compactionItem, key, options = {})
 {
+    const reasoningEnabled = options.reasoningEnabled !== false;
     return {
         model,
         instructions: 'Render a portable context handoff from the supplied compacted state. Return only the summary. Preserve every explicit user request, decision, constraint, completed action, current state, exact identifier and path, failure, unresolved question, and concrete next step needed to continue without the opaque checkpoint. Do not omit information to meet an arbitrary length target; use as much space as the handoff requires.',
@@ -100,10 +143,10 @@ export function buildFallbackPayload(model, compactionItem, key)
         ],
         tool_choice: 'none',
         parallel_tool_calls: false,
-        reasoning: { effort: 'low', summary: 'auto' },
+        reasoning: reasoningEnabled ? { effort: 'low', summary: 'auto' } : { effort: 'none' },
         store: false,
         stream: true,
-        include: ['reasoning.encrypted_content'],
+        ...(reasoningEnabled ? { include: ['reasoning.encrypted_content'] } : {}),
         prompt_cache_key: key,
     };
 }
@@ -225,8 +268,8 @@ export class CompactionStore
     save(value)
     {
         if (!value || typeof value.sessionId !== 'string' || !value.sessionId) throw new Error('checkpoint session id required');
-        if (!Array.isArray(value.history) || !value.history.some(item => item?.type === 'compaction'))
-            throw new Error('checkpoint history has no compaction item');
+        const item = Array.isArray(value.history) ? compactionItemIn(value.history) : null;
+        if (!item) throw new Error('checkpoint history must contain one valid compaction item');
         const id = crypto.randomBytes(18).toString('base64url');
         const record = { version: VERSION, id, createdAt: new Date().toISOString(), ...value };
         fs.mkdirSync(this.root, { recursive: true });
@@ -234,11 +277,11 @@ export class CompactionStore
         const temp = target + `.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
         fs.writeFileSync(temp, JSON.stringify(record), { mode: 0o600 });
         fs.renameSync(temp, target);
-        const item = record.history.find(entry => entry?.type === 'compaction');
+        const storedItem = compactionItemIn(record.history);
         const metadata = {
             version: VERSION, id, sessionId: record.sessionId, createdAt: record.createdAt,
             sourceModel: record.sourceModel, retainedItems: record.history.length,
-            encryptedBytes: Buffer.byteLength(item?.encrypted_content || ''),
+            encryptedBytes: Buffer.byteLength(storedItem.encrypted_content),
             fallbackCharacters: String(record.fallback || '').length,
         };
         const metaTarget = path.join(this.root, id + '.meta.json');
@@ -254,7 +297,7 @@ export class CompactionStore
         {
             const record = JSON.parse(fs.readFileSync(this.file(id), 'utf8'));
             if (record?.version !== VERSION || record.id !== id || record.sessionId !== sessionId) return null;
-            if (!Array.isArray(record.history) || !record.history.some(item => item?.type === 'compaction')) return null;
+            if (!Array.isArray(record.history) || !compactionItemIn(record.history)) return null;
             return record;
         }
         catch { return null; }
@@ -296,6 +339,7 @@ export function restoreCheckpointInput(input, sessionId, store)
 {
     let restored = 0;
     let degraded = 0;
+    const windowCuts = [];
     const output = [];
     for (const item of input || [])
     {
@@ -310,6 +354,7 @@ export function restoreCheckpointInput(input, sessionId, store)
         if (record)
         {
             output.push(...record.history);
+            if (record.windowCut) windowCuts.push(record.windowCut);
             restored++;
             continue;
         }
@@ -320,7 +365,7 @@ export function restoreCheckpointInput(input, sessionId, store)
         output.push({ ...item, content });
         degraded++;
     }
-    return { input: output, restored, degraded };
+    return { input: output, restored, degraded, windowCuts };
 }
 
 export function anthropicSummaryResponse(model, text, usage, stream)

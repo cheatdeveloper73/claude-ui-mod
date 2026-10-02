@@ -39,12 +39,13 @@ import { UsageAnalytics } from './analytics.mjs';
 import { ProviderLimits } from './limits.mjs';
 import { ResetCredits } from './reset-credits.mjs';
 import { AdapterRegistry } from './adapter-registry.mjs';
-import { readCompactionSettings, readContextSettings, readProviderSettings } from './settings.mjs';
+import { readAutoCompactBudget, readCompactionSettings, readContextSettings, readProviderSettings } from './settings.mjs';
 import { UsageLedger, normalizeUsage } from './telemetry.mjs';
 import { ThroughputLedger, isSubagentRequest } from './throughput.mjs';
 import { estimateOpenAIInput } from './count-tokens.mjs';
 import { applyPromptPolicy, promptPolicyHeaders, resolvePromptPolicy } from './prompt-policy.mjs';
 import { capturePrompt } from './prompt-capture.mjs';
+import { fastTier } from './fast-mode.mjs';
 import { openAIRequest } from './openai-transport.mjs';
 import {
     CompactionStore,
@@ -55,6 +56,7 @@ import {
     collectResponseText,
     isClaudeCompactionRequest,
     restoreCheckpointInput,
+    removeCompactionPrompt,
     retainCompactionHistory,
     stripCheckpointMarkers,
     summaryText,
@@ -73,6 +75,7 @@ import {
     stripClientIdentity,
 } from './relay.mjs';
 import {
+    FALLBACK_TOKEN_BUDGET,
     MAX_THREAD_HINT_BYTES,
     ModelMessages,
     NEW_CONTEXT_TOOL,
@@ -83,16 +86,24 @@ import {
     applyWindowCut,
     callBackend,
     codexBase,
+    contextBudgetLimits,
+    contextBudgetStatus,
+    contextResetSummary,
     contextTools,
     contextWindowMessage,
     driftReport,
     guidanceMessage,
     isContextCall,
     reminderMessage,
+    restoreContextResetInput,
     stripConcealment,
+    stripContextResetMarkers,
     tokenBudgetFor,
     toolOutputContent,
+    userMessages,
+    windowCutsMatch,
 } from './context-management.mjs';
+import { publicRouterPort, rejectRequest } from './request-guard.mjs';
 import {
     compatibleHeaders,
     compatibleModelEntries,
@@ -113,6 +124,7 @@ import {
     buildResponsesRequest,
     chatgptAuth,
     isOpenAI,
+    openAIRawUsage,
     parseOpenAIModel,
     responsesHeaders,
     sseParser,
@@ -152,25 +164,6 @@ const MAX_CONTEXT_ROUNDS = 8;
 
 let contextHealth = { drift: null, lastError: null };
 
-// Per session, and in memory only: these describe what this worker generation
-// has done, and a blue-green swap legitimately starts the count over. Bounded so
-// a long-lived worker cannot accumulate a row per session forever.
-const CONTEXT_STATS_LIMIT = 256;
-const contextStats = new Map();
-
-function contextStat(sessionId)
-{
-    if (!sessionId) return null;
-    let value = contextStats.get(sessionId);
-    if (!value)
-    {
-        value = { turns: 0, hintCalls: 0, toolCalls: 0, failures: 0, lastToolCallAt: null, lastTurnAt: null, remaining: null };
-        contextStats.set(sessionId, value);
-        if (contextStats.size > CONTEXT_STATS_LIMIT) contextStats.delete(contextStats.keys().next().value);
-    }
-    return value;
-}
-
 // Generation rate, measured per response. The constructor only reads, so a
 // candidate generation that never gets accepted leaves nothing behind here
 // either -- the file is created by the first completed response, not by import.
@@ -187,12 +180,38 @@ const accounting = new AccountingStore({
     planFile: PLAN_FILE,
 });
 const usageAnalytics = new UsageAnalytics({ planFile: PLAN_FILE, historyFile: LIMIT_HISTORY_FILE, accounting });
+// The in-app usage bar needs current limits, not permanent accounting. Keep its
+// background refresh off the inference worker's segment/rollup write path.
+const liveUsageAnalytics = new UsageAnalytics({ planFile: PLAN_FILE, historyFile: LIMIT_HISTORY_FILE, accounting: null });
 
 const OPENAI_USAGE_URL = process.env.CODEX_USAGE_URL
     || 'https://chatgpt.com/backend-api/wham/usage';
 const configuredHeartbeat = Number(process.env.CODEX_STREAM_HEARTBEAT_MS);
 const OPENAI_HEARTBEAT_MS = Number.isFinite(configuredHeartbeat) && configuredHeartbeat > 0
     ? configuredHeartbeat : 30000;
+const configuredIdle = Number(process.env.CODEX_STREAM_IDLE_TIMEOUT_MS);
+const OPENAI_STREAM_IDLE_MS = Number.isFinite(configuredIdle) && configuredIdle >= 50
+    ? configuredIdle : 60000;
+
+async function readOpenAIStream(reader)
+{
+    let timer;
+    try
+    {
+        return await Promise.race([
+            reader.read(),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const error = new Error(`openai stream produced no event for ${OPENAI_STREAM_IDLE_MS}ms`);
+                    error.code = 'OPENAI_STREAM_IDLE_TIMEOUT';
+                    reject(error);
+                }, OPENAI_STREAM_IDLE_MS);
+                timer.unref?.();
+            }),
+        ]);
+    }
+    finally { clearTimeout(timer); }
+}
 
 const log = (s) =>
 {
@@ -362,7 +381,7 @@ function pruneRequest(body)
 
 function prepareCompatibleBody(body, model, selection)
 {
-    let out = prepareProviderBody(stripCheckpointMarkers(body));
+    let out = prepareProviderBody(stripCheckpointMarkers(stripContextResetMarkers(body)));
     out.model = model.id;
     out = applyPromptPolicy(out, selection);
 
@@ -468,16 +487,40 @@ async function handleCompatible(req, res, body, model)
     finally { rate.end(); }
 }
 
-function restoreForSession(sessionId)
+function restoreForSession(sessionId, includeSessionState = true)
 {
-    return input => restoreCheckpointInput(input, sessionId, compactionStore);
+    return input => {
+        // Every root restoration path also performs the one-way migration. This
+        // includes disabled settings: an old mixed-agent marker must never be
+        // trusted merely because the feature was switched off before this turn.
+        const state = includeSessionState && typeof sessionId === 'string'
+            ? windowStore.quarantineLegacy(sessionId) : null;
+        const reset = restoreContextResetInput(input, state);
+        // Subagents receive the parent's transcript and therefore its marker, but
+        // have no distinct transport identity. Strip the marker with a null
+        // lookup rather than injecting the parent's opaque checkpoint history.
+        const checkpoint = restoreCheckpointInput(reset.input,
+            includeSessionState ? sessionId : null, compactionStore);
+        return {
+            ...checkpoint,
+            resetIds: reset.resetIds,
+            resetRestored: reset.restored,
+            resetDegraded: reset.degraded,
+        };
+    };
 }
 
-async function bufferedResponses(payload, tokens, key, gone, label)
+// Scoped by session so identical prompts in two Claude sessions stay apart.
+function conversationThread(sessionId, key)
+{
+    return crypto.createHash('sha256').update(`${sessionId || ''}\n${key}`).digest('hex').slice(0, 32);
+}
+
+async function bufferedResponses(payload, tokens, key, gone, label, sessionId)
 {
     const upstream = await openAIRequest(RESPONSES_URL, {
         method: 'POST',
-        headers: responsesHeaders(tokens, key),
+        headers: responsesHeaders(tokens, key, sessionId),
         body: JSON.stringify(payload),
     }, gone, log);
     if (!upstream.ok)
@@ -492,51 +535,106 @@ async function bufferedResponses(payload, tokens, key, gone, label)
     const events = [];
     let terminal = false;
     const feed = sseParser(event => {
+        // One terminal event owns the buffered transaction. sseParser can emit
+        // several frames from one chunk, so cancellation outside this callback
+        // is too late to stop trailing output from being misattributed.
+        if (terminal) return;
         events.push(event);
         if (['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(event?.type)) terminal = true;
     });
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
-    for (;;)
+    try
     {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (gone()) { try { await reader.cancel(); } catch (_) {} throw new Error('client disconnected'); }
-        feed(decoder.decode(value, { stream: true }));
-        if (terminal) { try { await reader.cancel(); } catch (_) {} break; }
+        for (;;)
+        {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (gone()) throw new Error('client disconnected');
+            feed(decoder.decode(value, { stream: true }));
+            if (terminal) break;
+        }
+        if (!terminal) feed(decoder.decode(), true);
+        if (gone()) throw new Error('client disconnected');
+        return events;
     }
-    if (!terminal) feed(decoder.decode(), true);
-    return events;
+    finally { try { await reader.cancel(); } catch (_) {} }
 }
 
-function combinedUsage(...values)
+function combinedUsage(reasoningEnabled, ...values)
 {
     const out = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
     for (const value of values)
     {
-        const usage = anthropicUsage(value || {});
+        const usage = anthropicUsage(value || {}, reasoningEnabled);
         for (const key of Object.keys(out)) out[key] += Number(usage[key]) || 0;
     }
+    if (!reasoningEnabled) out.output_tokens_details = { thinking_tokens: 0 };
     return out;
 }
 
-function recordCompactionResponse(response, source, sessionId, requestedModel)
+function recordCompactionResponse(response, source, sessionId, requestedModel, reasoningEnabled)
 {
     if (!response?.id || !response.usage) return;
     recordProviderUsage({
         provider: 'openai', sessionId, requestedModel,
         responseId: response.id, servedModel: response.model || requestedModel,
-        effort: response.reasoning?.effort || null,
+        effort: response.reasoning?.effort || (reasoningEnabled ? null : 'none'),
         source, exact: true, status: 'completed',
-        usage: anthropicUsage(response.usage), rawUsage: response.usage,
+        usage: anthropicUsage(response.usage, reasoningEnabled),
+        rawUsage: openAIRawUsage(response.usage, reasoningEnabled),
     });
+}
+
+// In Codex context-management mode manual and automatic compaction start a new
+// window without asking a model to summarize. Claude Code still expects one
+// assistant response from its compaction transaction, so return an opaque marker
+// and remove that synthetic message on the next count/inference request.
+async function handleContextCompaction(req, res, body)
+{
+    const request = isClaudeCompactionRequest(body);
+    const settings = readContextSettings();
+    if (!request || !settings.enabled || !settings.windowReset || isSubagentRequest(body) === true) return false;
+    const sessionId = req.headers['x-claude-code-session-id'];
+    if (typeof sessionId !== 'string' || !sessionId) return false;
+    // Migrate a pre-isolation namespace before restoration can consult its cut.
+    windowStore.ensure(sessionId);
+
+    const providerSettings = readProviderSettings();
+    const selection = resolvePromptPolicy(body, 'openai', providerSettings, sessionId);
+    const built = buildResponsesRequest(body, providerSettings, selection, {
+        restoreCompaction: restoreForSession(sessionId),
+    });
+    const input = removeCompactionPrompt(built.req.input);
+    const reset = windowStore.beginClientReset(sessionId, input);
+    const text = contextResetSummary(reset.id);
+    let inputTokens = 0;
+    try { inputTokens = await estimateOpenAIInput({ ...built.req, input }); } catch (_) {}
+    const usage = {
+        input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        ...(providerSettings.reasoningEnabled === false ? { output_tokens_details: { thinking_tokens: 0 } } : {}),
+    };
+    res.writeHead(200, {
+        'Content-Type': body.stream !== true ? 'application/json' : 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        ...promptPolicyHeaders(selection),
+        'X-Cuimod-Compaction': 'context-window-reset',
+        'X-Cuimod-Context-Window': reset.state.windowId,
+    });
+    res.end(anthropicSummaryResponse(body.model, text, usage, body.stream === true));
+    log(`openai context compaction ${sessionId} window=${reset.state.windowId.slice(0, 8)} windows=${reset.state.windows}${reset.reused ? ' retry=1' : ''}`);
+    return true;
 }
 
 async function handleCodexCompaction(req, res, body)
 {
     const request = isClaudeCompactionRequest(body);
     const settings = readCompactionSettings();
-    if (!request || settings.strategy !== 'codex') return false;
+    const subagent = isSubagentRequest(body);
+    if (!request || settings.strategy !== 'codex' || subagent === true) return false;
     const sessionId = req.headers['x-claude-code-session-id'];
     if (typeof sessionId !== 'string' || !sessionId) return false;
     const gone = () => res.writableEnded || res.destroyed;
@@ -544,18 +642,43 @@ async function handleCodexCompaction(req, res, body)
     try
     {
         const providerSettings = readProviderSettings();
+        const contextSettings = readContextSettings();
+        // A disabled setting must not resurrect a prefix retired by an earlier
+        // window reset. Quarantine legacy mixed-agent state before consulting it;
+        // only an enabled lane uses that store as its backend request identity.
+        const storedWindowState = contextSettings.enabled
+            ? windowStore.ensure(sessionId) : windowStore.quarantineLegacy(sessionId);
+        const contextState = contextSettings.enabled ? storedWindowState : null;
+        const windowState = storedWindowState;
         const selection = resolvePromptPolicy(body, 'openai', providerSettings, sessionId);
         const selectedBody = settings.model === 'current'
             ? body
             : { ...body, model: `claude-${settings.model}[1m]`, output_config: { ...(body.output_config || {}), effort: 'low' } };
         const built = buildResponsesRequest(selectedBody, providerSettings, selection, {
-            restoreCompaction: restoreForSession(sessionId),
+            restoreCompaction: restoreForSession(sessionId, subagent !== true),
         });
-        const compactPayload = buildRemoteCompactionPayload(built.req);
+        let compactionInput = built.req.input;
+        let windowCut = null;
+        if (windowState?.cut)
+        {
+            windowCut = windowState.cut;
+            const alreadyApplied = built.restoration?.windowCuts?.some(cut => windowCutsMatch(cut, windowCut));
+            if (!alreadyApplied)
+            {
+                const cut = applyWindowCut(compactionInput, windowCut);
+                compactionInput = cut.input;
+                if (cut.degraded) log(`openai compaction window cut degraded: ${cut.degraded}`);
+            }
+        }
+        const compactPayload = buildRemoteCompactionPayload({ ...built.req, input: compactionInput });
         const tokens = await chatgptAuth(log);
-        const compactEvents = await bufferedResponses(compactPayload, tokens, built.key, gone, 'openai-compaction');
+        // Same thread as the conversation being compacted, whose prefix it reads.
+        const compactEvents = await bufferedResponses(compactPayload, tokens,
+            contextState?.storeId ? built.key : conversationThread(sessionId, built.key), gone, 'openai-compaction',
+            contextState?.storeId || null);
         const compacted = collectRemoteCompaction(compactEvents);
         const retained = await retainCompactionHistory(compactPayload.input, built.model, estimateOpenAIInput);
+        if (gone()) throw new Error('client disconnected');
 
         let fallback = 'This conversation is preserved in a Codex checkpoint and requires a compatible GPT model to continue.';
         let fallbackResponse = null;
@@ -563,12 +686,14 @@ async function handleCodexCompaction(req, res, body)
         {
             const fallbackKey = crypto.createHash('sha256').update(built.key + '\ncompaction-fallback').digest('hex').slice(0, 32);
             const fallbackEvents = await bufferedResponses(
-                buildFallbackPayload(built.model, compacted.item, fallbackKey),
-                tokens, fallbackKey, gone, 'openai-compaction-fallback');
+                buildFallbackPayload(built.model, compacted.item, fallbackKey, providerSettings),
+                tokens, contextState?.storeId ? fallbackKey : conversationThread(sessionId, fallbackKey), gone, 'openai-compaction-fallback',
+                contextState?.storeId || null);
             const rendered = collectResponseText(fallbackEvents);
             fallback = rendered.text;
             fallbackResponse = rendered.response;
         }
+        if (gone()) throw new Error('client disconnected');
 
         const record = compactionStore.save({
             sessionId,
@@ -576,26 +701,46 @@ async function handleCodexCompaction(req, res, body)
             trigger: request.kind,
             history: retained.concat([compacted.item]),
             fallback,
+            windowCut,
             remoteResponseId: compacted.response.id || null,
             fallbackResponseId: fallbackResponse?.id || null,
         });
-        recordCompactionResponse(compacted.response, 'openai.compaction.v2', sessionId, built.model);
-        if (fallbackResponse) recordCompactionResponse(fallbackResponse, 'openai.compaction.fallback', sessionId, built.model);
+        const reasoningEnabled = providerSettings.reasoningEnabled !== false;
+        recordCompactionResponse(compacted.response, 'openai.compaction.v2', sessionId, built.model, reasoningEnabled);
+        if (fallbackResponse) recordCompactionResponse(fallbackResponse, 'openai.compaction.fallback', sessionId, built.model, reasoningEnabled);
 
         const text = summaryText(record.id, fallback);
-        const usage = combinedUsage(compacted.response.usage, fallbackResponse?.usage);
-        const headers = { 'Content-Type': body.stream === false ? 'application/json' : 'text/event-stream',
+        const usage = combinedUsage(reasoningEnabled, compacted.response.usage, fallbackResponse?.usage);
+        const headers = { 'Content-Type': body.stream !== true ? 'application/json' : 'text/event-stream',
             'Cache-Control': 'no-cache', ...promptPolicyHeaders(selection),
             'X-Cuimod-Compaction': 'codex-v2', 'X-Cuimod-Compaction-Checkpoint': record.id };
         res.writeHead(200, headers);
-        res.end(anthropicSummaryResponse(body.model, text, usage, body.stream !== false));
+        res.end(anthropicSummaryResponse(body.model, text, usage, body.stream === true));
         log(`openai compaction ${sessionId} checkpoint=${record.id} model=${built.model} retained=${record.history.length} fallback=${fallback.length}B`);
         return true;
     }
     catch (error)
     {
-        log(`openai compaction degraded to native summary: ${String(error?.message || error).replace(/\s+/g, ' ').slice(0, 300)}`);
-        if (!Number.isInteger(error?.upstreamStatus) || [400, 404].includes(error.upstreamStatus)) return false;
+        const message = String(error?.message || error).replace(/\s+/g, ' ').slice(0, 300);
+        if (gone() || message === 'client disconnected') {
+            log(`openai compaction cancelled: ${message}`);
+            return true;
+        }
+        // A provider that rejects the compaction endpoint may still use Claude
+        // Code's selected native summary path. A malformed/empty successful
+        // response is a protocol failure: falling through would rerun the same
+        // dedicated prompt as an ordinary tool-enabled turn and could replace
+        // usable context with another empty result.
+        if (Number.isInteger(error?.upstreamStatus) && [400, 404].includes(error.upstreamStatus)) {
+            log(`openai compaction unavailable; using native summary: ${message}`);
+            return false;
+        }
+        if (!Number.isInteger(error?.upstreamStatus)) {
+            log(`openai compaction failed closed: ${message}`);
+            res.writeHead(502, { 'Content-Type': 'application/json', 'X-Cuimod-Compaction': 'failed' });
+            res.end(errorBody(`openai compaction failed: ${message}`, 'api_error'));
+            return true;
+        }
         const headers = { 'Content-Type': 'application/json' };
         for (const name of ['retry-after', 'retry-after-ms', 'x-request-id'])
         {
@@ -635,13 +780,13 @@ function contextWindowSize(models, model)
     return Math.floor(ceiling * (Number.isFinite(percent) && percent > 0 ? percent : 95) / 100);
 }
 
-async function contextRemaining(payload, model, models)
+async function measureContextBudget(payload, model, models, budget, autoCompact, reminders)
 {
     try
     {
         const used = await estimateOpenAIInput(payload);
-        if (!Number.isFinite(used)) return null;
-        return Math.max(0, contextWindowSize(models, model) - used);
+        const limits = contextBudgetLimits(contextWindowSize(models, model), autoCompact, budget, reminders);
+        return contextBudgetStatus(used, limits);
     }
     catch (_) { return null; }
 }
@@ -660,7 +805,7 @@ async function threadHint(base, tokens, identity, storeId)
     return { text: Buffer.byteLength(text) > MAX_THREAD_HINT_BYTES ? '' : text, error: null };
 }
 
-async function prepareContextManagement({ payload, model, sessionId, tokens, key, settings })
+async function prepareContextManagement({ payload, model, sessionId, tokens, key, settings, restoration, autoCompact })
 {
     if (!settings.enabled || typeof sessionId !== 'string' || !sessionId) return null;
 
@@ -672,7 +817,7 @@ async function prepareContextManagement({ payload, model, sessionId, tokens, key
         return null;
     }
 
-    const identity = codexIdentityHeaders(key);
+    const identity = codexIdentityHeaders(key, state.storeId);
     let models = null;
     try { models = await modelMessages.load(tokens, identity); }
     catch (error) { contextHealth = { ...contextHealth, lastError: `models list: ${String(error?.message || error).slice(0, 160)}` }; }
@@ -681,21 +826,42 @@ async function prepareContextManagement({ payload, model, sessionId, tokens, key
 
     let input = payload.input;
     let cut = null;
-    if (settings.windowReset && state.cut)
+    if (restoration?.resetIds?.length)
     {
-        cut = applyWindowCut(input, state.cut);
-        input = cut.input;
+        // Stripping the synthetic marker prepares this attempt; it does not prove
+        // the replacement turn reached the client. Retire the durable reset only
+        // after a terminal response so a 429 or transport retry stays clean.
+        cut = { applied: false, clientReset: true };
+    }
+    else if (settings.windowReset && state.cut)
+    {
+        const compacted = restoration?.windowCuts?.some(value => windowCutsMatch(value, state.cut));
+        if (compacted)
+        {
+            state = windowStore.clearCut(sessionId, state.cut);
+            cut = { applied: false, compacted: true };
+        }
+        else
+        {
+            cut = applyWindowCut(input, state.cut);
+            input = cut.input;
+        }
     }
 
-    const stat = contextStat(sessionId);
-    const hint = settings.notesTools ? await threadHint(CODEX_BASE, tokens, identity, state.storeId) : { text: '', error: null };
-    if (settings.notesTools && stat)
+    let status = await measureContextBudget({ ...payload, input }, model, models, budget, autoCompact, settings.reminders);
+    // Codex forces a reset at the buffered boundary. Preserve the latest user
+    // turn by cutting before it, which is the router equivalent of Codex's
+    // InitialContextInjection::BeforeLastUserMessage.
+    if (settings.windowReset && status?.forceRemaining === 0 && userMessages(input).length > 1)
     {
-        // The hint is a backend call on every single turn, and not counting it
-        // is what made a working lane report "never".
-        stat.hintCalls++;
-        if (hint.error) stat.failures++;
+        state = windowStore.rotate(sessionId, input, { cause: 'forced', beforeLastUser: true });
+        const forced = applyWindowCut(input, state.cut);
+        input = forced.input;
+        cut = { ...forced, forced: true };
+        status = await measureContextBudget({ ...payload, input }, model, models, budget, autoCompact, settings.reminders);
     }
+
+    const hint = settings.notesTools ? await threadHint(CODEX_BASE, tokens, identity, state.storeId) : { text: '', error: null };
     if (hint.error) contextHealth = { ...contextHealth, lastError: `thread hint: ${hint.error}` };
 
     let removed = 0;
@@ -714,14 +880,20 @@ async function prepareContextManagement({ payload, model, sessionId, tokens, key
     }
 
     const trailing = [];
-    const remaining = await contextRemaining({ ...payload, input }, model, models);
     const threshold = Number(budget.reminder_threshold_tokens) || 0;
-    if (settings.reminders && remaining !== null && threshold > 0 && remaining <= threshold
+    if (settings.reminders && status && threshold > 0 && status.remaining <= threshold
         && windowStore.claimReminder(sessionId))
     {
-        const reminder = reminderMessage(budget.reminder_message_template, remaining);
+        const reminder = reminderMessage(budget.reminder_message_template, status.remaining);
         removed += reminder.removed;
         if (reminder.message) trailing.push(reminder.message);
+    }
+    if (settings.reminders && status?.remaining === 0 && status.forceRemaining > 0
+        && windowStore.claimFallback(sessionId))
+    {
+        const fallback = reminderMessage(budget.auto_compact_fallback_prompt, 0);
+        removed += fallback.removed;
+        if (fallback.message) trailing.push(fallback.message);
     }
 
     const clientNames = new Set((payload.tools || []).map(tool => tool?.name));
@@ -743,16 +915,18 @@ async function prepareContextManagement({ payload, model, sessionId, tokens, key
         agentName: CONTEXT_AGENT,
     }) : null;
 
-    if (stat)
-    {
-        stat.turns++;
-        stat.lastTurnAt = new Date().toISOString();
-        stat.remaining = remaining;
-    }
+    state = windowStore.recordTurn(sessionId, {
+        hint: settings.notesTools,
+        failure: !!hint.error,
+        budget: status,
+        threadHint: hint.error ? null : hint.text,
+    });
     contextHealth = { ...contextHealth, drift: driftReport(upstreamBudget, { total: removed }) };
 
     return {
-        state, identity, budget, tools, remaining, cut,
+        state, identity, budget, tools, remaining: status?.remaining ?? null,
+        forceRemaining: status?.forceRemaining ?? null, cut,
+        resetIds: restoration?.resetIds || [],
         concealmentRemoved: removed,
         ingesting: !!metadata,
         requestHeaders: metadata ? metadata.headers : null,
@@ -778,11 +952,13 @@ async function runContextCalls(calls, { context, sessionId, tokens, model, paylo
         {
             try
             {
-                context.state = windowStore.rotate(sessionId, payload.input);
+                context.state = windowStore.rotate(sessionId, payload.input, { cause: 'model' });
+                context.state = windowStore.recordModelCall(sessionId, call);
                 output = [{ type: 'input_text', text: 'A new context window will start without summarizing conversation history.' }];
             }
             catch (error)
             {
+                context.state = windowStore.recordModelCall(sessionId, call, true);
                 output = [{ type: 'input_text', text: `Unable to start a new context window: ${String(error?.message || error).slice(0, 160)}` }];
             }
         }
@@ -799,13 +975,7 @@ async function runContextCalls(calls, { context, sessionId, tokens, model, paylo
                     truncationBytes: settings.truncationBytes,
                 })
                 : { ok: false, error: 'unknown model-only tool' };
-            const stat = contextStat(sessionId);
-            if (stat)
-            {
-                stat.toolCalls++;
-                stat.lastToolCallAt = new Date().toISOString();
-                if (!result.ok) stat.failures++;
-            }
+            context.state = windowStore.recordModelCall(sessionId, call, !result.ok);
             if (!result.ok) contextHealth = { ...contextHealth, lastError: `${route || call.name}: ${result.error}` };
             output = result.ok
                 ? toolOutputContent(result.value)
@@ -821,20 +991,33 @@ async function handleOpenAI(req, res, body)
     const gone = () => res.writableEnded || res.destroyed;
     const clientModel = body.model;
     const settings = readProviderSettings();
+    const contextSettings = readContextSettings();
     const sessionId = req.headers['x-claude-code-session-id'];
+    const subagent = isSubagentRequest(body);
+    // buildResponsesRequest restores local reset markers. Isolate the root first,
+    // or the first request after this upgrade could still consume a mixed-agent
+    // cut before prepareContextManagement gets a chance to migrate the store.
+    if (contextSettings.enabled && subagent !== true && typeof sessionId === 'string')
+    {
+        try { windowStore.ensure(sessionId); }
+        catch (error) { contextHealth = { ...contextHealth, lastError: `window store: ${String(error?.message || error).slice(0, 160)}` }; }
+    }
     const selection = resolvePromptPolicy(body, 'openai', settings, sessionId);
-    const { req: payload, key, model, effort, promptSurface, restoration } = buildResponsesRequest(body, settings, selection, {
-        restoreCompaction: restoreForSession(sessionId),
+    const { req: payload, key, model, effort, promptSurface, restoration, webSearchMaxUses } = buildResponsesRequest(body, settings, selection, {
+        restoreCompaction: restoreForSession(sessionId, subagent !== true),
+        fast: fastTier({ body, model: parseOpenAIModel(body.model).id, sessionId, subagent }),
     });
     capturePrompt({ provider: 'openai', sessionId: req.headers['x-claude-code-session-id'], model,
         selection, ...promptSurface });
     const parsed = parseOpenAIModel(body.model, body.output_config?.effort);
-    const contextSettings = readContextSettings();
+    const speed = payload.service_tier === 'priority' ? 'fast' : 'standard';
+    const autoCompact = readAutoCompactBudget(model, sessionId);
     // Set once the translator exists. A round that still owes model-only tool
     // results is not the end of the turn, and settling the rate sample there
     // would measure the first leg instead of the whole answer.
     let translator = null;
-    const moreRounds = () => !!translator && translator.pendingCalls.length > 0;
+    let nonstreamPending = false;
+    const moreRounds = () => translator ? translator.pendingCalls.length > 0 : nonstreamPending;
     const identities = new Set();
     function observeIdentity(event) {
         if (!settings.logUpstreamIdentity || !['response.created', 'response.completed', 'response.incomplete'].includes(event?.type)) return;
@@ -858,7 +1041,8 @@ async function handleOpenAI(req, res, body)
             responseId: response.id, servedModel: response.model || model,
             effort: response.reasoning?.effort || effort,
             status: event.type === 'response.incomplete' ? 'incomplete' : 'completed',
-            usage: anthropicUsage(response.usage), rawUsage: response.usage,
+            usage: anthropicUsage(response.usage, settings.reasoningEnabled !== false),
+            rawUsage: openAIRawUsage(response.usage, settings.reasoningEnabled !== false),
         };
         recordProviderUsage({
             provider: 'openai',
@@ -866,16 +1050,20 @@ async function handleOpenAI(req, res, body)
             requestedModel: model,
             source: 'openai.response.usage', exact: true, ...sample,
         });
-        if (!moreRounds()) rate.complete(sample);
+        if (moreRounds()) rate.nextOpenAIResponse();
+        else rate.complete(sample);
     }
     const rate = throughput.begin({
         provider: 'openai', sessionId: req.headers['x-claude-code-session-id'] || null,
         requestedModel: model, effort,
-        subagent: isSubagentRequest(body), streaming: body.stream !== false,
+        subagent, streaming: body.stream === true,
     }, res);
     const observe = event => { observeIdentity(event); rate.openai(event); observeUsage(event); };
 
-    log(`openai ${body.model} -> ${model} effort=${effort}${parsed.rejectedEffort ? ` (rejected ${parsed.rejectedEffort}, not supported by this model)` : ''} items=${payload.input.length} tools=${payload.tools?.length ?? 0} instr=${payload.instructions.length}B key=${key.slice(0, 8)}`
+    const effortNote = parsed.rejectedEffort
+        ? (settings.reasoningEnabled === false ? ` (ignored ${parsed.rejectedEffort}, reasoning is off)` : ` (rejected ${parsed.rejectedEffort}, not supported by this model)`)
+        : '';
+    log(`openai ${body.model} -> ${model} effort=${effort}${effortNote} tier=${payload.service_tier || 'default'}${subagent === true ? ' sub' : ''} items=${payload.input.length} tools=${payload.tools?.length ?? 0} instr=${payload.instructions.length}B key=${key.slice(0, 8)}`
         + `${restoration?.restored ? ` compact-restored=${restoration.restored}` : ''}${restoration?.degraded ? ` compact-degraded=${restoration.degraded}` : ''}`);
 
     if (process.env.GEMINI_BRIDGE_DUMP)
@@ -897,19 +1085,22 @@ async function handleOpenAI(req, res, body)
     // several upstream responses. A failed preparation degrades to an ordinary
     // turn rather than to no turn.
     let context = null;
-    try { context = await prepareContextManagement({ payload, model, sessionId, tokens, key, settings: contextSettings }); }
-    catch (error)
+    if (subagent !== true)
     {
-        contextHealth = { ...contextHealth, lastError: String(error?.message || error).slice(0, 200) };
-        log(`context management skipped for this turn: ${String(error?.message || error).replace(/\s+/g, ' ').slice(0, 200)}`);
+        try { context = await prepareContextManagement({ payload, model, sessionId, tokens, key, settings: contextSettings, restoration, autoCompact }); }
+        catch (error)
+        {
+            contextHealth = { ...contextHealth, lastError: String(error?.message || error).slice(0, 200) };
+            log(`context management skipped for this turn: ${String(error?.message || error).replace(/\s+/g, ' ').slice(0, 200)}`);
+        }
     }
     let outbound = context ? context.prepared : payload;
     if (context)
     {
         log(`openai context-management session=${sessionId} window=${context.state.windowId.slice(0, 8)} windows=${context.state.windows}`
-            + ` tools=+${context.tools.length} remaining=${context.remaining ?? 'unknown'} stripped=${context.concealmentRemoved}`
+            + ` tools=+${context.tools.length} remaining=${context.remaining ?? 'unknown'} force-remaining=${context.forceRemaining ?? 'unknown'} stripped=${context.concealmentRemoved}`
             + `${context.ingesting ? ' ingest=on' : ''}`
-            + `${context.cut?.applied ? ` cut-dropped=${context.cut.dropped}` : ''}${context.cut?.degraded ? ` cut-degraded=${context.cut.degraded}` : ''}`);
+            + `${context.cut?.applied ? ` cut-dropped=${context.cut.dropped}` : ''}${context.cut?.compacted ? ' cut-compacted=1' : ''}${context.cut?.degraded ? ` cut-degraded=${context.cut.degraded}` : ''}`);
     }
 
     // Runs the model-only calls a round produced and appends both halves to the
@@ -922,10 +1113,21 @@ async function handleOpenAI(req, res, body)
         return outbound;
     };
 
+    // The backend keeps prompt-cache affinity per thread, so this must be one
+    // stable thread per conversation. Both earlier choices broke that: a fresh
+    // uuid per subagent request missed every time, and the shared Claude session
+    // id put a lead and all its parallel workers on one thread, where misses
+    // climbed from 2% solo to ~34% at six workers (ledger, 2026-09-24..27).
+    // Subagents never send client_metadata, so no backend history is shared.
+    const responseSessionId = context?.state?.storeId || null;
+    const threadKey = responseSessionId ? key : conversationThread(sessionId, key);
     // No status retry. A 429 here is the ChatGPT plan's own rate limit, and
     // hammering it is how a soft limit becomes a hard one; the Anthropic SDK on
     // the client side honours Retry-After and will do the waiting.
-    const upstreamHeaders = () => ({ ...responsesHeaders(tokens, key), ...(context?.requestHeaders || {}) });
+    const upstreamHeaders = () => ({
+        ...responsesHeaders(tokens, threadKey, responseSessionId),
+        ...(context?.requestHeaders || {}),
+    });
     let upstream = await openAIRequest(RESPONSES_URL, {
         method: 'POST',
         headers: upstreamHeaders(),
@@ -950,12 +1152,11 @@ async function handleOpenAI(req, res, body)
         return;
     }
 
-    // Non-streaming callers get the assembled message. Claude Code always
-    // streams, so this is the selftest's path and anything else that asks.
-    if (body.stream === false)
+    // Agent turns stream. Unary control-plane calls omit `stream` and need one
+    // assembled Message with terminal usage, which is also the selftest path.
+    if (body.stream !== true)
     {
         const kept = [];
-        const totals = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
         try
         {
             for (let round = 0; ; round++)
@@ -963,34 +1164,50 @@ async function handleOpenAI(req, res, body)
                 const events = [];
                 const pending = [];
                 const internal = new Set();
+                const argumentsByIndex = new Map();
+                nonstreamPending = false;
                 let terminal = false;
                 const feed = sseParser((e) => {
-                    observe(e);
+                    if (terminal) return;
                     const oi = e?.output_index ?? 0;
-                    if (e?.type === 'response.output_item.added' && isContextCall(e.item)) internal.add(oi);
+                    if (e?.type === 'response.output_item.added' && isContextCall(e.item)) {
+                        internal.add(oi);
+                        argumentsByIndex.set(oi, typeof e.item?.arguments === 'string' ? e.item.arguments : '');
+                    }
                     const hidden = internal.has(oi) && ['response.output_item.added', 'response.output_item.done', 'response.function_call_arguments.delta'].includes(e?.type);
-                    if (hidden && e.type === 'response.output_item.done') pending.push({ ...e.item, type: 'function_call' });
+                    if (hidden && e.type === 'response.function_call_arguments.delta')
+                        argumentsByIndex.set(oi, (argumentsByIndex.get(oi) || '') + (e.delta || ''));
+                    if (hidden && e.type === 'response.output_item.done') {
+                        pending.push({ ...e.item, type: 'function_call',
+                            arguments: typeof e.item?.arguments === 'string' && e.item.arguments
+                                ? e.item.arguments : (argumentsByIndex.get(oi) || '') });
+                        nonstreamPending = true;
+                    }
                     if (!hidden) events.push(e);
+                    observe(e);
                     if (['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(e?.type)) terminal = true;
                 });
                 const reader = upstream.body.getReader();
                 const dec = new TextDecoder();
-                for (;;)
+                try
                 {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    feed(dec.decode(value, { stream: true }));
-                    if (terminal) { try { await reader.cancel(); } catch (_) {} break; }
+                    for (;;)
+                    {
+                        const { value, done } = await readOpenAIStream(reader);
+                        if (done) break;
+                        if (gone()) return;
+                        feed(dec.decode(value, { stream: true }));
+                        if (terminal) break;
+                    }
+                    if (!terminal) feed(dec.decode(), true);
                 }
-                if (!terminal) feed(dec.decode(), true);
+                finally { try { await reader.cancel(); } catch (_) {} }
 
-                for (const event of events)
-                {
-                    if (!['response.completed', 'response.incomplete'].includes(event?.type)) continue;
-                    const usage = anthropicUsage(event.response?.usage);
-                    for (const field of Object.keys(totals)) totals[field] += Number(usage[field]) || 0;
-                }
-                kept.push(...events);
+                // A hidden round's terminal belongs to that upstream response,
+                // while the Anthropic message remains open for the final answer.
+                kept.push(...(pending.length
+                    ? events.filter(event => !['response.completed', 'response.incomplete'].includes(event?.type))
+                    : events));
 
                 if (!context || !pending.length) break;
                 const next = await advanceRound(pending);
@@ -1006,14 +1223,24 @@ async function handleOpenAI(req, res, body)
                 {
                     const text = await upstream.text().catch(() => '');
                     log(`openai ${upstream.status} on ${model} after a model-only round: ${text.slice(0, 300)}`);
-                    break;
+                    const headers = { 'Content-Type': 'application/json', ...promptPolicyHeaders(selection) };
+                    for (const name of ['retry-after', 'retry-after-ms', 'x-request-id']) {
+                        const value = upstream.headers.get(name);
+                        if (value !== null) headers[name] = value;
+                    }
+                    res.writeHead(upstream.status, headers);
+                    res.end(errorBody(`openai ${upstream.status}: ${text.slice(0, 500)}`,
+                        upstream.status === 429 ? 'rate_limit_error' : 'api_error'));
+                    return;
                 }
             }
         }
         finally { rate.end(); }
 
-        const message = collectAnthropicMessage(clientModel, kept, settings);
-        message.usage = { ...message.usage, ...totals };
+        const message = collectAnthropicMessage(clientModel, kept, { ...settings, webSearchMaxUses, speed });
+        if (context?.resetIds?.length) {
+            context.state = windowStore.acknowledgeClientReset(sessionId, context.resetIds);
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', ...promptPolicyHeaders(selection) });
         res.end(JSON.stringify(message));
         return;
@@ -1039,6 +1266,8 @@ async function handleOpenAI(req, res, body)
 
     const out = new ResponsesToAnthropic(clientModel, write, {
         ...settings,
+        webSearchMaxUses,
+        speed,
         ...(context ? { suppressCall: isContextCall, deferFinish: true } : {}),
     });
     translator = out;
@@ -1061,7 +1290,7 @@ async function handleOpenAI(req, res, body)
             {
                 for (;;)
                 {
-                    const { value, done } = await reader.read();
+                    const { value, done } = await readOpenAIStream(reader);
                     if (done) break;
                     if (gone()) { try { await reader.cancel(); } catch (_) {} return; }
                     feed(dec.decode(value, { stream: true }));
@@ -1072,6 +1301,7 @@ async function handleOpenAI(req, res, body)
             catch (error)
             {
                 log(`openai transport interrupted on ${model} [${error?.cause?.code || error?.code || error?.name || 'error'}]: ${String(error?.message || error).replace(/\s+/g, ' ').slice(0, 240)}`);
+                try { await reader.cancel(); } catch (_) {}
                 if (out.recoverTransport()) { res.end(); return; }
                 res.destroy(error);
                 return;
@@ -1109,7 +1339,12 @@ async function handleOpenAI(req, res, body)
         }
 
         if (!out.closed && out.terminal) out.finish();
-        if (out.terminal || out.failureMessage) { res.end(); return; }
+        if (out.terminal || out.failureMessage) {
+            if (out.terminal && !out.failureMessage && context?.resetIds?.length)
+                context.state = windowStore.acknowledgeClientReset(sessionId, context.resetIds);
+            res.end();
+            return;
+        }
         const error = new Error('openai stream ended before a terminal response event');
         log(`${error.message} on ${model}`);
         if (out.recoverTransport()) { res.end(); return; }
@@ -1133,7 +1368,7 @@ async function handlePassthrough(req, res, rawBody, body, urlPath)
     const messagesRequest = body && (urlPath === '/v1/messages' || urlPath === '/v1/messages/count_tokens');
     if (messagesRequest)
     {
-        const portableBody = stripCheckpointMarkers(body);
+        const portableBody = stripCheckpointMarkers(stripContextResetMarkers(body));
         selection = resolvePromptPolicy(portableBody, 'anthropic', readProviderSettings(), req.headers['x-claude-code-session-id']);
         const prepared = applyPromptPolicy(portableBody, selection);
         if (prepared !== body) outgoing = Buffer.from(JSON.stringify(prepared));
@@ -1148,7 +1383,7 @@ async function handlePassthrough(req, res, rawBody, body, urlPath)
     const rate = messagesRequest && urlPath === '/v1/messages'
         ? throughput.begin({
             provider: 'claude', sessionId: req.headers['x-claude-code-session-id'] || null,
-            requestedModel: body.model, subagent: isSubagentRequest(body), streaming: body.stream !== false,
+            requestedModel: body.model, subagent: isSubagentRequest(body), streaming: body.stream === true,
         }, res)
         : null;
 
@@ -1176,7 +1411,7 @@ async function handlePassthrough(req, res, rawBody, body, urlPath)
         };
         try
         {
-            await pipeObservedAnthropicBody(upstream, res, body.stream !== false, recordUsage, body.model,
+            await pipeObservedAnthropicBody(upstream, res, body.stream === true, recordUsage, body.model,
                 event => rate.anthropic(event));
         }
         finally { rate.end(); }
@@ -1209,10 +1444,99 @@ const CLAUDE_OFFICIAL_MODELS = [
 
 // ------------------------------------------------------------- server ----
 
+const activeMessageRequests = new Map();
+const controlPlaneModels = new Map();
+const MAX_MESSAGE_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_CONTROL_PLANE_MODELS = 2048;
+const AUTO_MODE_SYSTEM_MARKER = 'security monitor for autonomous AI coding agents';
+
+function requestAgentKey(req)
+{
+    const session = String(req.headers['x-claude-code-session-id'] || '').trim();
+    if (!session) return null;
+    const agent = String(req.headers['x-claude-code-agent-id'] || 'root').trim() || 'root';
+    return `${session}\0${agent}`;
+}
+
+function systemText(body)
+{
+    if (typeof body?.system === 'string') return body.system;
+    if (!Array.isArray(body?.system)) return '';
+    return body.system.map(block => typeof block === 'string' ? block : block?.type === 'text' ? block.text || '' : '').join('\n');
+}
+
+function isAlternateModel(model)
+{
+    return !!(isOpenAI(model) || providerAdapters.resolve(model) || resolveCompatibleModel(model));
+}
+
+function inheritControlPlaneModel(req, body)
+{
+    const key = requestAgentKey(req);
+    if (!key || !body || typeof body.model !== 'string') return body;
+
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const lane = isSubagentRequest(body);
+    const agent = key.slice(key.indexOf('\0') + 1);
+    if (tools.length > 0 && (lane === false || (lane === true && agent !== 'root')))
+    {
+        controlPlaneModels.delete(key);
+        if (isAlternateModel(body.model))
+        {
+            controlPlaneModels.set(key, body.model);
+            while (controlPlaneModels.size > MAX_CONTROL_PLANE_MODELS)
+                controlPlaneModels.delete(controlPlaneModels.keys().next().value);
+        }
+        return body;
+    }
+
+    if (tools.length !== 0 || !systemText(body).includes(AUTO_MODE_SYSTEM_MARKER)) return body;
+    const model = controlPlaneModels.get(key);
+    if (!model || model === body.model) return body;
+    return { ...body, model };
+}
+
 const server = http.createServer((req, res) =>
 {
+    // First, before admission bookkeeping or any body is read: a browser page
+    // must not be able to spend credits or read state through this port.
+    if (rejectRequest(req, res, [req.socket.localPort, publicRouterPort()])) return;
+    const earlyPath = (req.url || '').split('?')[0];
+    let admissionKey = null;
+    if (req.method === 'POST' && earlyPath === '/v1/messages')
+    {
+        const session = String(req.headers['x-claude-code-session-id'] || '').trim();
+        const agent = String(req.headers['x-claude-code-agent-id'] || 'root').trim();
+        if (session) admissionKey = `${session}\0${agent}`;
+        if (admissionKey && activeMessageRequests.has(admissionKey))
+        {
+            req.resume();
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '2', Connection: 'close' });
+            res.end(errorBody('a request for this session agent is already in flight; retry shortly', 'rate_limit_error'));
+            return;
+        }
+        if (admissionKey)
+        {
+            const token = Symbol(admissionKey);
+            activeMessageRequests.set(admissionKey, token);
+            res.once('close', () => {
+                if (activeMessageRequests.get(admissionKey) === token) activeMessageRequests.delete(admissionKey);
+            });
+        }
+    }
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let bodyBytes = 0;
+    req.on('data', (c) => {
+        bodyBytes += c.length;
+        if (bodyBytes > MAX_MESSAGE_BODY_BYTES)
+        {
+            res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+            res.end(errorBody('request body exceeds the 64 MiB router limit', 'invalid_request_error'));
+            req.destroy();
+            return;
+        }
+        chunks.push(c);
+    });
 
     req.on('end', async () =>
     {
@@ -1227,6 +1551,17 @@ const server = http.createServer((req, res) =>
 
         try
         {
+            if (req.method === 'POST' && urlPath === '/v1/messages' && body)
+            {
+                const originalModel = body.model;
+                body = inheritControlPlaneModel(req, body);
+                if (body.model !== originalModel)
+                {
+                    rawBody = Buffer.from(JSON.stringify(body));
+                    log(`control-plane ${originalModel} -> ${body.model}`);
+                }
+            }
+
             if (['GET', 'HEAD'].includes(req.method) && serveDashboard(req, res, urlPath)) return;
 
             if (req.method === 'GET' && urlPath === '/usagez')
@@ -1292,6 +1627,70 @@ const server = http.createServer((req, res) =>
                 return;
             }
 
+            // The generic pool-pin control: find a loaded adapter that exposes
+            // the optional `poolPin` capability (a manual pool-wide diagnostic
+            // override) and drive it. The core knows only that capability --
+            // no backend specifics here. No adapter exposes it -> 501.
+            if (urlPath === '/poolpinz' && (req.method === 'GET' || req.method === 'POST'))
+            {
+                const cap = [...providerAdapters.adapters].map(a => a.poolPin).find(Boolean);
+                if (!cap)
+                {
+                    res.writeHead(501, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                    res.end(JSON.stringify({ error: { type: 'not_supported_error', message: 'no adapter exposes a pool pin' } }));
+                    return;
+                }
+                const jsonError = (status, type, message) => {
+                    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                    res.end(JSON.stringify({ error: { type, message } }));
+                };
+                try
+                {
+                    let value;
+                    if (req.method === 'GET')
+                    {
+                        value = await cap.status();
+                    }
+                    else
+                    {
+                        let body = {};
+                        try { body = JSON.parse(rawBody.toString('utf8') || '{}'); } catch { jsonError(400, 'invalid_request_error', 'body must be JSON'); return; }
+                        const action = body.action;
+                        if (action === 'pin')
+                        {
+                            const id = body.id;
+                            if (!Number.isSafeInteger(id) || id <= 0)
+                            {
+                                jsonError(400, 'invalid_request_error', 'pin requires a positive integer id');
+                                return;
+                            }
+                            value = await cap.pin(id);
+                        }
+                        else if (action === 'auto')
+                        {
+                            value = await cap.auto();
+                        }
+                        else
+                        {
+                            jsonError(400, 'invalid_request_error', 'action must be "pin" or "auto"');
+                            return;
+                        }
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                    res.end(JSON.stringify(value));
+                }
+                catch (error)
+                {
+                    // The adapter throws a client-validation error with a
+                    // status for an invalid/unknown target; surface that as 4xx.
+                    // Everything else is an upstream/application failure -> 502.
+                    const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500
+                        ? error.status : 502;
+                    jsonError(status, status === 502 ? 'upstream_error' : 'invalid_request_error',
+                        String(error?.message || 'pool pin failed').slice(0, 200));
+                }
+                return;
+            }
             if (req.method === 'GET' && urlPath === '/usage/api')
             {
                 const limits = requestURL.searchParams.get('scope') === 'claude'
@@ -1302,12 +1701,19 @@ const server = http.createServer((req, res) =>
                 // Spooled responses have to reach the segments before the
                 // snapshot reads them: the calibrator draws its responses from
                 // the durable store now, not from the in-memory tail.
-                accounting.sync(2);
-                const value = usageAnalytics.snapshot(limits, usage);
+                const requestedRange = requestURL.searchParams.get('range');
+                if (requestedRange) accounting.sync(2);
+                const value = (requestedRange ? usageAnalytics : liveUsageAnalytics).snapshot(limits, usage);
                 value.range = null;
-                try
+                // The compact usage bar requests live limits with no range. It
+                // neither displays nor consumes archival accounting, so treating
+                // an omitted range as "all" made every background refresh scan
+                // the entire quota archive on the inference event loop. Full
+                // accounting remains opt-in through the dashboard's explicit
+                // range selector.
+                if (requestedRange) try
                 {
-                    const rangeKey = requestURL.searchParams.get('range') || 'all';
+                    const rangeKey = requestedRange;
                     const tz = Number(requestURL.searchParams.get('tz_offset'));
                     const archive = accounting.query(rangeKey, Number.isFinite(tz) ? tz : 0);
                     value.range = { key: archive.key, start: archive.start, end: archive.end };
@@ -1376,21 +1782,24 @@ const server = http.createServer((req, res) =>
                 // reaches this process, so there is nothing here to redact.
                 res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
                     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+                const window = sessionId ? windowStore.status(sessionId) : null;
                 res.end(JSON.stringify({
                     version: 1,
                     settings: readContextSettings(),
                     backend: CODEX_BASE,
                     clientVersion: CODEX_CLIENT_VERSION,
-                    window: sessionId ? windowStore.status(sessionId) : null,
+                    window,
                     drift: contextHealth.drift,
-                    // Scoped to the session asked about, so the card cannot show
-                    // one session's window beside another session's activity.
-                    activity: (sessionId && contextStats.get(sessionId)) || null,
+                    // Activity is stored beside the window, so a hot worker swap
+                    // cannot turn real resets back into "none yet".
+                    activity: window?.activity || null,
                     lastError: contextHealth.lastError,
                 }));
                 return;
             }
 
+            // Worker diagnostics. The stable supervisor has its own /supervisorz
+            // liveness endpoint so a busy inference worker is never a daemon probe.
             if (urlPath === '/healthz')
             {
                 // Report whether the ChatGPT credential is readable without
@@ -1407,6 +1816,16 @@ const server = http.createServer((req, res) =>
                 }
                 catch (_) {}
 
+                const adapterHealth = providerAdapters.health();
+                // Adapters are resolved before built-in arms for inference, so
+                // contested ids must report the same owner here.
+                const modelRoutes = [
+                    ...adapterHealth.loaded.flatMap(adapter => adapter.modelRoutes || []),
+                    ...OPENAI_MODELS.map(model => ({ id: model.id, provider: 'openai',
+                        context: Number.isFinite(model.context) ? model.context : null })),
+                    ...CLAUDE_OFFICIAL_MODELS.map(model => ({ id: model.id, provider: 'claude',
+                        context: Number.isFinite(model.context) ? model.context : null })),
+                ];
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     ok: true,
@@ -1416,9 +1835,10 @@ const server = http.createServer((req, res) =>
                     chatgptOk,
                     chatgptExpiresIn,
                     models: OPENAI_MODELS.map((m) => m.id),
+                    modelRoutes,
                     compatible: compatibleStatus(),
                     // Adapters report readiness, never a credential value.
-                    adapters: providerAdapters.health(),
+                    adapters: adapterHealth,
                     providerSettings: readProviderSettings(),
                     compaction: { settings: readCompactionSettings(), api: '/compactionz' },
                     contextManagement: { settings: readContextSettings(), api: '/contextz',
@@ -1448,20 +1868,20 @@ const server = http.createServer((req, res) =>
 
             if (['GET', 'HEAD'].includes(req.method) && urlPath === '/v1/models')
             {
-                // Anthropic's own list and every adapter's live list are
-                // fetched together. An adapter whose backend is down
-                // contributes nothing rather than emptying the response, so
-                // the models the router serves locally always survive.
+                // Optional upstream model metadata must not make locally routed
+                // providers unavailable during an Anthropic outage. Bound this
+                // metadata request independently of inference retries.
                 const [upstream, adapterIds] = await Promise.all([
-                    fetchResilient(ANTHROPIC + req.url, {
+                    fetch(ANTHROPIC + req.url, {
                         method: 'GET',
+                        signal: AbortSignal.timeout(3000),
                         headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP_REQ.has(k.toLowerCase()))),
-                    }, 'anthropic-models', () => res.writableEnded || res.destroyed, undefined, log),
+                    }).then(async response => response.ok ? await response.json().catch(() => null) : (await response.body?.cancel(), null)).catch(() => null),
                     providerAdapters.modelIds(),
                 ]);
 
                 let payload = { data: [], has_more: false, first_id: null, last_id: null };
-                try { payload = await upstream.json(); } catch (_) {}
+                if (upstream && typeof upstream === 'object' && !Array.isArray(upstream)) payload = upstream;
                 if (!Array.isArray(payload.data)) payload.data = [];
 
                 for (const id of adapterIds)
@@ -1493,7 +1913,7 @@ const server = http.createServer((req, res) =>
             const adapter = body ? providerAdapters.resolve(body.model) : null;
             if (adapter)
             {
-                const adapterBody = stripCheckpointMarkers(body);
+                const adapterBody = stripCheckpointMarkers(stripContextResetMarkers(body));
                 if (urlPath.endsWith('/count_tokens'))
                 {
                     // count_tokens is optional on the adapter interface. Without
@@ -1544,11 +1964,24 @@ const server = http.createServer((req, res) =>
                 if (urlPath.endsWith('/count_tokens'))
                 {
                     const settings = readProviderSettings();
+                    const contextSettings = readContextSettings();
                     const sessionId = req.headers['x-claude-code-session-id'];
+                    const subagent = isSubagentRequest(body);
+                    const state = contextSettings.enabled && contextSettings.windowReset
+                        && subagent !== true && typeof sessionId === 'string'
+                        ? windowStore.ensure(sessionId) : null;
                     const selection = resolvePromptPolicy(body, 'openai', settings, sessionId);
-                    const { req: payload } = buildResponsesRequest(body, settings, selection, {
-                        restoreCompaction: restoreForSession(sessionId),
+                    const built = buildResponsesRequest(body, settings, selection, {
+                        restoreCompaction: restoreForSession(sessionId, subagent !== true),
                     });
+                    let payload = built.req;
+                    const compacted = built.restoration?.windowCuts?.some(cut => windowCutsMatch(cut, state?.cut));
+                    // Claude Code asks this endpoint before deciding whether to
+                    // compact. Count the same post-cut transcript inference will
+                    // receive, or an old window can immediately trigger another
+                    // client compaction after new_context.
+                    if (state?.cut && !built.restoration?.resetIds?.length && !compacted)
+                        payload = { ...payload, input: applyWindowCut(payload.input, state.cut).input };
                     const input_tokens = await estimateOpenAIInput(payload);
                     res.writeHead(200, { 'Content-Type': 'application/json',
                         'X-Cuimod-Token-Count-Source': 'o200k_base-estimate', ...promptPolicyHeaders(selection) });
@@ -1556,6 +1989,7 @@ const server = http.createServer((req, res) =>
                     return;
                 }
 
+                if (urlPath === '/v1/messages' && await handleContextCompaction(req, res, body)) return;
                 if (urlPath === '/v1/messages' && await handleCodexCompaction(req, res, body)) return;
                 await handleOpenAI(req, res, body);
                 return;
@@ -1569,8 +2003,9 @@ const server = http.createServer((req, res) =>
             const gone = res.destroyed || e?.message === 'client disconnected' || (e?.name === 'AbortError' && res.writableEnded);
 
             if (Number.isInteger(e?.statusCode) && e.statusCode >= 400 && e.statusCode <= 599 && !res.headersSent) {
+                const errorType = e.errorType || (e.statusCode === 400 ? 'invalid_request_error' : 'api_error');
                 res.writeHead(e.statusCode, { 'Content-Type': 'application/json' });
-                res.end(errorBody(e.message, e.statusCode === 400 ? 'invalid_request_error' : 'api_error'));
+                res.end(errorBody(e.message, errorType));
                 return;
             }
 

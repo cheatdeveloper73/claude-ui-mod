@@ -20,6 +20,10 @@ let host = null, shadow = null, bar = null, sheet = null;
 let timer = null;
 let raf = 0;
 let compactToggleBusy = false;
+let compactToggleOwner = null;
+let compactToggleWant = null;
+let compactToggleUntil = 0;
+let rendererDisposed = false;
 const ringOriginal = new WeakMap();
 
 function el(tag, cls, text) {
@@ -38,7 +42,7 @@ function short(value) {
     return String(value);
 }
 
-function formatCountdown(value) {
+function formatCountdown(value, includeMinuteWithDays = false) {
     if (value === null || value === undefined || value === '') return '';
     let seconds = 0;
     if (typeof value === 'number') {
@@ -52,7 +56,7 @@ function formatCountdown(value) {
     const days = Math.floor(seconds / 86400);
     const hours = Math.floor((seconds % 86400) / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
-    if (days) return days + 'd ' + hours + 'h';
+    if (days) return days + 'd ' + hours + 'h' + (includeMinuteWithDays ? ' ' + minutes + 'm' : '');
     if (hours) return hours + 'h ' + minutes + 'm';
     return Math.max(1, minutes) + 'm';
 }
@@ -143,7 +147,8 @@ const HOST_CSS = (value) => `
 .wrap {
     position: fixed; z-index: 50; display: flex; align-items: center; justify-content: center;
     pointer-events: none; opacity: 0; transform: translateY(3px);
-    transition: opacity 220ms cubic-bezier(.2,.85,.3,1), transform 220ms cubic-bezier(.2,.85,.3,1);
+    /* This state is often set while the window is hidden, where transitions freeze. */
+    transition: none;
 }
 .wrap.show { opacity: 1; transform: none; }
 ${barCss('', value)}
@@ -191,11 +196,21 @@ function paintComposer() {
 
     const toggle = bar.querySelector('.compact-toggle');
     const enabled = context?.isAutoCompactEnabled === true;
+    if (compactToggleWant && context && compactToggleWant.sessionId === desktopSessionId()
+        && context.isAutoCompactEnabled === compactToggleWant.enabled) {
+        compactToggleWant = null;
+        compactToggleUntil = 0;
+    } else if (compactToggleWant && Date.now() > compactToggleUntil) {
+        compactToggleWant = null;
+        compactToggleUntil = 0;
+    }
     toggle.classList.toggle('on', enabled);
-    toggle.disabled = compactToggleBusy || !desktopSessionId();
-    toggle.title = enabled
-        ? 'Auto-compact is on for this session · click to turn it off'
-        : 'Auto-compact is off for this session · click to turn it on at this model’s native window';
+    toggle.disabled = compactToggleBusy || !!compactToggleWant || !desktopSessionId();
+    toggle.title = compactToggleWant
+        ? 'Change accepted · waiting for this worker to report its effective state'
+        : enabled
+            ? 'Auto-compact is on for this session · click to turn it off'
+            : 'Auto-compact is off for this session · click to turn it on at this model’s native window';
     toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
 }
 
@@ -204,32 +219,48 @@ function saveSessionOverride(cliSessionId, enabled) {
     const registry = globalThis.__cuimodReg;
     const spec = registry?.specs?.get('auto-compact');
     if (!spec || typeof registry.set !== 'function') return;
-    // `window: 0` means the worker's own auto window. This is an explicit
-    // per-session choice, so a resumed session gets the same full-context mode.
+    // Record the enablement and nothing else. Writing `window: 0` alongside it
+    // read as a deliberate "auto" choice everywhere the override is consulted,
+    // which masked the per-model table and the launch flag for every session
+    // this button had ever touched. Any window already stored stays.
     const stored = (registry.get?.('auto-compact')?.sessionOverrides) || {};
-    registry.set('auto-compact', 'sessionOverrides', { ...stored, [cliSessionId]: { enabled, window: 0 } });
+    const held = Number(stored[cliSessionId]?.window || 0);
+    registry.set('auto-compact', 'sessionOverrides', {
+        ...stored,
+        [cliSessionId]: held > 0 ? { enabled, window: held } : { enabled },
+    });
 }
 
 async function toggleAutoCompact() {
-    if (compactToggleBusy) return;
+    if (compactToggleBusy || compactToggleWant) return;
     const sessionId = desktopSessionId();
+    const cliSessionId = cuimod.sessionId;
     const current = data.ctx;
     if (!sessionId || typeof current?.isAutoCompactEnabled !== 'boolean') return;
+    const owner = { generation: refreshGeneration, sessionId };
+    compactToggleOwner = owner;
     compactToggleBusy = true;
     paintComposer();
     try {
         const enabled = !current.isAutoCompactEnabled;
-        const result = await cuimod.rpc('auto-compact.apply', { sessionId, enabled, window: null });
+        const result = await within(cuimod.rpc('auto-compact.apply', { sessionId, enabled, window: null }));
         if (!result?.applied) throw new Error(result?.reason || 'worker unavailable');
-        saveSessionOverride(result.cliSessionId || cuimod.sessionId, enabled);
-        // The button remains in its old state until this worker answers its
-        // normal state query. A successful control response is not displayed as
-        // a resolved state by itself.
-        await refresh(true);
+        // A returned CLI id belongs to the worker that accepted the event even if
+        // the view moved away. Without it, only the captured current owner is a
+        // safe persistence key; the new view's cuimod.sessionId is unrelated.
+        const target = result.cliSessionId || (refreshOwned(owner) ? cliSessionId : null);
+        saveSessionOverride(target, enabled);
+        if (!refreshOwned(owner)) return;
+        compactToggleWant = { sessionId, enabled };
+        compactToggleUntil = Date.now() + 12000;
+        refresh(true);
     } catch (_) {
+        if (!refreshOwned(owner)) return;
         const button = bar?.querySelector('.compact-toggle');
         if (button) button.title = 'Auto-compact change was not accepted by this worker';
     } finally {
+        if (compactToggleOwner !== owner) return;
+        compactToggleOwner = null;
         compactToggleBusy = false;
         paintComposer();
     }
@@ -357,11 +388,47 @@ function openAIRows() {
     return { rows, error: rows.length ? '' : 'OpenAI returned no rate-limit windows' };
 }
 
+// Some adapters report one subscription with shared rolling windows, rather
+// than the per-account pool shape used by other providers.
+function subscriptionRows() {
+    const usage = data.pool;
+    if (!usage || usage.error) return { rows: [], error: usage?.error || 'Subscription usage is unavailable' };
+    const rows = [];
+    const add = (window, key, label, includeMinuteWithDays = false) => {
+        const used = window?.used;
+        const cap = window?.cap;
+        if (!Number.isFinite(used) || !Number.isFinite(cap) || cap <= 0) return;
+        rows.push({
+            key,
+            label,
+            pct: Math.max(0, Math.min(100, used / cap * 100)),
+            reset: window.resetAt ? 'Resets in ' + formatCountdown(window.resetAt, includeMinuteWithDays) : '',
+            insight: { text: '' },
+        });
+    };
+    add(usage.windowLimits?.fiveHour, 'five-hour', '5-hour limit');
+    add(usage.windowLimits?.weekly, 'weekly', 'Weekly · all models', true);
+    return { rows, error: rows.length ? '' : 'Provider returned no rolling-window limits' };
+}
+
 // An adapter provider backed by several accounts. Each active account gets a
 // row; the ring shows the one the scheduler would actually pick.
 function poolRows(model, provider) {
     const usage = data.pool;
     if (!Array.isArray(usage?.accounts)) return { rows: [], error: usage?.error || 'Account usage is unavailable' };
+    if (usage.poolMeter?.missingUsedPercent === 0) {
+        const accounts = usage.accounts.filter(account => account?.status === 'active' && account.schedulable === true);
+        if (!accounts.length) return { rows: [], error: 'No schedulable accounts' };
+        const used = accounts.reduce((sum, account) => {
+            const percent = quotaFor(account, model)?.value?.utilization;
+            return sum + (Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0);
+        }, 0) / accounts.length;
+        return { rows: [{
+            key: 'pool', label: `${usage.poolMeter.label} · ${accounts.length} account${accounts.length === 1 ? '' : 's'}`,
+            pct: used, percentLabel: used.toLocaleString(undefined, { maximumFractionDigits: 1 }) + '%',
+            schedulable: true, insight: { text: '' },
+        }], error: '' };
+    }
     const rows = usage.accounts
         .filter((account) => account?.status === 'active')
         .map((account) => {
@@ -369,7 +436,8 @@ function poolRows(model, provider) {
             if (!quota?.value || typeof quota.value.utilization !== 'number') return null;
             return {
                 key: String(account.id),
-                label: (account.name || 'Account ' + account.id) + (account.tier ? ' · ' + account.tier : ''),
+                label: (account.name || 'Account ' + account.id) + (account.tier ? ' · ' + account.tier : '')
+                    + (quota.value.windowSeconds >= 6 * 86400 ? ' · Weekly' : ''),
                 pct: quota.value.utilization,
                 reset: quota.value.resetTime ? 'Resets in ' + formatCountdown(quota.value.resetTime) : '',
                 remaining: quota.value.remainingFraction,
@@ -378,7 +446,11 @@ function poolRows(model, provider) {
             };
         })
         .filter(Boolean);
-    return { rows, error: rows.length ? '' : 'No active account has a quota for ' + providerName(provider, model) };
+    const unmeasured = usage.accounts.filter(account => account?.status === 'active' && account.schedulable === true).length
+        - rows.filter(row => row.schedulable === true).length;
+    const notice = unmeasured > 0 && usage.quotaLabel
+        ? `${unmeasured} schedulable account${unmeasured === 1 ? '' : 's'} ${unmeasured === 1 ? 'has' : 'have'} no ${usage.quotaLabel} reading` : '';
+    return { rows, notice, error: rows.length || notice ? '' : 'No active account has a quota for ' + providerName(provider, model) };
 }
 
 function snapshot() {
@@ -389,13 +461,16 @@ function snapshot() {
     const provider = providerOfModel(model);
     let result;
     if (provider === 'openai') result = openAIRows();
+    else if (data.pool?.windowLimits) result = subscriptionRows();
     else if (provider !== 'claude') result = poolRows(model, provider);
     else result = { rows: claudeRows(model), error: '' };
 
     const rows = result.rows || [];
     // The popover exposes every active account. A disabled scheduler slot
     // cannot serve the next request, so it cannot make the ring look healthier.
-    const pooled = provider !== 'openai' && provider !== 'claude';
+    // A single subscription has multiple windows instead; its ring shows the
+    // most consumed window, as Claude and OpenAI do.
+    const pooled = Array.isArray(data.pool?.accounts);
     const eligibleRows = pooled ? rows.filter((row) => row.schedulable !== false) : rows;
     const ringRows = eligibleRows.length ? eligibleRows : rows;
     const ringRow = pooled
@@ -409,6 +484,7 @@ function snapshot() {
             : providerName(provider, model),
         rows,
         ringRow,
+        notice: result.notice || '',
         error: result.error || '',
     };
 }
@@ -454,7 +530,7 @@ function syncRing() {
     }
 
     if (!ringOriginal.has(button)) ringOriginal.set(button, { aria: button.getAttribute('aria-label') });
-    const aria = ['Usage: ' + picked.title + ': ' + Math.round(row.pct) + '%', row.reset]
+    const aria = ['Usage: ' + picked.title + ': ' + (row.percentLabel || Math.round(row.pct) + '%'), row.reset, picked.notice]
         .filter(Boolean).join(', ');
     setAttribute(button, 'aria-label', aria);
     setAttribute(button, 'data-cuimod-provider-usage', picked.provider);
@@ -483,7 +559,7 @@ function restoreRing() {
 }
 
 function usagePopover(node) {
-    return node && /Context window|Plan usage limits/.test(node.textContent || '') ? node : null;
+    return node && /Context window|(?:Plan|Your) usage limits/.test(node.textContent || '') ? node : null;
 }
 
 function restorePlan(popover, keepCustom = false) {
@@ -503,7 +579,10 @@ function planBlock(divider) {
     for (let node = divider.nextElementSibling; node; node = node.nextElementSibling) {
         if (node.hasAttribute('data-cuimod-provider-limits')) continue;
         if (node.hasAttribute('data-cuimod-native-plan')) return node;
-        if (/Plan usage limits/.test(node.textContent || '')) return node;
+        // The heading reads "Your usage limits" instead of "Plan usage limits"
+        // on some plans (app 2.7032.0), so the testid is the primary anchor.
+        if (node.getAttribute('data-testid') === 'usage-ring-plan') return node;
+        if (/(?:Plan|Your) usage limits/.test(node.textContent || '')) return node;
     }
     return null;
 }
@@ -539,7 +618,7 @@ function setText(node, value) {
     if (node.textContent !== value) node.textContent = value;
 }
 
-function paintLimitRows(container, rows, error) {
+function paintLimitRows(container, rows, error, notice) {
     const live = new Map(Array.from(container.querySelectorAll('[data-cuimod-limit-row]'))
         .map((node) => [node.getAttribute('data-cuimod-limit-row'), node]));
     const used = new Set();
@@ -567,11 +646,14 @@ function paintLimitRows(container, rows, error) {
         }
         const [label, right] = node.querySelector('.flex.items-baseline').children;
         setText(label, row.label);
-        setText(right, [row.reset, Math.round(row.pct) + '%'].filter(Boolean).join(' · '));
+        const percentText = row.percentLabel || Math.round(row.pct) + '%';
+        setText(right, [row.reset, percentText].filter(Boolean).join(' · '));
         const insight = node.querySelector('.cuimod-limit-insight');
-        setText(insight, row.insight?.text || 'Learning burn rate and tokens per 1%');
+        const insightText = row.insight?.text ?? 'Learning burn rate and tokens per 1%';
+        setText(insight, insightText);
+        insight.hidden = !insightText;
         const track = node.querySelector('[role="progressbar"]');
-        setAttribute(track, 'aria-valuetext', Math.round(row.pct) + '%');
+        setAttribute(track, 'aria-valuetext', percentText);
         const fill = track.firstElementChild;
         const width = (clamp01(row.pct / 100) * 100).toFixed(2) + '%';
         requestAnimationFrame(() => { setStyle(fill, 'width', width); });
@@ -580,13 +662,14 @@ function paintLimitRows(container, rows, error) {
 
     for (const [key, node] of live) if (!used.has(key)) node.remove();
     let status = container.querySelector('[data-cuimod-limit-status]');
-    if (!rows.length && error) {
+    const message = notice || (!rows.length ? error : '');
+    if (message) {
         if (!status) {
             status = el('div', 'px-lg pb-xs text-footnote text-muted');
             status.setAttribute('data-cuimod-limit-status', '1');
             container.append(status);
         }
-        setText(status, error);
+        setText(status, message);
     } else if (status) status.remove();
 }
 
@@ -608,12 +691,15 @@ function transformPopover(popover) {
     // So for Claude only the bars go, and our section takes their place under
     // the header. Failing to build rows leaves the app's bars alone.
     const plan = planBlock(divider);
-    const planRows = plan && plan.children.length > 1 ? plan.lastElementChild : null;
+    // The window rows are flat siblings of the header, not one wrapper.
+    const planRows = plan ? Array.from(plan.children).slice(1) : [];
     if (plan && picked.provider !== 'claude') hideNode(plan, 'data-cuimod-native-plan');
     else if (plan) {
         showNode(plan, 'data-cuimod-native-plan');
-        if (planRows && picked.rows.length) hideNode(planRows, 'data-cuimod-native-rows');
-        else if (planRows) showNode(planRows, 'data-cuimod-native-rows');
+        for (const row of planRows) {
+            if (picked.rows.length) hideNode(row, 'data-cuimod-native-rows');
+            else showNode(row, 'data-cuimod-native-rows');
+        }
     }
     const anchor = plan && picked.provider === 'claude' ? plan : divider;
 
@@ -632,13 +718,13 @@ function transformPopover(popover) {
         custom.append(header, el('div', 'flex flex-col gap-sm px-lg pb-xs'));
         // The selection can change while the popover is closed, and a stale
         // model would scope these rows to the wrong one until the next refresh.
-        pullNative().then(syncNativeUsage);
+        refresh(true);
     }
     if (custom.previousElementSibling !== anchor) anchor.after(custom);
 
     const header = custom.firstElementChild;
     setText(header.firstElementChild, 'Usage intelligence · ' + picked.title);
-    paintLimitRows(custom.lastElementChild, picked.rows, picked.error);
+    paintLimitRows(custom.lastElementChild, picked.rows, picked.error, picked.notice);
 }
 
 function syncNativeUsage() {
@@ -670,57 +756,150 @@ function desktopSessionId() {
     return match ? 'local_' + match[0].toLowerCase() : null;
 }
 
-let pullingNative = false;
-async function pullNative() {
-    if (pullingNative) return;
-    pullingNative = true;
-    try { data.native = await cuimod.rpc('usage-bar.native'); }
-    catch (_) { /* Page-world state is unreadable while the host reloads. */ }
-    finally { pullingNative = false; }
-}
-
-let pulling = false;
+const REQUEST_TIMEOUT_MS = 5000;
+let refreshGeneration = 0;
+let refreshFlight = null;
+let refreshQueued = false;
+let refreshQueuedLimits = false;
+let observedDesktopId = desktopSessionId();
+let observedCliSessionId = cuimod.sessionId || null;
 let lastLimitsAt = 0;
 let lastLimitsProvider = null;
 let lastLimitsModel = null;
+
+function within(promise, ms = REQUEST_TIMEOUT_MS) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('usage observation timed out')), ms);
+    });
+    return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+function refreshOwned(owner) {
+    return !rendererDisposed && owner.generation === refreshGeneration
+        && owner.sessionId === observedDesktopId && owner.sessionId === desktopSessionId();
+}
+
+function clearProviderObservation() {
+    data.native = null;
+    data.openai = null;
+    data.pool = null;
+    data.analytics = null;
+    data.provider = null;
+    lastLimitsAt = 0;
+    lastLimitsProvider = null;
+    lastLimitsModel = null;
+}
+
+function invalidateObservation(nextDesktopId = desktopSessionId(), nextCliSessionId = cuimod.sessionId || null) {
+    refreshGeneration++;
+    refreshFlight = null;
+    refreshQueued = false;
+    refreshQueuedLimits = false;
+    observedDesktopId = nextDesktopId;
+    observedCliSessionId = nextCliSessionId;
+    data.ctx = null;
+    clearProviderObservation();
+    compactToggleOwner = null;
+    compactToggleBusy = false;
+    compactToggleWant = null;
+    compactToggleUntil = 0;
+    paintComposer();
+    syncNativeUsage();
+}
+
+function syncObservationIdentity() {
+    const id = desktopSessionId();
+    if (id === observedDesktopId) return false;
+    invalidateObservation(id, cuimod.sessionId || null);
+    return true;
+}
+
 async function refresh(forceLimits = false) {
-    if (pulling) return;
-    pulling = true;
-    try {
-        const id = desktopSessionId();
-        data.ctx = id ? await cuimod.appInvoke(CTX_CHANNEL, id) : null;
-    } catch (_) {
-        data.ctx = null;
+    syncObservationIdentity();
+    const generation = refreshGeneration;
+    if (refreshFlight?.generation === generation) {
+        refreshQueued = true;
+        refreshQueuedLimits = refreshQueuedLimits || forceLimits;
+        return refreshFlight.promise;
     }
 
-    await pullNative();
+    const owner = { generation, sessionId: observedDesktopId, promise: null };
+    const run = Promise.resolve().then(async () => {
+        let context = null;
+        try {
+            context = owner.sessionId ? await within(cuimod.appInvoke(CTX_CHANNEL, owner.sessionId)) : null;
+        } catch (_) {
+            if (!refreshOwned(owner)) return false;
+        }
+        if (!refreshOwned(owner)) return false;
+        data.ctx = context;
+        paintComposer();
 
-    try {
+        let native = data.native;
+        try { native = await within(cuimod.rpc('usage-bar.native')); }
+        catch (_) { /* Page-world state is unreadable while the host reloads. */ }
+        if (!refreshOwned(owner)) return false;
+        const before = data.native?.model || null;
+        data.native = native;
         const model = data.native?.model || data.ctx?.model || null;
+        if (before !== model || (lastLimitsModel && lastLimitsModel !== model)) clearProviderObservation();
+        data.native = native;
+
         const provider = providerOfModel(model);
         const due = forceLimits || provider !== lastLimitsProvider || model !== lastLimitsModel
             || Date.now() - lastLimitsAt >= 30000;
         if (due) {
-            const limits = await cuimod.rpc('usage-bar.allLimits', { providers: provider !== 'claude', model });
-            if (limits?.plan) data.plan = limits.plan;
-            if (limits?.openai) data.openai = limits.openai;
-            if (limits?.pool) data.pool = limits.pool;
-            if (limits?.provider) data.provider = limits.provider;
-            if (limits?.analytics) data.analytics = limits.analytics;
-            lastLimitsAt = Date.now();
-            lastLimitsProvider = provider;
-            lastLimitsModel = model;
+            try {
+                const limits = await within(cuimod.rpc('usage-bar.allLimits', { model }));
+                if (!refreshOwned(owner)) return false;
+                // The composer can switch models while the slower provider-limit
+                // request is pending. Re-read its authoritative page-world state
+                // before associating those limits with the selected model.
+                const confirmedNative = await within(cuimod.rpc('usage-bar.native'));
+                if (!refreshOwned(owner)) return false;
+                const confirmedModel = confirmedNative?.model || data.ctx?.model || null;
+                if (confirmedModel !== model) {
+                    clearProviderObservation();
+                    data.native = confirmedNative;
+                    refreshQueued = true;
+                    refreshQueuedLimits = true;
+                    return false;
+                }
+                data.native = confirmedNative;
+                if (limits?.plan) data.plan = limits.plan;
+                if (limits?.openai) data.openai = limits.openai;
+                if (limits?.pool) data.pool = limits.pool;
+                if (limits?.provider) data.provider = limits.provider;
+                if (limits?.analytics) data.analytics = limits.analytics;
+                lastLimitsAt = Date.now();
+                lastLimitsProvider = provider;
+                lastLimitsModel = model;
+            } catch (_) {
+                if (!refreshOwned(owner)) return false;
+                // The last same-model snapshot remains useful while its main
+                // plugin reloads; a changed model cleared it above.
+            }
         }
-    } catch (_) {
-        // The last provider snapshot remains useful while its main plugin reloads.
-    }
 
-    try {
         paintComposer();
         syncNativeUsage();
-    } finally {
-        pulling = false;
-    }
+        return true;
+    }).finally(() => {
+        // Retired completions cannot unlock, repaint or reschedule the current
+        // visit. Only the owner installed in refreshFlight may do that.
+        if (refreshFlight !== owner) return;
+        refreshFlight = null;
+        if (refreshQueued && refreshOwned(owner)) {
+            const force = refreshQueuedLimits;
+            refreshQueued = false;
+            refreshQueuedLimits = false;
+            queueMicrotask(() => refresh(force));
+        }
+    });
+    owner.promise = run;
+    refreshFlight = owner;
+    return run;
 }
 
 const ROW_MAX_DEPTH = 8;
@@ -733,7 +912,7 @@ function rowFrom(group) {
 }
 
 function rowIn(scope) {
-    for (const group of scope.querySelectorAll('[class*="ml-auto"]')) {
+    for (const group of scope.querySelectorAll('[class*="ml-auto"], [class*="ms-auto"]')) {
         const found = rowFrom(group);
         if (found) return found;
     }
@@ -766,6 +945,14 @@ function place() {
         if (child === found.right) break;
         const rect = child.getBoundingClientRect();
         if (rect.width > 0) leftEdge = Math.max(leftEdge, rect.right);
+    }
+    const voiceHost = document.getElementById('cuimod-voice-agent');
+    const voicePill = voiceHost?.shadowRoot?.querySelector('.pill.on');
+    const voiceRect = voicePill?.getBoundingClientRect();
+    if (voiceRect && voiceRect.width > 0
+        && voiceRect.bottom > found.rowRect.top && voiceRect.top < found.rowRect.bottom
+        && voiceRect.right > found.rowRect.left && voiceRect.left < found.rightRect.left) {
+        leftEdge = Math.max(leftEdge + voiceRect.width + 8, voiceRect.right);
     }
     const left = Math.round(leftEdge + GAP);
     const width = Math.round(found.rightRect.left - GAP - left);
@@ -825,16 +1012,34 @@ nativeStyle.id = STYLE_ID;
 
 ctx.track(window, 'resize', schedule, { passive: true });
 ctx.track(window, 'scroll', schedule, { passive: true, capture: true });
+ctx.track(window, 'cuimod:voice-layout', place);
 ctx.track(document, 'visibilitychange', schedule);
 ctx.observe(document.documentElement, { childList: true, subtree: true }, () => {
     schedule();
     scanBands();
     syncNativeUsage();
 });
-ctx.every(1000, () => { place(); syncNativeUsage(); });
+ctx.every(1000, () => {
+    if (syncObservationIdentity()) refresh(true);
+    place();
+    syncNativeUsage();
+});
 ctx.every(8000, () => { scanBands(); refresh(); });
-cuimod.onSessionChange(() => { lastLimitsAt = 0; refresh(true); });
+cuimod.onSessionChange((cliSessionId) => {
+    const desktopId = desktopSessionId();
+    const nextCli = cliSessionId || null;
+    if (desktopId !== observedDesktopId || nextCli !== observedCliSessionId)
+        invalidateObservation(desktopId, nextCli);
+    refresh(true);
+});
 ctx.onDispose(() => {
+    rendererDisposed = true;
+    refreshGeneration++;
+    refreshFlight = null;
+    refreshQueued = false;
+    compactToggleOwner = null;
+    compactToggleBusy = false;
+    compactToggleWant = null;
     if (raf) cancelAnimationFrame(raf);
     clearInterval(timer);
     try { host?.remove(); } catch (_) {}

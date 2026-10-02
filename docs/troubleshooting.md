@@ -29,11 +29,11 @@ accounts for the delay while `preflight`, `mcp`, and `query` are short, inspect
 the CLI startup log (`--debug-file <local-file>`), not just the router log.
 The first model request can be waiting behind an MCP initialization timeout.
 
-On Desktop 1.26832.0 / CLI 2.1.222, the home-directory `.mcp.json` loaded
-`godot-mcp` into unrelated projects. Its server awaited an editor WebSocket
-connection on port 9080 before starting MCP stdio. With no editor running,
+On Desktop 1.26832.0 / CLI 2.1.222, a home-directory `.mcp.json` loaded
+an editor-bridge MCP server into unrelated projects. That server awaited an
+editor WebSocket connection before starting MCP stdio. With no editor running,
 the CLI waited 30,000 ms for the MCP handshake, then sent the first request.
-The fix in the local `godot-mcp` repository starts MCP immediately and uses
+The fix in that server's own repository starts MCP immediately and uses
 the existing `sendCommand()` connection-on-demand path. Tools remain available;
 no global timeout, routing, credential, or permission change is needed.
 

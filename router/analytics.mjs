@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PRICING_FINGERPRINT, RATES, pricedModels } from './pricing.mjs';
 
 // Claude's own history file records utilization but never reset times, so a
 // Claude window could not tell whether it would exhaust or simply reset. The
@@ -215,6 +216,7 @@ export function normalizeLimitRows(limits, claude)
         const aliases = Array.isArray(snapshot.modelAliases) ? snapshot.modelAliases : [];
         const poolLabel = typeof snapshot.poolLabel === 'string' ? snapshot.poolLabel : `${provider} pool`;
         const poolScope = typeof snapshot.poolScope === 'string' ? snapshot.poolScope : null;
+        const historyVersion = Number.isInteger(snapshot.historyVersion) ? snapshot.historyVersion : null;
         const pools = new Map();
 
         for (const account of snapshot.accounts)
@@ -241,7 +243,8 @@ export function normalizeLimitRows(limits, claude)
                     schedulable: account.status === 'active' && account.schedulable !== false,
                     status: account.status || null,
                     tier: account.tier || null,
-                    windowSeconds: null,
+                    windowSeconds: finite(quota.windowSeconds),
+                    historyVersion,
                     aggregate: false,
                     track: tracked ? tracked.has(model) : true,
                     aliases,
@@ -264,6 +267,7 @@ export function normalizeLimitRows(limits, claude)
             const usedPercent = members.reduce((sum, item) => sum + item.usedPercent, 0) / members.length;
             const resetTimes = members.map(item => iso(item.quota.resetTime)).filter(Boolean).sort();
             const fractions = members.map(item => finite(item.quota.remainingFraction)).filter(value => value !== null);
+            const windowSeconds = finite(members[0].quota.windowSeconds);
             rows.push({
                 key: `${provider}:pool:${model}`,
                 provider,
@@ -281,7 +285,9 @@ export function normalizeLimitRows(limits, claude)
                 source: snapshot.source || null,
                 exact: true,
                 schedulable: schedulable.length > 0,
-                windowSeconds: null,
+                windowSeconds: windowSeconds !== null && members.every(item => finite(item.quota.windowSeconds) === windowSeconds)
+                    ? windowSeconds : null,
+                historyVersion,
                 aggregate: true,
                 accountCount: members.length,
                 schedulableCount: schedulable.length,
@@ -401,10 +407,12 @@ export class LimitHistory
             const observedAt = iso(row.observedAt) || new Date().toISOString();
             const prior = this.latest.get(row.key);
             const same = prior && prior.usedPercent === row.usedPercent && prior.resetAt === row.resetAt
+                && (prior.historyVersion ?? null) === (row.historyVersion ?? null)
                 && Date.parse(observedAt) - Date.parse(prior.observedAt) < HISTORY_HEARTBEAT_MS;
             if (same) continue;
             const entry = { version: 1, key: row.key, provider: row.provider, model: row.model || null,
-                observedAt, usedPercent: row.usedPercent, resetAt: row.resetAt || null };
+                observedAt, usedPercent: row.usedPercent, resetAt: row.resetAt || null,
+                historyVersion: row.historyVersion ?? null };
             added.push(entry);
             this.rows.push(entry);
             this.latest.set(entry.key, entry);
@@ -586,7 +594,10 @@ export class UsageAnalytics
         }
         const events = this.calibrationEvents(now, usage);
         const enriched = meters.map(meter => {
-            const history = byKey.get(meter.key) || [];
+            // A provider may correct its quota units without rewriting durable
+            // observations. Keep the old samples for audit, never for forecasts.
+            const history = (byKey.get(meter.key) || []).filter(row =>
+                !Number.isInteger(meter.historyVersion) || row.historyVersion === meter.historyVersion);
             return { ...meter, forecast: forecastMeter(meter, history, now), calibration: calibrateMeter(meter, history, events, now),
                 history: history.slice(-128).map(row => ({ observedAt: row.observedAt, usedPercent: row.usedPercent })) };
         });
@@ -607,7 +618,11 @@ export class UsageAnalytics
                     }])),
             },
             meters: enriched,
-            usage,
+            // Pricing is a live in-memory table. It belongs on both the ranged
+            // dashboard snapshot and the range-less usage-bar snapshot without
+            // requiring an accounting archive scan.
+            usage: { ...usage,
+                pricing: { fingerprint: PRICING_FINGERPRINT, models: pricedModels(), rates: RATES } },
             limits,
         };
     }

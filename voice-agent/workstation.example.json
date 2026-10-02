@@ -1,0 +1,33 @@
+{
+  "host": "127.0.0.1",
+  "port": 18764,
+  "computeUrl": "http://127.0.0.1:18765",
+  "computeTokenFile": ".state/voice-agent/compute-token",
+  "sshHost": "compute-box.local",
+  "sshUser": "voice",
+  "sshPort": 22,
+  "sshIdentity": "~/.ssh/id_ed25519",
+  "computeRemotePort": 8765,
+  "inputDevice": null,
+  "wakeEnabled": true,
+  "wakePhrases": [
+    "hey agent"
+  ],
+  "stopPhrase": "green apple",
+  "armSeconds": 25,
+  "vadThreshold": 0.5,
+  "energyThreshold": 0.012,
+  "silenceMs": 700,
+  "preRollMs": 960,
+  "minimumSpeechMs": 224,
+  "segmentSeconds": 25,
+  "commandGraceMs": 1200,
+  "continuousJournal": false,
+  "journalChunkSeconds": 60,
+  "retentionDays": 30,
+  "emotionEnabled": true,
+  "cueEnabled": true,
+  "ttsEnabled": true,
+  "ttsVoice": "af_heart",
+  "ttsSpeed": 1.0
+}

@@ -44,7 +44,7 @@ function isTransient(err)
 // rate-limit into "no available accounts" for a full minute. Passing the status
 // straight back lets the Anthropic SDK's own backoff, which honours
 // Retry-After, do the waiting instead.
-async function fetchResilient(url, opts, label, clientGone, retryStatus = RETRY_STATUS, log = () => {})
+async function fetchResilient(url, opts, label, clientGone, retryStatus = RETRY_STATUS, log = () => {}, headersTimeoutMs = HEADERS_TIMEOUT_MS)
 {
     let last;
 
@@ -53,11 +53,12 @@ async function fetchResilient(url, opts, label, clientGone, retryStatus = RETRY_
         if (clientGone && clientGone()) throw new Error('client disconnected');
 
         const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), HEADERS_TIMEOUT_MS);
+        const timer = setTimeout(() => ac.abort(), headersTimeoutMs);
 
         try
         {
-            const res = await fetch(url, { ...opts, signal: ac.signal });
+            const signal = opts.signal ? AbortSignal.any([ac.signal, opts.signal]) : ac.signal;
+            const res = await fetch(url, { ...opts, signal });
             clearTimeout(timer);
 
             if (retryStatus.has(res.status) && attempt < MAX_ATTEMPTS)
@@ -241,6 +242,79 @@ function eventFromFrame(frame)
     try { return JSON.parse(data); } catch (_) { return null; }
 }
 
+// Reasoning-off is the one state where a missing detail has a known value. The
+// enabled path never calls this helper: if a provider omits its hidden-token
+// split, the omission remains unknown rather than being inferred from output.
+function zeroReasoningUsage(usage)
+{
+    if (!usage || typeof usage !== 'object') return usage;
+    const details = { ...(usage.output_tokens_details || {}), thinking_tokens: 0 };
+    if (Object.hasOwn(details, 'reasoning_tokens')) details.reasoning_tokens = 0;
+    return {
+        ...usage,
+        ...(Object.hasOwn(usage, 'thoughtsTokenCount') ? { thoughtsTokenCount: 0 } : {}),
+        output_tokens_details: details,
+    };
+}
+
+const isReasoningBlock = block => block?.type === 'thinking' || block?.type === 'redacted_thinking';
+
+function stripReasoningPayload(payload)
+{
+    if (!payload || typeof payload !== 'object') return payload;
+    return {
+        ...payload,
+        ...(Array.isArray(payload.content) ? { content: payload.content.filter(block => !isReasoningBlock(block)) } : {}),
+        ...(payload.usage ? { usage: zeroReasoningUsage(payload.usage) } : {}),
+    };
+}
+
+// A provider honoring the disabled request emits no thinking blocks. This
+// filter keeps the downstream contract true if a gateway echoes one anyway,
+// and compacts block indices so removing index zero cannot leave text at one.
+function noReasoningEventFilter()
+{
+    const suppressed = new Set();
+    const indices = new Map();
+    let nextIndex = 0;
+
+    return event => {
+        if (!event || typeof event !== 'object') return event;
+        if (event.type === 'message_start' && event.message)
+        {
+            return { ...event, message: stripReasoningPayload(event.message) };
+        }
+        if (event.type === 'message_delta')
+        {
+            return event.usage ? { ...event, usage: zeroReasoningUsage(event.usage) } : event;
+        }
+        if (event.type === 'content_block_start')
+        {
+            const source = event.index ?? 0;
+            if (isReasoningBlock(event.content_block)) { suppressed.add(source); return null; }
+            const target = nextIndex++;
+            indices.set(source, target);
+            return target === source ? event : { ...event, index: target };
+        }
+        if (event.type === 'content_block_delta')
+        {
+            const source = event.index ?? 0;
+            if (suppressed.has(source) || ['thinking_delta', 'signature_delta'].includes(event.delta?.type)) return null;
+            const target = indices.get(source);
+            return target === undefined || target === source ? event : { ...event, index: target };
+        }
+        if (event.type === 'content_block_stop')
+        {
+            const source = event.index ?? 0;
+            if (suppressed.delete(source)) return null;
+            const target = indices.get(source);
+            indices.delete(source);
+            return target === undefined || target === source ? event : { ...event, index: target };
+        }
+        return event;
+    };
+}
+
 // Stream the upstream body through untouched. A backend that already emits the
 // Anthropic SSE event sequence needs no re-framing -- and relaying rather than
 // collecting means first-token latency is the backend's, not ours.
@@ -319,15 +393,92 @@ async function pipeObservedAnthropicBody(upstream, res, streaming, onUsage, fall
     res.end();
 }
 
+function canonicalizeJson(value)
+{
+    if (Array.isArray(value)) return value.map(canonicalizeJson);
+    if (!value || typeof value !== 'object') return value;
+
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = canonicalizeJson(value[key]);
+    return out;
+}
+
+function toolCallSignature(name, input, rawInput = '')
+{
+    if (rawInput)
+    {
+        try { input = JSON.parse(rawInput); }
+        catch (_) { return `${name}\x1f${rawInput.trim()}`; }
+    }
+    return `${name}\x1f${JSON.stringify(canonicalizeJson(input || {}))}`;
+}
+
+function dedupeToolUsePayload(payload)
+{
+    if (!Array.isArray(payload?.content)) return { payload, duplicate: null };
+
+    const seen = new Set();
+    let duplicate = null;
+    const content = payload.content.filter(block => {
+        if (block?.type !== 'tool_use') return true;
+        const signature = toolCallSignature(block.name || '', block.input);
+        if (!seen.has(signature)) { seen.add(signature); return true; }
+        duplicate ||= block.name || 'unknown';
+        return false;
+    });
+
+    return duplicate ? { payload: { ...payload, content }, duplicate } : { payload, duplicate: null };
+}
+
+function cancelReaderOnResponseClose(reader, res)
+{
+    let canceled = false;
+    const cancel = () => {
+        if (canceled) return;
+        canceled = true;
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) {}
+    };
+    if (typeof res.once === 'function')
+    {
+        res.once('close', cancel);
+        res.once('error', cancel);
+    }
+    if (res.writableEnded || res.destroyed) cancel();
+    return {
+        canceled: () => canceled || res.writableEnded || res.destroyed,
+        dispose: () => {
+            if (typeof res.off === 'function')
+            {
+                res.off('close', cancel);
+                res.off('error', cancel);
+            }
+            else if (typeof res.removeListener === 'function')
+            {
+                res.removeListener('close', cancel);
+                res.removeListener('error', cancel);
+            }
+        },
+    };
+}
+
 // The backend sees the bare provider slug; retain the requested alias in the
 // Anthropic envelope so the native transcript matches the selected model.
-async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage, probe)
+async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage, probe, options = {})
 {
     if (!upstream.body) { res.end(); return; }
+    const reasoningEnabled = options.reasoningEnabled !== false;
+    const stopOnDuplicateToolCall = options.stopOnDuplicateToolCall === true;
+    const idleTimeoutMs = Number.isFinite(options.idleTimeoutMs) && options.idleTimeoutMs > 0
+        ? options.idleTimeoutMs
+        : 0;
 
     if (!streaming)
     {
-        const payload = await upstream.json();
+        let payload = await upstream.json();
+        let duplicate = null;
+        if (!reasoningEnabled) payload = stripReasoningPayload(payload);
+        if (options.payloadFilter) payload = options.payloadFilter(payload);
+        if (stopOnDuplicateToolCall) ({ payload, duplicate } = dedupeToolUsePayload(payload));
         if (payload && typeof payload === 'object')
         {
             if (payload.usage && payload.id) onUsage?.({ responseId: payload.id, servedModel: payload.model || clientModel,
@@ -336,58 +487,183 @@ async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage,
             if (payload.model) payload.model = clientModel;
         }
         res.end(JSON.stringify(payload));
-        return;
+        return duplicate ? { duplicateTool: duplicate, responseId: payload?.id || null, canceled: false } : null;
     }
 
     const reader = upstream.body.getReader();
+    const downstream = cancelReaderOnResponseClose(reader, res);
+    const readNext = async () => {
+        if (!idleTimeoutMs) return reader.read();
+        let timer;
+        try
+        {
+            return await Promise.race([
+                reader.read(),
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => {
+                        const error = new Error(`upstream stream produced no bytes for ${idleTimeoutMs}ms`);
+                        error.code = 'STREAM_IDLE_TIMEOUT';
+                        reject(error);
+                    }, idleTimeoutMs);
+                }),
+            ]);
+        }
+        finally { clearTimeout(timer); }
+    };
     const dec = new TextDecoder();
     const usage = anthropicUsageObserver(onUsage, clientModel);
-    const observe = event => { probe?.(event); usage(event); };
+    const filters = [reasoningEnabled ? null : noReasoningEventFilter(), options.eventFilter].filter(Boolean);
+    const seenToolCalls = new Set();
+    const pendingToolBlocks = new Map();
     let buffer = '';
+    let responseId = null;
+    let duplicateTool = null;
 
-    const writeFrame = async (frame) => {
-        if (!frame) return;
+    const prepareFrame = frame => {
+        if (!frame) return null;
         const lines = frame.split(/\r?\n/);
-        const data = lines.filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart()).join('\n');
-        if (data && data !== '[DONE]')
+        let event = eventFromFrame(frame);
+        let observedEvent = event;
+        if (event)
         {
-            try
+            for (const filter of filters)
             {
-                const event = JSON.parse(data);
-                observe(event);
-                // Anthropic's message_start carries the message, while a few
-                // terminal/non-stream paths carry model at the top level.
-                if (event.message && event.message.model) event.message.model = clientModel;
-                if (event.model) event.model = clientModel;
-                const i = lines.findIndex((l) => l.startsWith('data:'));
-                if (i !== -1) {
-                    lines.splice(i, lines.length - i, 'data: ' + JSON.stringify(event));
-                    frame = lines.join(String.fromCharCode(10));
-                }
+                event = filter(event);
+                if (!event) return null;
             }
-            catch (_) {}
+            observedEvent = event;
+            // Observe the provider's real model before changing only the client
+            // envelope. Accounting and the native transcript need different ids.
+            if (event.message?.model) event = { ...event, message: { ...event.message, model: clientModel } };
+            if (event.model) event = { ...event, model: clientModel };
+            const i = lines.findIndex(line => line.startsWith('data:'));
+            if (i !== -1)
+            {
+                lines.splice(i, lines.length - i, 'data: ' + JSON.stringify(event));
+                frame = lines.join(String.fromCharCode(10));
+            }
         }
-        if (!res.write(frame + String.fromCharCode(10, 10))) await new Promise((r) => res.once('drain', r));
+        return { event, observedEvent, frame };
     };
 
-    for (;;)
+    const writePrepared = async (prepared, observeUsage = true) => {
+        if (!prepared) return;
+        if (prepared.observedEvent || prepared.event)
+        {
+            const observedEvent = prepared.observedEvent || prepared.event;
+            probe?.(observedEvent);
+            if (observeUsage) usage(observedEvent);
+        }
+        if (!res.write(prepared.frame + String.fromCharCode(10, 10))) await new Promise(resolve => res.once('drain', resolve));
+    };
+
+    const processFrame = async frame => {
+        const prepared = prepareFrame(frame);
+        if (!prepared) return false;
+        const event = prepared.event;
+        if (!stopOnDuplicateToolCall || !event)
+        {
+            await writePrepared(prepared);
+            return false;
+        }
+
+        if (event.type === 'message_start') responseId = event.message?.id || responseId;
+        if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use')
+        {
+            pendingToolBlocks.set(event.index ?? 0, {
+                frames: [prepared],
+                name: event.content_block.name || '',
+                input: event.content_block.input || {},
+                rawInput: '',
+            });
+            return false;
+        }
+
+        const pending = pendingToolBlocks.get(event.index ?? 0);
+        if (pending)
+        {
+            pending.frames.push(prepared);
+            if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta')
+                pending.rawInput += event.delta.partial_json || '';
+            if (event.type !== 'content_block_stop') return false;
+
+            pendingToolBlocks.delete(event.index ?? 0);
+            const signature = toolCallSignature(pending.name, pending.input, pending.rawInput);
+            if (seenToolCalls.has(signature))
+            {
+                duplicateTool = pending.name || 'unknown';
+                return true;
+            }
+            seenToolCalls.add(signature);
+            for (const item of pending.frames) await writePrepared(item);
+            return false;
+        }
+
+        await writePrepared(prepared);
+        return false;
+    };
+
+    try
     {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (res.writableEnded || res.destroyed) { try { await reader.cancel(); } catch (_) {} return; }
-        buffer += dec.decode(value, { stream: true });
-        for (;;) {
-            const boundary = /\r?\n\r?\n/.exec(buffer);
-            if (!boundary) break;
-            const cut = boundary.index;
-            const frame = buffer.slice(0, cut);
-            buffer = buffer.slice(cut + boundary[0].length);
-            await writeFrame(frame);
+        outer: for (;;)
+        {
+            const { value, done } = await readNext();
+            if (done) break;
+            if (downstream.canceled()) return null;
+            buffer += dec.decode(value, { stream: true });
+            for (;;)
+            {
+                const boundary = /\r?\n\r?\n/.exec(buffer);
+                if (!boundary) break;
+                const frame = buffer.slice(0, boundary.index);
+                buffer = buffer.slice(boundary.index + boundary[0].length);
+                if (await processFrame(frame)) break outer;
+            }
         }
     }
-    buffer += dec.decode();
-    if (buffer) await writeFrame(buffer);
+    catch (error)
+    {
+        if (error?.code === 'STREAM_IDLE_TIMEOUT')
+        {
+            try { await reader.cancel(); } catch (_) {}
+            if (downstream.canceled()) return null;
+            const event = { type: 'error', error: { type: 'api_error', message: 'Upstream stream timed out waiting for output.' } };
+            await writePrepared({ event, observedEvent: event,
+                frame: `event: error\ndata: ${JSON.stringify(event)}` }, false);
+            res.end();
+            return { idleTimeout: true };
+        }
+        if (!downstream.canceled()) throw error;
+        return null;
+    }
+    finally { downstream.dispose(); }
+
+    if (downstream.canceled()) return null;
+
+    if (!duplicateTool)
+    {
+        buffer += dec.decode();
+        if (buffer) await processFrame(buffer);
+    }
+
+    if (duplicateTool)
+    {
+        try { await reader.cancel(); } catch (_) {}
+        // The duplicate block was never exposed. The first identical call is a
+        // complete valid block, so close the message as an ordinary tool turn
+        // and let its result drive a fresh provider response.
+        const delta = { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 0 } };
+        const stop = { type: 'message_stop' };
+        await writePrepared({ event: delta, frame: `event: message_delta\ndata: ${JSON.stringify(delta)}` }, false);
+        await writePrepared({ event: stop, frame: `event: message_stop\ndata: ${JSON.stringify(stop)}` }, false);
+        res.end();
+        return { duplicateTool, responseId, canceled: true };
+    }
+
+    for (const pending of pendingToolBlocks.values())
+        for (const item of pending.frames) await writePrepared(item);
     res.end();
+    return null;
 }
 
 export {
@@ -405,6 +681,9 @@ export {
     prepareProviderBody,
     anthropicUsageObserver,
     eventFromFrame,
+    zeroReasoningUsage,
+    stripReasoningPayload,
+    noReasoningEventFilter,
     pipeBody,
     pipeObservedAnthropicBody,
     pipeAnthropicBody,

@@ -370,6 +370,10 @@ const CSS = `
 }
 .cui-scroll::-webkit-scrollbar-corner { background: transparent; }
 
+/* Set while the same plugin is being re-rendered in place. The staggered
+ * entrance is a tab-switch gesture; replaying it under every click of a control
+ * that writes its own setting made the page flicker through its own arrival. */
+.scroll.still .sect, .scroll.still .group { animation: none; }
 .sect {
     animation: rowIn var(--d2) var(--e-out) both;
     animation-delay: calc(var(--i, 0) * 16ms);
@@ -1444,16 +1448,29 @@ function select(name) {
     out.finished.then(() => { renderMain(); out.cancel(); }, () => { renderMain(); });
 }
 
+// A plugin that writes one of its own settings comes back through REG.set,
+// which re-renders this page — so does every input event of a slider drag. The
+// page is rebuilt from scratch each time, and a rebuilt scroller starts at the
+// top: a click on a control halfway down the page threw the page back to its
+// first row. The scroll position and the entrance animations belong to the tab,
+// not to the value that changed, so both are held across a same-plugin render.
+let renderedPlugin = null;
+
 function renderMain() {
     if (!scroll || !mainHd) return;
+    const same = current != null && current === renderedPlugin;
+    const keep = same ? scroll.scrollTop : 0;
+    scroll.classList.toggle('still', same);
     mainHd.textContent = '';
     scroll.textContent = '';
 
     const spec = current && REG.specs.get(current);
     if (!spec) {
+        renderedPlugin = null;
         scroll.append(el('div', 'empty', 'No plugin has registered a settings panel.'));
         return;
     }
+    renderedPlugin = current;
 
     const tt = el('div', 'tt');
     tt.append(el('h2', null, spec.title || spec.plugin));
@@ -1501,6 +1518,8 @@ function renderMain() {
         scroll.append(box);
     }
 
+    // After the content is in, or there is nothing to scroll back to yet.
+    if (keep) scroll.scrollTop = keep;
     renderPreview(spec);
     refreshFades();
 }
@@ -1534,6 +1553,9 @@ function show() {
     build();
     open = true;
     firstPaint = true;
+    // Opening is an entrance, never a re-render: the rows play their stagger and
+    // the page starts where a freshly built scroller starts.
+    renderedPlugin = null;
     renderSidebar();
     renderMain();
     firstPaint = false;

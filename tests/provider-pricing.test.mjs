@@ -132,6 +132,22 @@ test('the newer Anthropic models price at their published rates', () => {
 test('the newer OpenAI models price at their published rates', () => {
     const usage = tokensOf({ inputTokens: 1_000_000, outputTokens: 1_000_000 });
     near(costOfTokens('openai', 'gpt-6-astra', usage, '2026-09-05').total, 10.00 + 50.00, 'astra');
+    const pricedUsage = tokensOf({ inputTokens: 1_000_000, cacheReadInputTokens: 1_000_000,
+        cacheCreation5mTokens: 1_000_000, outputTokens: 1_000_000 });
+    const sol = costOfTokens('openai', 'gpt-6-sol', pricedUsage, '2026-09-22');
+    near(sol.input, 2.00, 'gpt-6 sol input');
+    near(sol.cacheRead, 0.20, 'gpt-6 sol cached input');
+    near(sol.cacheWrite, 2.50, 'gpt-6 sol cache write');
+    near(sol.output, 10.00, 'gpt-6 sol output');
+    const next = costOfTokens('openai', 'gpt-6.1-sol', pricedUsage, '2026-09-29');
+    near(next.input, 2.00, 'gpt-6.1 sol input');
+    near(next.cacheRead, 0.10, 'gpt-6.1 sol cached input');
+    near(next.output, 10.00, 'gpt-6.1 sol output');
+    const luna = costOfTokens('openai', 'gpt-6-luna', pricedUsage, '2026-09-22');
+    near(luna.input, 0.10, 'gpt-6 luna input');
+    near(luna.cacheRead, 0.01, 'gpt-6 luna cached input');
+    near(luna.cacheWrite, 0.125, 'gpt-6 luna cache write');
+    near(luna.output, 0.50, 'gpt-6 luna output');
     near(costOfTokens('openai', 'gpt-5.6-terra', usage, '2026-09-03').total, 2.00 + 12.00, 'terra');
     near(costOfTokens('openai', 'gpt-5.6-luna', usage, '2026-09-03').total, 0.20 + 1.20, 'luna');
 });
@@ -164,6 +180,20 @@ test('a scheduled increase the provider cancelled prices at the published rate o
     const usage = tokensOf({ inputTokens: 1_000_000 });
     near(costOfTokens('claude', 'claude-sonnet-5', usage, '2026-08-31T23:59:59.999Z').input, 2.00, 'August');
     near(costOfTokens('claude', 'claude-sonnet-5', usage, '2026-09-03T00:00:00.000Z').input, 2.00, 'September');
+});
+
+test('the 5.5 generation is priced, including the 0.05x Opus 5.5 cache read', () => {
+    const usage = tokensOf({ inputTokens: 1_000_000, outputTokens: 1_000_000,
+        cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 2_000_000,
+        cacheCreation5mTokens: 1_000_000, cacheCreation1hTokens: 1_000_000 });
+    for (const [model, want] of [
+        ['claude-opus-5-5', { input: 4.00, output: 20.00, cacheRead: 0.20, cacheWrite: 13.00 }],
+        ['claude-sonnet-5-5', { input: 2.00, output: 10.00, cacheRead: 0.20, cacheWrite: 6.50 }],
+    ]) {
+        const cost = costOfTokens('claude', model, usage, '2026-09-28');
+        assert.ok(cost, model + ' must not be unpriced');
+        for (const [field, value] of Object.entries(want)) near(cost[field], value, model + ' ' + field);
+    }
 });
 
 // ------------------------------------------------------------- cache write ---

@@ -6,16 +6,44 @@
 'use strict';
 
 const DEF = { strategy: 'codex', portableFallback: true, model: 'current' };
+const nativePatchOwner = performance.timeOrigin + ':' + Math.random().toString(36).slice(2);
 let V = { ...DEF };
 let statusNode = null;
 let statusBody = null;
-let statusBusy = false;
+let statusGeneration = 0;
+let statusFlight = null;
+let statusQueued = false;
+let statusSessionId = cuimod.sessionId || null;
+let rendererDisposed = false;
+let stopSessionStatus = null;
+let nativePatchBusy = false;
+let nativePatchInstalled = false;
 
 function el(tag, cls, text) {
     const node = document.createElement(tag);
     if (cls) node.className = cls;
     if (text != null) node.textContent = text;
     return node;
+}
+
+function assetScripts() {
+    return Array.from(document.querySelectorAll('link[href]'), node => node.href)
+        .filter(url => /\.js(?:$|\?)/.test(url));
+}
+
+async function installNativeStatusPatch() {
+    if (nativePatchBusy || nativePatchInstalled) return;
+    nativePatchBusy = true;
+    try {
+        const result = await cuimod.rpc('compaction-provider.nativeStatusPatch', {
+            enabled: true,
+            urls: assetScripts(),
+            owner: nativePatchOwner,
+        });
+        nativePatchInstalled = result?.installed === true;
+    } catch (_) {
+        nativePatchInstalled = false;
+    } finally { nativePatchBusy = false; }
 }
 
 function statusCard() {
@@ -43,29 +71,68 @@ function row(grid, key, value) {
     grid.append(el('div', 'k', key), el('div', 'v', value));
 }
 
-async function refreshStatus() {
-    if (statusBusy || !statusBody) return;
-    statusBusy = true;
-    try {
-        const value = await cuimod.rpc('compaction-provider.status', { sessionId: cuimod.sessionId });
-        const latest = value?.checkpoints?.latest;
-        statusBody.className = latest ? 'cc-grid' : 'cc-empty';
-        statusBody.textContent = '';
-        if (!latest) {
-            statusBody.textContent = cuimod.sessionId
-                ? 'No Codex checkpoint exists for this session yet.'
-                : 'Open a Code session to see its checkpoint state.';
-            return;
-        }
-        row(statusBody, 'Created', new Date(latest.createdAt).toLocaleString());
-        row(statusBody, 'Model', latest.sourceModel || 'unknown');
-        row(statusBody, 'Retained items', String(latest.retainedItems));
-        row(statusBody, 'Encrypted state', Number(latest.encryptedBytes || 0).toLocaleString() + ' bytes');
-        row(statusBody, 'Portable fallback', Number(latest.fallbackCharacters || 0).toLocaleString() + ' characters');
-    } catch (_) {
+function statusOwned(owner) {
+    return !rendererDisposed && owner.generation === statusGeneration
+        && owner.sessionId === statusSessionId && owner.sessionId === (cuimod.sessionId || null);
+}
+
+function invalidateStatus(sessionId = cuimod.sessionId || null) {
+    statusGeneration++;
+    statusFlight = null;
+    statusQueued = false;
+    statusSessionId = sessionId;
+    if (statusBody) {
         statusBody.className = 'cc-empty';
-        statusBody.textContent = 'Router status is temporarily unavailable.';
-    } finally { statusBusy = false; }
+        statusBody.textContent = sessionId ? 'Reading this session’s checkpoint state…' : 'Open a Code session to see its checkpoint state.';
+    }
+}
+
+async function refreshStatus() {
+    if (rendererDisposed || !statusBody) return false;
+    const sessionId = cuimod.sessionId || null;
+    if (sessionId !== statusSessionId) invalidateStatus(sessionId);
+    const generation = statusGeneration;
+    if (statusFlight?.generation === generation) {
+        statusQueued = true;
+        return statusFlight.promise;
+    }
+    const owner = { generation, sessionId, promise: null };
+    const run = Promise.resolve().then(async () => {
+        try {
+            const value = await cuimod.rpc('compaction-provider.status', { sessionId });
+            if (!statusOwned(owner)) return false;
+            const latest = value?.checkpoints?.latest;
+            statusBody.className = latest ? 'cc-grid' : 'cc-empty';
+            statusBody.textContent = '';
+            if (!latest) {
+                statusBody.textContent = sessionId
+                    ? 'No Codex checkpoint exists for this session yet.'
+                    : 'Open a Code session to see its checkpoint state.';
+                return true;
+            }
+            row(statusBody, 'Created', new Date(latest.createdAt).toLocaleString());
+            row(statusBody, 'Model', latest.sourceModel || 'unknown');
+            row(statusBody, 'Retained items', String(latest.retainedItems));
+            row(statusBody, 'Encrypted state', Number(latest.encryptedBytes || 0).toLocaleString() + ' bytes');
+            row(statusBody, 'Portable fallback', Number(latest.fallbackCharacters || 0).toLocaleString() + ' characters');
+            return true;
+        } catch (_) {
+            if (!statusOwned(owner)) return false;
+            statusBody.className = 'cc-empty';
+            statusBody.textContent = 'Router status is temporarily unavailable.';
+            return false;
+        } finally {
+            if (statusFlight !== owner) return;
+            statusFlight = null;
+            if (statusQueued && statusOwned(owner)) {
+                statusQueued = false;
+                queueMicrotask(refreshStatus);
+            }
+        }
+    });
+    owner.promise = run;
+    statusFlight = owner;
+    return run;
 }
 
 const spec = {
@@ -103,9 +170,26 @@ const REG = (globalThis.__cuimodReg || (globalThis.__cuimodReg = { specs: new Ma
 REG.specs.set(spec.plugin, spec);
 REG.subs.forEach(fn => { try { fn(); } catch (_) {} });
 ctx.onDispose(() => {
+    rendererDisposed = true;
+    if (typeof stopSessionStatus === 'function') stopSessionStatus();
+    stopSessionStatus = null;
+    statusGeneration++;
+    statusFlight = null;
+    statusQueued = false;
     REG.specs.delete(spec.plugin);
     REG.subs.forEach(fn => { try { fn(); } catch (_) {} });
+    cuimod.rpc('compaction-provider.nativeStatusPatch', {
+        enabled: false,
+        owner: nativePatchOwner,
+    }).catch(() => {});
 });
 
-cuimod.onSessionChange(refreshStatus);
-ctx.every(3000, refreshStatus);
+installNativeStatusPatch();
+stopSessionStatus = cuimod.onSessionChange((sessionId) => {
+    invalidateStatus(sessionId || null);
+    refreshStatus();
+});
+ctx.every(3000, () => {
+    installNativeStatusPatch();
+    refreshStatus();
+});
