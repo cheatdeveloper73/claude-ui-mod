@@ -1,7 +1,7 @@
 # claude-ui-mod
 
-**A hot-reloadable plugin runtime for Claude Desktop on Windows, with 33 plugins
-in the box.** Task rail, subagent HUD, send queue, provider picker, per-response
+**A hot-reloadable plugin runtime for Claude Desktop on Windows: 33 plugins and
+419 features in the box.** Task rail, subagent HUD, send queue, provider picker, per-response
 throughput, and fixes for Claude Code Desktop bugs, injected into the app and
 editable while it runs: save a file and the change is live, with no restart and
 no interruption to a Claude Code session that is mid-turn.
@@ -19,11 +19,28 @@ relay. Optional; see [voice-agent/README.md](voice-agent/README.md).
 > Unofficial and unaffiliated with Anthropic. It rewrites files inside your
 > local Claude Desktop install. Read [SECURITY.md](SECURITY.md) before using it.
 
-**33 plugins in six categories:** 8 bug fixes, 2 unlocks, 5 for providers and
-routing, 6 for agents and automation, 5 for usage and context, 7 for transcript
-and appearance. [At a glance](#at-a-glance) lists every one.
+**419 features**: 161 in the 33 plugins and 258 in the router and its tooling,
+with 193 settings live in the dashboard. A plugin is just how the code is split;
+some do one thing and some do nineteen, so the count that matters is the
+features. [docs/FEATURES.md](docs/FEATURES.md) lists every one, each traced to
+the source that implements it.
 
-![all 33 plugins, grouped by category](docs/media/plugin-wall.gif)
+| outcome | features |
+|---|---|
+| Models and providers | 83 |
+| Agents and automation | 48 |
+| Usage, limits and context | 141 |
+| Composer and session | 29 |
+| Transcript and appearance | 31 |
+| Fixes for Claude Code Desktop bugs | 12 |
+| Unlocks | 10 |
+| Router and reliability | 65 |
+
+The plugins themselves fall into six groups: 8 bug fixes, 2 unlocks, 5 for
+providers and routing, 6 for agents and automation, 5 for usage and context, 7
+for transcript and appearance. [At a glance](#at-a-glance) lists every one.
+
+![419 features across 33 plugins and the router](docs/media/plugin-wall.gif)
 
 ![the whole window: task rail, usage meters, the dashboard, and the transcript restyled](docs/media/tour.gif)
 

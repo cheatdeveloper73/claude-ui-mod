@@ -56,8 +56,9 @@ dropping a directory into `src/plugins/` is picked up live.
 `router/supervisor.mjs` owns public port 8789. A router backend save boots a
 candidate `router/index.mjs` on a private port, accepts it only after `/healthz`
 returns 200 and `scripts/router-canary.mjs` passes in a fresh process, then switches
-new requests. The previous worker stays warm for ten minutes while its active
-responses drain. Syntax errors, failed health checks, and failed translation
+new requests. The previous worker stays warm as the rollback target for two
+minutes (`ROLLBACK_WINDOW_MS`), and a retired worker keeps draining its active
+responses for up to an hour (`RETIRED_DRAIN_TIMEOUT_MS`). Syntax errors, failed health checks, and failed translation
 canaries retain the current worker. `GET /supervisorz` reports the warm generation;
 local `POST /rollbackz` restores it immediately, and a current worker that exits
 rolls back automatically. Desktop and the CLI sessions stay running. This guarantee
