@@ -48,6 +48,9 @@ Claude works with nothing further. The others are opt-in:
   `COMMAND_CODE_API_KEY`. It is read per request, so no restart is needed.
 - **Other Anthropic-Messages backends:** add a catalogue entry. See
   `docs/provider-adapters.md`.
+- **Agents on different providers:** a subagent's provider comes from the
+  `model:` line of its definition in `~/.claude/agents/`. The spelling differs
+  per provider. See `docs/agents-and-model-mixing.md`.
 
 Never put a key anywhere but `.state/provider-secrets.json` or the
 environment. `.state/` is ignored by git.

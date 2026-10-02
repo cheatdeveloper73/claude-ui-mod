@@ -1,10 +1,18 @@
 # claude-ui-mod
 
 **A hot-reloadable plugin runtime for Claude Desktop on Windows: 33 plugins and
-419 features in the box.** Task rail, subagent HUD, send queue, provider picker, per-response
-throughput, and fixes for Claude Code Desktop bugs, injected into the app and
-editable while it runs: save a file and the change is live, with no restart and
-no interruption to a Claude Code session that is mid-turn.
+419 features in the box.** Model mixing across agents, a subagent HUD, task
+rail, send queue, provider picker, per-response throughput, and fixes for
+Claude Code Desktop bugs, injected into the app and editable while it runs: save
+a file and the change is live, with no restart and no interruption to a Claude
+Code session that is mid-turn.
+
+**Mix models in one conversation.** Every agent picks its own provider: a
+Claude Opus orchestrator, GPT-6 readers on your ChatGPT plan, DeepSeek and Kimi
+workers on Command Code, all running side by side in the Desktop Code tab, each
+on its own quota, each listed in the subagent HUD.
+An agent definition's `model:` line is all it takes;
+[docs/agents-and-model-mixing.md](docs/agents-and-model-mixing.md) shows how.
 
 **Always-on voice assistant.** Say the wake phrase (`hey agent` by default),
 speak the prompt, and hear a spoken summary of the reply. Dictation,
@@ -79,9 +87,10 @@ live.
 - **State comes from the CLI's own files.** Tasks, transcripts, per-agent
   transcripts and goal records are read from `~/.claude`, so the views survive a
   stop-and-resume that the app's own views do not.
-- **One loopback router, one model selector.** Sessions talk to a local router
-  that picks the backend per request from the model id, so switching between
-  Claude and other models is the app's own live model switch.
+- **One router, any model, per agent.** Every session and every subagent talks
+  to a local router that picks the backend per request from the model id. A
+  conversation can switch models live through the app's own picker, and a team
+  of agents can span providers.
 - **Nothing is hidden from you.** No telemetry, no update check, no
   `contextBridge`, and a plugin is a plain CommonJS file you can read.
 
@@ -98,6 +107,15 @@ live.
 
 ## Highlights
 
+**model mixing** — each subagent runs on the provider its definition names, so
+one conversation can run a Claude orchestrator, GPT-6 readers and a DeepSeek
+worker at once. The HUD lists every agent with its current tool and how long it
+has run; click one for its transcript sheet, which shows the model and effort
+its definition pins and what passed between it and its parent.
+[docs/agents-and-model-mixing.md](docs/agents-and-model-mixing.md)
+
+![a mixed-provider team in the subagent HUD](docs/media/crop-subagents.gif)
+
 **voice-agent** — wake phrase, local dictation, spoken summaries. A recorder
 process writes every microphone block to disk before anything else sees it, so a
 restart never drops audio, and a prompt reaches the composer at most once.
@@ -110,11 +128,6 @@ login you already hold.
 
 ![provider tabs inside the native model picker](docs/media/crop-provider-picker.gif)
 
-**subagents** — a HUD of this session's agents: who is running, what tool they
-are on, how long. Click one for its transcript and controls, and for what passed
-between it and its parent.
-
-![the subagent rail and an agent's transcript sheet](docs/media/crop-subagents.gif)
 
 **throughput** — real tokens per second, measured at the router from the
 provider's exact token counts, split into upstream hop, prefill and generation
@@ -324,6 +337,27 @@ the publish step excludes the settings file from the public mirrors. After
 restoring an older copy, run `dashboard.reload` and reload the renderer; the
 store is authoritative in memory once read.
 
+## Mixing models across agents
+
+Every subagent goes through the same router as the main session, so a team can
+span providers: a Claude orchestrator, GPT-6 readers on your ChatGPT plan and a
+DeepSeek worker on Command Code, all in one conversation. The agent definition
+picks the provider through its `model:` line:
+
+```markdown
+---
+name: gpt-reader
+model: claude-gpt-6-luna[1m]
+effort: high
+---
+```
+
+A subagent with no `model:` lands on a cheap tier of the session's own
+provider, a `#fast` first line puts one GPT agent on the priority tier, and the
+subagent HUD, throughput and usage meters show which agent is on what.
+[docs/agents-and-model-mixing.md](docs/agents-and-model-mixing.md) covers the
+id spellings per provider, the defaults and a worked mixed team.
+
 ## Usage Atlas
 
 The router keeps a permanent, deduplicated record of every response it relays:
@@ -510,6 +544,8 @@ there is no telemetry or update check.
 - [docs/development.md](docs/development.md): the hot-reload dev flow
 - [docs/plugin-api.md](docs/plugin-api.md): plugin contracts, host RPC surface, introspection recipes
 - [docs/provider-adapters.md](docs/provider-adapters.md): adding a provider, by catalogue entry or by adapter
+- [docs/agents-and-model-mixing.md](docs/agents-and-model-mixing.md): agent definitions across providers, and how unpinned subagents are routed
+- [docs/FEATURES.md](docs/FEATURES.md): all 419 features by outcome
 - [docs/internals.md](docs/internals.md): verified Claude Desktop internals, and the dead ends not worth re-walking
 - [docs/troubleshooting.md](docs/troubleshooting.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md)

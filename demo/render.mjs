@@ -40,7 +40,7 @@ const JOBS = [
     { id: 'crop-provider-picker', gifWidth: 800, gifFps: 14 },
     // a title card that sits under the README hero; held tighter than the 5 MB default
     { id: 'plugin-wall', gifWidth: 900, gifFps: 15, maxBytes: 3 * 1024 * 1024 },
-    { id: 'crop-subagents', gifWidth: 900, gifFps: 12 },
+    { id: 'crop-subagents', gifWidth: 900, gifFps: 12, maxBytes: 3 * 1024 * 1024 },
     { id: 'crop-throughput', gifWidth: 900, gifFps: 12 },
     { id: 'crop-queue', gifWidth: 820, gifFps: 12 },
 ];

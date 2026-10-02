@@ -190,8 +190,8 @@ export function composerAt(t: number) {
 }
 
 // ---------------------------------------------------------------- transcript
-export const ASSIST_A = `Three independent concerns: the header repoint, the Squirrel directory layout, and the watcher's patch-on-close path. One agent for each, running now.`;
-export const ASSIST_B = `All three agree. The repoint is length-preserving, the layout assumption holds for \`app-<version>\`, and the watcher patches a freshly downloaded version before it first launches.`;
+export const ASSIST_A = `Three concerns, split across providers: two GPT readers on the header repoint and the Squirrel layout, a DeepSeek worker on the watcher, and a Claude reviewer cross-checking. Running now.`;
+export const ASSIST_B = `All four agree. The repoint is length-preserving, the layout assumption holds for \`app-<version>\`, and the watcher patches a freshly downloaded version before it first launches.`;
 export const ASSIST_C = `On it. The watcher already patches on download, so the mid-session case reduces to the file lock on \`app.asar\`.`;
 
 export type Turn = { user: string; userAt: number; text: string; chars: number; final?: boolean };
@@ -250,36 +250,46 @@ export type Agent = {
     tools: [string, string][];
     toolOffset: number;
     last: string;
+    /** The definition's frontmatter, as the sheet's subline prints it: type (pin). */
+    pin: string;
+    /** What the transcript reports for the agent: the sheet's "model" and "effort" bits. */
+    model: string;
+    effort?: string;
+    /** Throughput lane: the model id the router attributes the stream to. */
+    lane: string;
+    hue: number;
+    tps: number;
 };
 
 export const AGENTS: Agent[] = [
     {
-        id: 'a1', name: 'rv-asar', type: 'reviewer',
+        id: 'a1', name: 'gpt-reader-asar', type: 'gpt-reader',
         spawn: AGENTS_IN - 214, end: 62.0,
         toolOffset: 0,
         tools: [
             ['Read', 'file_path: src/patch/asar.js, offset: 120, limit: 60'],
             ['Grep', 'pattern: repointExeIntegrity, output_mode: content'],
             ['Read', 'file_path: src/patch/pe.js'],
-            ['Bash', 'node selfcheck.js'],
             ['Read', 'file_path: docs/internals.md, offset: 40, limit: 80'],
         ],
         last: 'Header repoint is length-preserving; no PE relocation involved.',
+        pin: 'gpt-6-luna · high', model: 'gpt-6-luna', effort: 'high', lane: 'gpt-6-luna', hue: 152, tps: 118.6,
     },
     {
-        id: 'a2', name: 'rd-squirrel', type: 'reader', parent: 'a1',
+        id: 'a2', name: 'gpt-reader-layout', type: 'gpt-reader',
         spawn: AGENTS_IN - 64, end: 50.5,
         toolOffset: 2,
         tools: [
             ['Grep', 'pattern: app-<version>, output_mode: content'],
             ['Read', 'file_path: src/watcher.js, offset: 1, limit: 80'],
-            ['Bash', 'ls %LOCALAPPDATA%\\AnthropicClaude'],
+            ['Bash', 'ls %LOCALAPPDATA%\AnthropicClaude'],
             ['Read', 'file_path: install.ps1'],
         ],
         last: 'Each update lands in a fresh app-<version> directory.',
+        pin: 'gpt-6-luna · high', model: 'gpt-6-luna', effort: 'high', lane: 'gpt-6-luna', hue: 152, tps: 112.3,
     },
     {
-        id: 'a3', name: 'wk-watcher', type: 'worker', parent: 'a2',
+        id: 'a3', name: 'deepseek-worker', type: 'deepseek-worker', parent: 'a2',
         spawn: AGENTS_IN - 21, end: 42.0,
         toolOffset: 1,
         tools: [
@@ -288,6 +298,20 @@ export const AGENTS: Agent[] = [
             ['Bash', 'node selfcheck.js'],
         ],
         last: 'Patch-on-download path verified, selfcheck clean.',
+        pin: 'deepseek-v4.1-flash', model: 'deepseek-v4.1-flash', lane: 'deepseek-v4.1-flash', hue: 215, tps: 186.4,
+    },
+    {
+        id: 'a4', name: 'reviewer', type: 'reviewer',
+        spawn: AGENTS_IN - 130, end: 56.0,
+        toolOffset: 3,
+        tools: [
+            ['Read', 'file_path: src/patch/asar.js, offset: 120, limit: 60'],
+            ['Grep', 'pattern: repointExeIntegrity, output_mode: content'],
+            ['Bash', 'node selfcheck.js'],
+            ['Read', 'file_path: src/patch/pe.js'],
+        ],
+        last: 'Findings agree with the readers; nothing depends on the build layout.',
+        pin: 'sonnet-5-5 · medium', model: 'sonnet-5-5', effort: 'medium', lane: 'claude-sonnet-5-5', hue: 24, tps: 71.2,
     },
 ];
 
@@ -334,7 +358,7 @@ export type LiveRow = {
     hue: number;
 };
 
-const HUE = { claude: 24, openai: 152 };
+const HUE = { claude: 24, openai: 152, deepseek: 215 };
 
 export function liveRowsAt(t: number): LiveRow[] {
     const rows: LiveRow[] = [];
@@ -355,14 +379,14 @@ export function liveRowsAt(t: number): LiveRow[] {
     for (const a of AGENTS) {
         const v = agentView(a, t, 4);
         if (!v.live) continue;
-        const base = a.id === 'a1' ? 71.2 : a.id === 'a2' ? 64.5 : 58.9;
+        const base = a.tps;
         const turnStart = stepped(t + 0.0, 5) - 0.3;
         const el = (t - turnStart) * 1000;
         rows.push({
-            key: a.id, title: a.id === 'a1' ? 'claude-sonnet-5-5' : a.id === 'a2' ? 'claude-sonnet-5-5' : 'claude-sonnet-5-5',
+            key: a.id, title: a.lane,
             tag: a.name, main: false,
-            elapsedMs: el, ttftMs: 410 + (a.id === 'a1' ? 90 : 0), tokens: Math.round((base * Math.max(0, el - 410)) / 1000),
-            tps: base + wob(t, 2.6, 1.7, a.id.charCodeAt(1)), est: false, hue: HUE.claude,
+            elapsedMs: el, ttftMs: a.id === 'a3' ? 280 : a.id === 'a4' ? 480 : 350, tokens: Math.round((base * Math.max(0, el - 410)) / 1000),
+            tps: base + wob(t, 2.6, 1.7, a.id.charCodeAt(1)), est: false, hue: a.hue,
         });
     }
     return rows;
@@ -394,20 +418,23 @@ export type PanelRow = { key: string; title: string; sub: string; tag: string; m
 
 export const LANES: PanelRow[] = [
     { key: 'l1', title: 'Main session', sub: '9 resp · 6.9k out · ttft p50 590ms', tag: 'gpt-6.1-sol', main: true, value: '96.4', unit: 'sustained', hue: HUE.openai },
-    { key: 'l2', title: 'rv-asar', sub: '5 resp · 11k out · ttft p50 480ms', tag: 'claude-sonnet-5-5', main: false, value: '71.0', unit: 'sustained', hue: HUE.claude },
-    { key: 'l3', title: 'rd-squirrel', sub: '4 resp · 8.2k out · ttft p50 430ms', tag: 'claude-sonnet-5-5', main: false, value: '64.8', unit: 'sustained', hue: HUE.claude },
-    { key: 'l4', title: 'wk-watcher', sub: '3 resp · 3.1k out · ttft p50 410ms', tag: 'claude-sonnet-5-5', main: false, value: '59.2', unit: 'sustained', hue: HUE.claude },
+    { key: 'l2', title: 'gpt-reader-asar', sub: '5 resp · 11k out · ttft p50 360ms', tag: 'gpt-6-luna', main: false, value: '118.2', unit: 'sustained', hue: HUE.openai },
+    { key: 'l3', title: 'gpt-reader-layout', sub: '4 resp · 8.2k out · ttft p50 340ms', tag: 'gpt-6-luna', main: false, value: '111.9', unit: 'sustained', hue: HUE.openai },
+    { key: 'l4', title: 'deepseek-worker', sub: '3 resp · 3.1k out · ttft p50 280ms', tag: 'deepseek-v4.1-flash', main: false, value: '185.7', unit: 'sustained', hue: HUE.deepseek },
+    { key: 'l5', title: 'reviewer', sub: '3 resp · 4.4k out · ttft p50 480ms', tag: 'claude-sonnet-5-5', main: false, value: '71.0', unit: 'sustained', hue: HUE.claude },
 ];
 
 export const MODELS: PanelRow[] = [
     { key: 'm1', title: 'GPT-6.1-Sol', sub: '9 resp · 6.9k out · p90 104 · ttft p50 590ms', tag: 'openai', main: false, value: '96.4', unit: 'sustained', hue: HUE.openai },
-    { key: 'm2', title: 'Sonnet 5.5', sub: '12 resp · 22k out · p90 78 · ttft p50 450ms', tag: 'claude', main: false, value: '68.1', unit: 'sustained', hue: HUE.claude },
+    { key: 'm2', title: 'GPT-6 Luna', sub: '9 resp · 19k out · p90 126 · ttft p50 350ms', tag: 'openai', main: false, value: '115.3', unit: 'sustained', hue: HUE.openai },
+    { key: 'm3', title: 'DeepSeek V4.1 Flash', sub: '3 resp · 3.1k out · p90 201 · ttft p50 280ms', tag: 'deepseek', main: false, value: '185.7', unit: 'sustained', hue: HUE.deepseek },
+    { key: 'm4', title: 'Sonnet 5.5', sub: '3 resp · 4.4k out · p90 78 · ttft p50 480ms', tag: 'claude', main: false, value: '71.0', unit: 'sustained', hue: HUE.claude },
 ];
 
 export const RECENT: PanelRow[] = [
     { key: 'r1', title: 'gpt-6.1-sol', sub: '812 out (310 thinking) · ttft 640ms · gen 5.4s', tag: 'main', main: true, value: '150', unit: 'tok/s', hue: HUE.openai },
-    { key: 'r2', title: 'claude-sonnet-5-5', sub: '1.3k out · ttft 410ms · gen 19s', tag: 'wk-watcher', main: false, value: '68.4', unit: 'tok/s', hue: HUE.claude },
-    { key: 'r3', title: 'claude-sonnet-5-5', sub: '964 out · ttft 480ms · gen 13s', tag: 'rd-squirrel', main: false, value: '74.1', unit: 'tok/s', hue: HUE.claude },
+    { key: 'r2', title: 'deepseek-v4.1-flash', sub: '1.3k out · ttft 280ms · gen 7.0s', tag: 'deepseek-worker', main: false, value: '187.1', unit: 'tok/s', hue: HUE.deepseek },
+    { key: 'r3', title: 'gpt-6-luna', sub: '964 out · ttft 340ms · gen 8.2s', tag: 'gpt-reader-layout', main: false, value: '117.6', unit: 'tok/s', hue: HUE.openai },
     { key: 'r4', title: 'gpt-6.1-sol', sub: '604 out · ttft 570ms · gen 6.2s', tag: 'main', main: true, value: '97.4', unit: 'tok/s', hue: HUE.openai },
 ];
 

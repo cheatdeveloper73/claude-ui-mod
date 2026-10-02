@@ -238,14 +238,19 @@ const Sheet: React.FC<{ t: number; agent: Agent }> = ({ t, agent }) => {
                         </div>
                         <div className="subline">
                             <span>
-                                <b>type </b>reviewer
+                                {agent.type}
+                                <span className="pin">({agent.pin})</span>
                             </span>
                             <span>
-                                <b>model </b>sonnet-5-5
+                                <b>model </b>
+                                {agent.model}
                             </span>
-                            <span>
-                                <b>effort </b>medium
-                            </span>
+                            {agent.effort && (
+                                <span>
+                                    <b>effort </b>
+                                    {agent.effort}
+                                </span>
+                            )}
                             <span>
                                 <b>running </b>
                                 {v.elapsedLabel}
@@ -260,7 +265,7 @@ const Sheet: React.FC<{ t: number; agent: Agent }> = ({ t, agent }) => {
                 <div className="grid">
                     <div className="main">
                         <div className="brief">
-                            Review the asar header repoint in src/patch against the integrity check in claude.exe. Report
+                            Read the asar header repoint in src/patch against the integrity check in claude.exe. Report
                             anything that depends on the current build’s layout.
                         </div>
                         <div className="tailslot">

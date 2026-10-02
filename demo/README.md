@@ -5,7 +5,7 @@ The Remotion project that renders the videos in [`docs/media`](../docs/media).
 It is a **mock** of Claude Desktop, not a screen recording: a fake window with
 the same anchors the plugins attach to in the real app — the sidebar's right
 edge, the composer box, the free middle of the footer row — and a scripted
-session that creates and completes tasks, switches model, runs three subagents,
+session that creates and completes tasks, switches model, runs four subagents on three providers,
 queues messages and moves the numbers.
 
 Nothing about the look is re-drawn by hand. `gen-css.mjs` pulls the real
@@ -62,7 +62,7 @@ node stills.mjs out/stills scene@26.3 scene@41.5 crop-queue@6
 | `crop-transcript` | thinking blocks and transcript typography being restyled |
 | `crop-provider-picker` | the four-tab provider strip inside the native model picker: Claude to OpenAI, GPT-6.1-Sol, the effort slider; then, a second visit, the Command Code tab with its eight models and one picked (the camera pulls back as the list grows) |
 | `plugin-wall` | **a title card, not a plugin render**: the mod's 419 features as seven labelled groups of name chips, each with a right-aligned count badge, that build in one at a time while the total climbs (a chip's count ramps in over a fraction of a second, so the router's 193 reads as a sweep, not a jump). Six groups hold the 33 plugins; the seventh, "Router & tooling", holds the router, its adapter, and the scripts around it. The sub-line reads 33 plugins · 193 settings · 258 in the router and tooling. Drawn by `PluginWall.tsx` in the demo's own tokens and faces, with no extracted stylesheet behind it (six accents are colours the shipped sheets already use, listed in its header comment; the seventh is the neutral `--text-300` token). It is held to a 3 MB GIF; the chip names and their counts are typed out in `PluginWall.tsx` from a source-grounded feature inventory, so a plugin added or removed under `src/plugins/`, or a change in how many things one does, means editing that list by hand |
-| `crop-subagents` | the subagent rail under the chat title (running rows, finished ghosts), and the transcript sheet a click opens |
+| `crop-subagents` | the subagent rail under the chat title (running rows, finished ghosts), and the transcript sheet a click opens. The scripted team mixes providers under the GPT-6.1-Sol main session: two `gpt-reader` agents (`gpt-6-luna · high`), a `deepseek-worker` (`deepseek-v4.1-flash`) and a `reviewer` (`sonnet-5-5 · medium`). As in the shipped HUD, rail rows show only the agent's name; the definition pin (`type (model · effort)`) appears in the sheet's subline, here for the first `gpt-reader` |
 | `crop-throughput` | the tok/s chip in the streaming strip, then the dashboard readout splitting hop, ttft and generation per lane |
 | `crop-queue` | the send queue: Enter mid-turn, edit, steer, delete (armed, then confirmed), auto-send at turn end |
 
@@ -115,8 +115,8 @@ is checked, because the catalogue gives those models no efforts and `page.js` on
 gives a model a `thinking` block when it has some — the app's own selector is
 assumed to follow, which has not been observed; the steered and auto-sent messages
 appear in the transcript as user bubbles (the plugin delivers them; what the app
-then draws is assumed); the subagent hierarchy (a parent, a child and a
-grandchild) and its finishing order; the rail's duration and tool text change
+then draws is assumed); the subagent hierarchy (a reader and the worker it
+spawned) and its finishing order; the rail's duration and tool text change
 every 4s (2s with the sheet open) to match the plugin's poll, not a clock.
 
 Faithful to a quirk: the subagent sheet covers the rail while it is open (it is

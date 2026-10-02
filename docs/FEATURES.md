@@ -2,6 +2,13 @@
 
 **419 features**: 161 in the 33 plugins and 258 in the router and its tooling, with 193 settings live in the dashboard.
 
+The capability most of these add up to is **model mixing**: every agent in a
+conversation can run on a different provider, so a Claude orchestrator, GPT-6
+readers and a DeepSeek worker work as one team.
+[agents-and-model-mixing.md](agents-and-model-mixing.md) explains it; the rows
+it rests on are under Models & providers, Agents & automation and Router &
+reliability.
+
 A feature here is one thing you can see, use or rely on. A group of settings that tunes one thing counts once, and two unrelated behaviours in one plugin count twice. Each row was traced to the source line that implements it when this list was compiled for 1.2.0.
 
 | outcome | features |
