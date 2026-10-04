@@ -118,6 +118,119 @@ test('every worker may run fast GPT, and a resumed session keeps its own switch'
     }
 }));
 
+// Desktop 2.9939.4, .vite/build/index.chunk-yciyIejk.js. Replay the actual
+// credit handler and message emitter: the frontend also consumes the notice
+// independently of fastModeCreditsExhausted, so both paths must be guarded.
+const nativeCreditsNotice = vm.runInNewContext('({' +
+    'handleFastModeCreditsNotice(e,n){let{session:r,sessionId:i}=e,a=n;if(a.type!=="system"||a.subtype!=="notification"||a.key!=="fast-mode-overage-rejected"||a.parent_tool_use_id||r.query!==e.queryObj||r.fastModeOffByCredits==="settled")return;let o=r.fastModeOffByCredits===void 0;if(r.fastModeOffByCredits="pending",r.fastModeCreditsStaleOn=!0,r.fastModeState="off",r.fastModeDisabledReason=void 0,this.setFastMode(i,!1).catch((e=>{t.cY.warn(`[CCD] turning fast off after credits ran out failed for ${i}`,e)})),!o)return;let s=typeof a.text=="string"?a.text.trim():"";this.emit("fastModeCreditsExhausted",{sessionId:i,text:s||void 0})}' +
+    '}).handleFastModeCreditsNotice', { t: { cY: { warn() {} } } });
+const nativeEmitStreamMessage = vm.runInNewContext('({' +
+    'emitStreamMessage(e,t,n){let r=n.uuid;e.sshAdoptionSettling&&e.backend.remoteTarget&&typeof r=="string"&&e.rendererKnownUuids?.has(r)||(this.emit("event",{type:"message",sessionId:t,message:n}),PS(e,[n]))}' +
+    '}).emitStreamMessage', { PS() {} });
+
+async function withCreditsManager(fn) {
+    const root = fakeRoot();
+    const picker = path.join(root, 'src', 'plugins', 'provider-picker');
+    fs.mkdirSync(picker, { recursive: true });
+    fs.writeFileSync(path.join(picker, 'catalogue.json'), JSON.stringify([
+        { id: 'gpt-6.1-sol', provider: 'openai' }, { id: 'stub-external', provider: 'stub' },
+    ]));
+    const session = { sessionId: 'local_gpt', cliSessionId: 'cli-gpt', model: 'claude-gpt-6.1-sol[1m]',
+        query: {}, fastModeState: 'on', backend: { kind: 'local' } };
+    fs.writeFileSync(path.join(root, '.state', 'fast-mode.json'), JSON.stringify({
+        sessions: { local_gpt: true }, draft: true, cli: { 'cli-gpt': true },
+    }));
+    const events = [], applied = [], methods = {}, timers = [];
+    const manager = {
+        sessions: new Map([[session.sessionId, session]]),
+        handleFastModeCreditsNotice: nativeCreditsNotice,
+        emitStreamMessage: nativeEmitStreamMessage,
+        async setFastMode(id, value) { applied.push([id, value]); },
+        emit(name, event) { events.push([name, event]); },
+    };
+    const key = path.join(root, 'credits-manager.js');
+    require.cache[key] = { exports: { claudeCodeSessionManager: manager } };
+    const disposers = [];
+    const load = () => {
+        const own = [];
+        require('../src/plugins/fast-mode/main')({ dir: path.join(root, 'src', 'plugins', 'fast-mode'),
+            boot: { MOD_DIR: root }, every: (_ms, fn) => timers.push(fn), log() {},
+            method: (name, fn) => { methods[name] = fn; }, onDispose: fn => own.push(fn) });
+        const dispose = () => own.forEach(fn => fn());
+        disposers.push(dispose);
+        return dispose;
+    };
+    load();
+    const notice = { type: 'system', subtype: 'notification', key: 'fast-mode-overage-rejected', text: "You're out of usage credits" };
+    const deliver = message => {
+        manager.handleFastModeCreditsNotice({ session, sessionId: session.sessionId, queryObj: session.query }, message);
+        manager.emitStreamMessage(session, session.sessionId, message);
+    };
+    try { await fn({ manager, session, notice, deliver, events, applied, methods, load, disposers, timers, root }); }
+    finally { disposers.forEach(fn => fn()); delete require.cache[key]; fs.rmSync(root, { recursive: true, force: true }); }
+}
+
+test('Anthropic credit notices cannot disable external fast intent or notify the desktop', () => withCreditsManager(({ session, notice, deliver, applied, events, methods, root }) => {
+    for (const model of ['claude-gpt-6.1-sol[1m]', 'gpt-6.1-sol:high', 'claude-stub-external[1m]']) {
+        session.model = model;
+        deliver(notice);
+        assert.deepEqual(applied, [], model + ' must not receive a fast-off push');
+        assert.equal(session.fastModeState, 'on');
+        assert.equal(session.fastModeOffByCredits, undefined);
+        assert.equal(session.fastModeCreditsStaleOn, undefined);
+        assert.deepEqual(events, [], model + ' must not emit the background credit notice');
+        assert.equal(methods.desired({ sessionId: session.sessionId }), true);
+        assert.equal(methods.draft({}), true);
+        assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.state', 'fast-mode.json'), 'utf8')).cli['cli-gpt'], true);
+    }
+}));
+
+test('the streamed Anthropic credit notice never reaches an external-provider frontend', () => withCreditsManager(({ manager, session, notice, events }) => {
+    manager.emitStreamMessage(session, session.sessionId, notice);
+    assert.deepEqual(events, [], 'the frontend independently creates a toast from this exact message');
+}));
+
+test('native Claude credits and ordinary provider errors keep their native paths', () => withCreditsManager(async ({ manager, session, notice, deliver, events, applied, methods }) => {
+    for (const message of [
+        { type: 'result', is_error: true, errors: ['OpenAI rate limit reached'] },
+        { type: 'system', subtype: 'notification', key: 'other', text: 'Provider credit error' },
+        { ...notice, type: 'assistant' }, { ...notice, subtype: 'other' },
+        { ...notice, parent_tool_use_id: 'subagent' },
+    ]) {
+        events.length = 0;
+        deliver(message);
+        assert.equal(events.length, 1);
+        assert.equal(events[0][1].message, message);
+        assert.deepEqual(applied, []);
+    }
+    events.length = 0;
+    session.model = 'claude-opus-5-5';
+    deliver(notice);
+    assert.deepEqual(applied, [[session.sessionId, false]]);
+    assert.equal(session.fastModeState, 'off');
+    assert.equal(events[0][0], 'fastModeCreditsExhausted');
+    assert.equal(events[1][1].message, notice);
+    assert.equal(methods.desired({ sessionId: session.sessionId }), false);
+    session.model = 'claude-gpt-6.1-sol[1m]';
+    await manager.setFastMode(session.sessionId, false);
+    await manager.setFastMode(session.sessionId, true);
+    assert.equal(methods.desired({ sessionId: session.sessionId }), true, 'explicit user changes remain available');
+}));
+
+test('credit guards survive overlapping hot reloads and restore native methods on disposal', () => withCreditsManager(({ manager, session, notice, events, load, disposers, timers }) => {
+    const first = manager.handleFastModeCreditsNotice;
+    load();
+    assert.notEqual(manager.handleFastModeCreditsNotice, first);
+    disposers[0]();
+    timers.at(-1)();
+    manager.handleFastModeCreditsNotice({ session, sessionId: session.sessionId, queryObj: session.query }, notice);
+    manager.emitStreamMessage(session, session.sessionId, notice);
+    assert.deepEqual(events, []);
+    disposers[1]();
+    assert.equal(manager.handleFastModeCreditsNotice, nativeCreditsNotice);
+    assert.equal(manager.emitStreamMessage, nativeEmitStreamMessage);
+}));
+
 test('the switch value is recorded per session from every setFastMode caller', () => withHome(async () => {
     const root = fakeRoot();
     const order = [];

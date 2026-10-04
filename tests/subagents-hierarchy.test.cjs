@@ -71,6 +71,7 @@ test('subagent list preserves multiple roots and arbitrary parent chains from si
     const methods = new Map();
     delete require.cache[require.resolve(MAIN)];
     require(MAIN)({
+        boot: { MOD_DIR: path.join(root, 'mod') },
         method: (name, fn) => methods.set(name, fn),
         onDispose: () => {},
         electron: { shell: { showItemInFolder: () => {} } },

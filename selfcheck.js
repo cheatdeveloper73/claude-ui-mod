@@ -19,6 +19,11 @@ function compile(label, src, wrapper) {
     catch (e) { fail(label + ': ' + e.message); }
 }
 
+console.log('bundled frontend:');
+const frontend = require('./lib/frontend-assets').verifyBundle();
+if (frontend.problems.length) frontend.problems.forEach(fail);
+else ok(frontend.assets + ' assets, exact hashes and dependency closure');
+
 console.log('compile:');
 compile('src/main-hook.js', fs.readFileSync(path.join(MOD, 'src/main-hook.js'), 'utf8'));
 compile('src/preload-hook.js', fs.readFileSync(path.join(MOD, 'src/preload-hook.js'), 'utf8'));

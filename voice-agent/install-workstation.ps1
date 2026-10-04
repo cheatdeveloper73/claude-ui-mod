@@ -13,6 +13,9 @@ $Venv = Join-Path $State 'venv'
 $TaskName = 'ClaudeUiMod-Voice'
 
 function Stop-VoiceTask {
+    # Disabled first: the watchdog trigger would otherwise restart the old
+    # definition between this stop and the re-register or unregister below.
+    Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
     $TokenPath = Join-Path $State 'token'
     $ConfigPath = Join-Path $State 'workstation.json'
     if ((Test-Path $TokenPath) -and (Test-Path $ConfigPath)) {
@@ -45,7 +48,6 @@ if (-not (Test-Path (Join-Path $Venv 'Scripts\python.exe'))) {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create the workstation Python environment.' }
 }
 $Python = Join-Path $Venv 'Scripts\python.exe'
-$Pythonw = Join-Path $Venv 'Scripts\pythonw.exe'
 & $Python -c 'import torch, torchaudio' 2>$null
 if ($LASTEXITCODE -ne 0) {
     & $Python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu `
@@ -74,15 +76,27 @@ if (-not (Test-Path $ConfigPath)) {
 }
 
 $LogPath = Join-Path $State 'companion.log'
-$Arguments = '"' + (Join-Path $Voice 'workstation.py') + '" --state-root "' + $State + '" --config "' + $ConfigPath + '" --log "' + $LogPath + '"'
-$Action = New-ScheduledTaskAction -Execute $Pythonw -Argument $Arguments -WorkingDirectory $Repo
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# The task runs guard.cs, which relaunches the companion the instant it exits
+# while the task is enabled. RestartOnFailure only covers a failed launch.
+$Guard = Join-Path $State 'voice-guard.exe'
+$Csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$Action = New-ScheduledTaskAction -Execute $Guard -Argument ('"' + $Repo + '" "' + $TaskName + '"') -WorkingDirectory $Repo
+# The every-minute trigger restarts a killed guard, which adopts the running
+# companion; IgnoreNew makes it a no-op while the guard runs. An omitted
+# repetition duration is indefinite. To keep voice down, Disable-ScheduledTask.
+$Watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$Watchdog.Repetition.StopAtDurationEnd = $false
+$Trigger = @((New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME), $Watchdog)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 20 -RestartInterval (New-TimeSpan -Minutes 1)
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 20 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -MultipleInstances IgnoreNew
 $Task = New-ScheduledTask -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings `
     -Description 'Local microphone capture, durable voice journal, and speech tunnel for claude-ui-mod.'
 Stop-VoiceTask
+& $Csc -nologo -target:winexe -optimize+ -r:System.Management.dll -r:Microsoft.CSharp.dll -r:System.Core.dll `
+    "-out:$Guard" (Join-Path $Voice 'guard.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Failed to build the voice guard.' }
 Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 

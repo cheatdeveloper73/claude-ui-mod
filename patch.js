@@ -179,7 +179,13 @@ function unbanSendMessage(source, log) {
     return out;
 }
 
+function verifyFrontend() {
+    const result = require('./lib/frontend-assets').verifyBundle();
+    if (result.problems.length) throw new Error('bundled frontend verification failed: ' + result.problems.join('; '));
+}
+
 function patchOne(a, log = console.log) {
+    verifyFrontend();
     // Always inject into pristine bytes so re-running never double-appends.
     let source = a.asar;
     if (fs.existsSync(a.backup)) {
@@ -233,6 +239,7 @@ function patchOne(a, log = console.log) {
 }
 
 function apply(opts = {}) {
+    verifyFrontend();
     const list = appDirs();
     if (!list.length) throw new Error('no app-<version> directory under ' + ROOT);
     const targets = (opts.all ? list : [list[0]]).filter((a) => opts.rebuild || !isPatched(a));

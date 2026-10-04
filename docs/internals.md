@@ -602,8 +602,33 @@ the change becomes active on the next document load or reload.
 
 ### The Code view can be held to one frontend release
 
-The mod can hold the Code view to a single approved frontend release. The
-mechanism and its measurements are in the private notes.
+The mod holds the Code view to a bundled approved frontend release by default.
+The public installation and compatibility boundary are in
+[frontend-pin.md](frontend-pin.md). The entry, release sheets, supporting utility
+sheet and static asset graph live under `vendor/claude-code-frontend/`; CDP Fetch
+serves their original bytes at the original HTTPS URLs. The bundle manifest is
+the authority for filenames, hashes and bootstrap flag overrides. Dedicated
+workers' requests reach the owning page's Fetch agent. Worker targets themselves
+reject `Fetch.enable`, so attaching them is neither needed nor correct.
+Missing/corrupt archived bytes abort locally;
+they do not trigger a CDN download.
+
+The document, build ID, account bootstrap, runtime gated imports and backend
+contracts remain live. This archive removes retention of the approved CDN graph
+as an installation dependency; it does not make the Claude service offline.
+On 2026-10-03, an independent JavaScript parser found no missing static imports
+in the archived graph, and an independent exact asset-literal sweep found no
+missing hashed references. The focused plugin check fulfills every archived
+asset with its exact manifest bytes. A fresh-profile, isolated Chrome
+154.0.8037.93 / CDP 1.3 check fulfilled the entry and release sheets from disk,
+decoded an archived WOFF2 through `FontFace.load()`, and returned identical
+archived Wasm bytes through both page and dedicated-worker fetches with external
+asset requests blocked. The worker request arrived at the page's Fetch agent;
+worker targets rejected both `Fetch.enable` and legacy
+`Network.setRequestInterception`. No worker debugger attachment is needed.
+The warning was captured at desktop and narrow widths from the actual renderer
+source with an injected failure. These are archive/protocol/isolated-renderer
+checks, not an authenticated Desktop cold-launch measurement.
 
 ## The file pane's "Couldn't find this file" is a granted-roots refusal
 
@@ -4425,6 +4450,22 @@ the `fast-mode-overage-rejected` notification ("usage credits exhausted") and
 served `speed: standard`. Desktop then turns the session's fast off itself
 (`handleFastModeCreditsNotice`).
 
+Source-verified on 2026-10-03 in Desktop 2.9939.4: this handler in
+`.vite/build/index.chunk-yciyIejk.js` accepts a root `system/notification` keyed
+`fast-mode-overage-rejected` without checking the session's provider. It changes
+`fastModeState` to `off`, sets the credit-settlement flags, calls
+`setFastMode(sessionId, false)`, and emits `fastModeCreditsExhausted`. The shell
+uses that event for a background Windows notification. Independently, the pinned
+`c66fe388e-DPBHRy8_.js` frontend recognizes the raw notice in a streamed message,
+clears its fast selection and shows the focused-session toast. Guarding only one
+path leaves the other active. `fast-mode/main.js` guards both the credit handler
+and `emitStreamMessage` for models resolved by the existing external-provider
+catalogues. Other notifications and actual provider errors keep their native
+paths; native Claude credit handling remains unchanged. `tests/fast-mode.test.js`
+replays the extracted handler and emitter and covers provider switches and
+hot-reload disposal. This establishes the provider-blind handling; the upstream
+origin of the reported OpenAI session's notification was not captured.
+
 The Codex backend takes `service_tier:"priority"`, the tier the models cache
 lists per slug as `{id:"priority", name:"Fast"}`. `"fast"` and `"flex"` return
 400 `Unsupported service_tier`. The completed response reports
@@ -4475,3 +4516,55 @@ parent                 tier=priority
 subagent, #fast        tier=priority   transcript speed fast
 subagent, plain        tier=default    transcript speed standard
 ```
+
+## Reading a file under `src/` can reload the host (2026-10-02)
+
+libuv's Windows recursive `fs.watch` subscribes to last-access changes. NTFS
+updates atime on a read when the stored value is over an hour stale, so reading
+such a file reports `change:<file>` with mtime and ctime unchanged (reproduced
+in a scratch tree with Node 24.12). After a long idle, the host's own boot-time
+`require` of every plugin fired the `src/` watcher and reloaded the host
+mid-launch. `main-hook.js` now drops an event whose `max(mtimeMs, ctimeMs)` has
+not moved past the last seen value, with the watcher's start time as the
+baseline. Edits, creates and renames all move one of the two.
+
+## Driving dot from code
+
+Read 2026-10-03 against ChatGPT desktop (package OpenAI.Codex) 26.930.2377. Dot
+threads (`threadSource: "aeon"`) are served by the app's `durable` host, not the
+local Codex rollouts. The main window page (`app://-/index.html`) exposes
+`electronBridge.sendMessageFromView`; an `{ type: 'mcp-request', hostId, request }`
+envelope is passed unchanged to that host's app-server, and the reply arrives as a
+window `message` of type `mcp-response`. `thread/list`, `thread/read`,
+`thread/turns/list` (`itemsView: 'notLoaded'` only) and `thread/items/list` work
+that way, and `turn/addUserMessage` admits a user message. Dot's visible replies
+are `user_message.send_message` tool calls. Chat messages typed in ChatGPT go
+through `/messaging/rooms/{room_id}/messages`, which needs the app's sentinel
+token, so `scripts/dot.mjs` uses the app-server route. CDP needs the app launched
+with `--remote-debugging-port` through `Invoke-CommandInDesktopPackage`. Killing
+the app to relaunch it also kills dot's local exec-server.
+
+The first live send landed in an idle dot and was answered. The owner's chat message
+then steered into that still-running turn after a mid-turn context compaction, and
+the turn stayed `inProgress` with no further items until `turn/interrupt`. The
+cause is not isolated. The script now refuses to send into an active dot.
+
+## Bounded bridge reads for native SSH sessions (2026-10-03)
+
+Verified in Desktop 2.9939.4 and against three migrated Windows sessions.
+The old local transcript remains after migration, so a CLI-ID file glob cannot
+establish the current source. The session's native `sshRemoteTranscriptPath`
+names the remote file. `connectForRemoteSpawn(target, id, 'warm_up',
+{automatic:true})` supplies Desktop's authenticated RemoteServerController;
+`withSftp` and `sftpPath` support an exact read-only handle and byte range.
+This does not start a model turn. Live reads paginated 67.8–78.1 MB histories
+using at most 256 KiB per request, with the target still non-running.
+
+The bridge reader checks account, target and CLI identity before and after the
+asynchronous range read, closes handles and uses a lifecycle-owned 15-second
+deadline. It never falls back to the stale local file. The shared parser keeps
+raw-byte pagination and excludes thinking, tool payloads and sidechains.
+Search, exchange reads and handoff byte baselines now await that read; handoff
+checks its captured CLI ID again before sending. Tests cover partial SFTP reads,
+UTF-8 pagination, deadlines, late-handle cleanup, stale local copies and identity
+changes. WSL remains unsupported by this reader.

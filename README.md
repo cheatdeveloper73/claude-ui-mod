@@ -65,6 +65,7 @@ Quit Claude Desktop from the tray first, then:
 ```bash
 git clone https://gitlab.com/blockshooter/claude-ui-mod && cd claude-ui-mod
 npm ci
+node scripts/verify-frontend.cjs
 node patch.js apply
 ```
 
@@ -167,9 +168,21 @@ by forcing a font on the subtree.
 
 ## Plugins
 
-33 plugins ship in `src/plugins/`. Most have a panel in the dashboard, and
+Plugins ship in `src/plugins/`. Most have a panel in the dashboard, and
 adding your own needs no re-patch: drop a directory into `src/plugins/` and it
 loads live. See [docs/plugin-api.md](docs/plugin-api.md).
+
+### Frontend compatibility
+
+`frontend-pin` ships enabled by default. It holds Code on the approved entry and
+serves its JavaScript, CSS, fonts, images and Wasm from the bundled asset archive.
+A fresh install needs no old browser cache or CDN download. Missing or corrupt
+bundled files and a failed pin display an unsupported-frontend warning.
+
+The Desktop shell and the Code frontend have independent release channels.
+Authentication, APIs, the document bootstrap and server-selected gated imports
+remain live. See [the frontend pin runbook](docs/frontend-pin.md) for the exact
+boundary, verification and recovery controls.
 
 ### Bug fixes
 
@@ -409,10 +422,11 @@ Optional, by feature:
 Current development target is app **2.9939.4** (Electron 44.4.3, Chromium
 152.0.7977.130); the `SendMessage` patch audit also covers 2.7032.0. The first
 release was verified against 1.26832.0 (Electron 42, Chromium 148). The patcher
-reads what it needs out of the shipped bundle rather than hardcoding it, so
-minor updates are expected to keep working, and plugins that anchor on claude.ai
-markup are the part most likely to need a repair after an update. The
-version-specific facts are listed in [docs/internals.md](docs/internals.md).
+reads what it needs out of the shipped shell bundle rather than hardcoding it.
+The bundled frontend pin separately holds the Code markup release targeted by
+the UI plugins. Future shell IPC changes and live document/backend changes can
+still require a repair. The version-specific facts are listed in
+[docs/internals.md](docs/internals.md).
 
 ## Install
 
@@ -423,6 +437,7 @@ while it runs, and the running version cannot be replaced.
 git clone https://gitlab.com/blockshooter/claude-ui-mod
 cd claude-ui-mod
 npm ci
+node scripts/verify-frontend.cjs
 node patch.js apply
 ```
 

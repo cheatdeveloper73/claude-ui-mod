@@ -47,6 +47,7 @@ import { applyPromptPolicy, promptPolicyHeaders, resolvePromptPolicy } from './p
 import { capturePrompt } from './prompt-capture.mjs';
 import { fastTier } from './fast-mode.mjs';
 import { openAIRequest } from './openai-transport.mjs';
+import { authorityConfig, authorizeClaude, readerCredential } from './credential-authority.mjs';
 import {
     CompactionStore,
     anthropicSummaryResponse,
@@ -1360,8 +1361,9 @@ async function handleOpenAI(req, res, body)
 async function handlePassthrough(req, res, rawBody, body, urlPath)
 {
     const gone = () => res.writableEnded || res.destroyed;
-    const headers = {};
+    let headers = {};
     for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k.toLowerCase())) headers[k] = v;
+    headers = await authorizeClaude(headers, log);
 
     let selection = null;
     let outgoing = rawBody;
@@ -1809,13 +1811,14 @@ const server = http.createServer((req, res) =>
                 let chatgptExpiresIn = null;
                 try
                 {
-                    const t = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8').replace(/^﻿/, ''))?.tokens;
+                    const t = readerCredential('openai') || JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8').replace(/^﻿/, ''))?.tokens;
                     chatgptOk = !!(t?.access_token && t?.account_id);
                     const payload = JSON.parse(Buffer.from(String(t.access_token).split('.')[1], 'base64url').toString('utf8'));
                     if (payload?.exp) chatgptExpiresIn = Math.round(payload.exp - Date.now() / 1000);
                 }
                 catch (_) {}
 
+                const authority = authorityConfig();
                 const adapterHealth = providerAdapters.health();
                 // Adapters are resolved before built-in arms for inference, so
                 // contested ids must report the same owner here.
@@ -1831,7 +1834,8 @@ const server = http.createServer((req, res) =>
                     ok: true,
                     anthropic: ANTHROPIC,
                     openai: RESPONSES_URL,
-                    authFile: AUTH_FILE,
+                    authFile: authority?.reader ? authority.viewFile : AUTH_FILE,
+                    credentialAuthority: authority ? { host: authority.authorityHost, reader: authority.reader } : null,
                     chatgptOk,
                     chatgptExpiresIn,
                     models: OPENAI_MODELS.map((m) => m.id),
@@ -1875,7 +1879,7 @@ const server = http.createServer((req, res) =>
                     fetch(ANTHROPIC + req.url, {
                         method: 'GET',
                         signal: AbortSignal.timeout(3000),
-                        headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP_REQ.has(k.toLowerCase()))),
+                        headers: await authorizeClaude(Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP_REQ.has(k.toLowerCase()))), log),
                     }).then(async response => response.ok ? await response.json().catch(() => null) : (await response.body?.cancel(), null)).catch(() => null),
                     providerAdapters.modelIds(),
                 ]);

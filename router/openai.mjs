@@ -39,6 +39,7 @@ import crypto from 'node:crypto';
 import { readProviderSettings } from './settings.mjs';
 import { applyPromptPolicy, policyChangesCachePrefix } from './prompt-policy.mjs';
 import { stripFastMarker } from './fast-mode.mjs';
+import { readerCredential, replaceCredential } from './credential-authority.mjs';
 
 const AUTH_FILE = process.env.CODEX_AUTH_FILE
     || path.join(os.homedir(), '.codex', 'auth.json');
@@ -149,8 +150,9 @@ export function parseOpenAIModel(raw, requestedEffort = null)
 
 function readAuth()
 {
-    const raw = fs.readFileSync(AUTH_FILE, 'utf8').replace(/^﻿/, '');
-    const j = JSON.parse(raw);
+    let j;
+    try { j = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8').replace(/^﻿/, '')); }
+    catch { throw new Error('OpenAI credential file could not be read'); }
     const t = j?.tokens;
     if (!t?.access_token) throw new Error(`no tokens.access_token in ${AUTH_FILE}`);
     return { file: j, tokens: t };
@@ -222,8 +224,8 @@ async function refreshAuth(log)
             }),
         });
 
+        if (!res.ok) { await res.body?.cancel(); throw new Error(`token refresh HTTP ${res.status}`); }
         const text = await res.text();
-        if (!res.ok) throw new Error(`token refresh ${res.status}: ${text.slice(0, 300)}`);
 
         let got;
         try { got = JSON.parse(text); }
@@ -235,13 +237,7 @@ async function refreshAuth(log)
         if (got.id_token)      next.tokens.id_token      = got.id_token;
         next.last_refresh = new Date().toISOString();
 
-        const tmp = AUTH_FILE + `.bridge-tmp-${process.pid}`;
-        try
-        {
-            fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-            fs.renameSync(tmp, AUTH_FILE);
-        }
-        finally { try { fs.unlinkSync(tmp); } catch (_) {} }
+        replaceCredential(AUTH_FILE, next);
 
         log?.(`refreshed chatgpt oauth (rotated=${!!got.refresh_token})`);
         return next.tokens;
@@ -255,6 +251,8 @@ let refreshInFlight = null;
 
 export async function chatgptAuth(log)
 {
+    const reader = readerCredential('openai');
+    if (reader) return reader;
     let { tokens } = readAuth();
 
     const exp = jwtExpiry(tokens.access_token);

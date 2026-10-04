@@ -106,10 +106,15 @@ module.exports = function (ctx) {
             } catch (_) {}
         }
         if (manager) {
-            replace(manager, 'startSession', original => function (options, ...rest) {
+            replace(manager, 'startSession', original => async function (options, ...rest) {
+                if (options?.sessionId && this.sessions.has(options.sessionId))
+                    await globalThis[Symbol.for('cuimod.native.dormant-migration')]?.reconcile(this, options.sessionId);
+                options = await globalThis[Symbol.for('cuimod.native.dormant-migration')]?.prepareStart?.(this, options, rest[0]) ?? options;
                 return state.als.run({ model: options?.model }, () => Reflect.apply(original, this, [options, ...rest]));
             });
-            replace(manager, 'sendMessage', original => function (sessionId, ...rest) {
+            replace(manager, 'sendMessage', original => async function (sessionId, ...rest) {
+                if (this.sessions.has(sessionId))
+                    await globalThis[Symbol.for('cuimod.native.dormant-migration')]?.reconcile(this, sessionId);
                 const model = this.sessions?.get(sessionId)?.model;
                 return state.als.run({ model }, () => Reflect.apply(original, this, [sessionId, ...rest]));
             });

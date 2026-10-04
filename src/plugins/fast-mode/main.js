@@ -23,6 +23,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const { routedModel } = require('../unlock-code/main');
 
 const STATE = ['.state', 'fast-mode.json'];
 // On the worker's query object, so a host reload does not push twice.
@@ -120,10 +121,43 @@ module.exports = function (ctx) {
         } catch (err) { ctx.log('fast-mode capability push failed: ' + (err?.message || err)); }
     }
 
+    function externalCreditsNotice(session, message) {
+        return message?.type === 'system' && message.subtype === 'notification'
+            && message.key === 'fast-mode-overage-rejected' && !message.parent_tool_use_id
+            && routedModel(modDir, session?.model);
+    }
+
+    // Desktop's credit handler changes the switch before emitting its background
+    // notice. The frontend also creates a toast from the raw streamed message.
+    // Guard both boundaries; filtering only the toast still persists fast:false.
+    const creditGuards = new Map();
+    function guardCredits(manager) {
+        let guards = creditGuards.get(manager);
+        if (!guards) { guards = new Map(); creditGuards.set(manager, guards); }
+        for (const key of ['handleFastModeCreditsNotice', 'emitStreamMessage']) {
+            const current = manager[key];
+            if (typeof current !== 'function' || guards.get(key)?.wrapper === current) continue;
+            const original = current.__cuimodFastCreditsOriginal || current;
+            const wrapper = key === 'handleFastModeCreditsNotice'
+                ? function (context, message, ...rest) {
+                    if (externalCreditsNotice(context?.session, message)) return;
+                    return original.call(this, context, message, ...rest);
+                }
+                : function (session, sessionId, message, ...rest) {
+                    if (externalCreditsNotice(session, message)) return;
+                    return original.call(this, session, sessionId, message, ...rest);
+                };
+            wrapper.__cuimodFastCreditsOriginal = original;
+            manager[key] = wrapper;
+            guards.set(key, { original, wrapper });
+        }
+    }
+
     // manager -> { original, wrapper }
     const wrapped = new Map();
     function attach() {
         for (const manager of managers()) {
+            guardCredits(manager);
             const current = manager.setFastMode;
             if (wrapped.get(manager)?.wrapper === current) continue;
             // A newer host generation is built before this one is disposed;
@@ -154,6 +188,9 @@ module.exports = function (ctx) {
         for (const [manager, { original, wrapper }] of wrapped)
             if (manager.setFastMode === wrapper) manager.setFastMode = original;
         wrapped.clear();
+        for (const [manager, guards] of creditGuards) for (const [key, { original, wrapper }] of guards)
+            if (manager[key] === wrapper) manager[key] = original;
+        creditGuards.clear();
     });
 
     function session(sessionId) {

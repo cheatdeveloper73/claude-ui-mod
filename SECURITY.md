@@ -49,6 +49,17 @@ read them before dropping them into `src/plugins/`.
 
 Most plugins only draw UI. These do more:
 
+- **`frontend-pin`** attaches CDP Fetch to Code views. Dedicated worker asset
+  requests arrive through their owning view's interceptor; workers are never
+  attached or paused. It
+  rewrites the Code document's entry and shared stylesheet URLs, serves the
+  archived frontend's assets from local files, and holds the manifest's two
+  bootstrap UI flags off. Cookies, account data, sessions, backend APIs and
+  server-selected gated imports remain live. The archive contains original
+  public CDN assets, not a signed-in document or account bootstrap. Missing or
+  corrupt archived bytes abort locally and display a compatibility warning.
+  The dashboard toggle detaches interception without reloading the open page.
+  See [the frontend pin boundary](docs/frontend-pin.md).
 - **`file-pane-access`** wraps the app's file-read handler. When the shell
   answers "not found" for a path the page asks for, it returns the file itself
   if it exists on your disk: any file you can read, up to 10 MB, read-only, with

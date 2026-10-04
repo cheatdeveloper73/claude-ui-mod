@@ -106,9 +106,24 @@
         // Watcher lives in the loader so a broken host is always recoverable.
         let timer = null;
         let pendingRenderOnly = true;
+        // libuv watches last-access too, so merely reading a file whose atime is
+        // over an hour stale reports a change. The host's own boot-time require
+        // did exactly that after a long idle and reloaded the host mid-launch.
+        // A real edit, create or rename moves mtime or ctime; a read moves neither.
+        const watchStart = Date.now();
+        const stamps = new Map();
+        function touchedOnly(n) {
+            let st;
+            try { st = fs.statSync(path.join(srcRoot, n)); } catch (_) { return false; }
+            const stamp = Math.max(st.mtimeMs, st.ctimeMs);
+            if (stamp <= (stamps.get(n) || watchStart)) return true;
+            stamps.set(n, stamp);
+            return false;
+        }
         function onChange(name) {
             const n = String(name || '').replace(/\\/g, '/');
             if (!/\.(js|css|json)$/.test(n)) return;
+            if (touchedOnly(n)) return;
             const rendererOnly = /(renderer\.js|bridge\.js|\.css)$/.test(n);
             if (!rendererOnly) pendingRenderOnly = false;
             clearTimeout(timer);

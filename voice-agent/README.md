@@ -182,6 +182,8 @@ Get-ScheduledTask -TaskName ClaudeUiMod-Voice | Get-ScheduledTaskInfo
 systemctl --user status cuimod-voice.service
 ```
 
+The task's action is `voice-guard.exe`, built from `guard.cs` by the installer. It waits on the companion's process handle and relaunches it as soon as it exits, while the task is enabled. A killed companion answers again with capture ready in about 3 s. The guard is a native program, so a sweep that kills `pythonw.exe` leaves it running. The companion respawns the recorder on reconnect. A second trigger fires every minute; with `IgnoreNew` it does nothing while the guard runs. If the guard is killed, that trigger restarts it, and it adopts the companion that is still running. The task's own restart-on-failure setting covers only a failed launch. To keep voice down on purpose, run `Disable-ScheduledTask -TaskName ClaudeUiMod-Voice` and then stop the task. A plain stop is undone within a minute. `.state/voice-agent/guard.log` records every launch, exit code and adoption.
+
 If the compute host or tunnel is unavailable, capture continues and closes WAV files locally. Retry jobs stay beside those files and are reprocessed after connectivity returns. If the microphone disappears, the capture thread reconnects with exponential backoff while the API and retry worker remain alive.
 
 ## Tests

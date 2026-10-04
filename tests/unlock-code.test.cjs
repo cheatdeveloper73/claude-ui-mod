@@ -28,6 +28,37 @@ test("unlock-code plugin syntax and exports", () => {
     assert.match(rendererCode, /suppressUpsells/, "renderer.js includes upsell suppression");
 });
 
+test("session starts work without an optional native preparation plugin", async () => {
+    const mainPath = path.resolve(__dirname, "../src/plugins/unlock-code/main.js");
+    const key = Symbol.for("cuimod.native.dormant-migration");
+    const previous = globalThis[key];
+    const cacheKey = path.join(__dirname, "fixture-native-start.cjs");
+    const manager = { sessions: new Map(), startSession: async options => options };
+    require.cache[cacheKey] = { exports: { claudeCodeSessionManager: manager } };
+    const disposers = [];
+    try {
+        delete globalThis[key];
+        require(mainPath)({ dir: path.dirname(mainPath), boot: { MOD_DIR: path.resolve(__dirname, "..") },
+            electron: { webContents: { getAllWebContents: () => [] } },
+            every() {}, method() {}, onDispose: fn => disposers.push(fn) });
+        const options = { cwd: "fixture", message: "hello", model: "claude-opus-5" };
+        assert.equal(await manager.startSession(options), options);
+        globalThis[key] = { reconcile() {} };
+        assert.equal(await manager.startSession(options), options);
+        globalThis[key] = { prepareStart: async (owner, input, flags) => {
+            assert.equal(owner, manager);
+            assert.equal(input, options);
+            assert.equal(flags.initiator, "user");
+            return { ...input, prepared: true };
+        } };
+        assert.deepEqual(await manager.startSession(options, { initiator: "user" }), { ...options, prepared: true });
+    } finally {
+        disposers.reverse().forEach(fn => fn());
+        delete require.cache[cacheKey];
+        if (previous === undefined) delete globalThis[key]; else globalThis[key] = previous;
+    }
+});
+
 test("unlock-code clears precomputed model selector upgrade gates", () => {
     const pageCode = fs.readFileSync(path.resolve(__dirname, "../src/plugins/unlock-code/page.js"), "utf8");
     const query = {

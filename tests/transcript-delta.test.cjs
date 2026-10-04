@@ -47,6 +47,7 @@ function rig() {
     // state, so each rig needs its own instance of the factory.
     delete require.cache[require.resolve(PLUGIN)];
     require(PLUGIN)({
+        boot: { MOD_DIR: path.join(root, 'mod') },
         dir,
         log: () => {},
         method: (m, fn) => methods.set(m, fn),

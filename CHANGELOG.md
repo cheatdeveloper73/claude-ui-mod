@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semver](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Frontend compatibility** — the approved Code frontend and its static asset
+  graph now ship with the public mod. The pin is enabled by default and serves
+  integrity-checked local bytes under the original URLs, including worker
+  assets and the supporting utility stylesheet. Installs no longer depend on
+  an old browser cache or retention of those CDN files. Pin failures display an
+  unsupported-frontend warning. Selfcheck and the public export verify the
+  archive; the public runbook separates the pinned assets from live document,
+  authentication, gated-import and API contracts.
+
 ## [1.2.0] — 2026-10-01
 
 ### Added

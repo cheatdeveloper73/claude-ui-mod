@@ -2,6 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 const TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
@@ -14,7 +15,9 @@ function decodeJwt(token) {
 }
 
 function authIdentity(file, raw) {
-    const value = JSON.parse(raw.replace(/^﻿/, ''));
+    let value;
+    try { value = JSON.parse(raw.replace(/^﻿/, '')); }
+    catch (_) { throw new Error('OpenAI login credential file is invalid'); }
     const tokens = value?.tokens;
     if (!tokens?.access_token || !tokens?.account_id) throw new Error('OpenAI login did not return a subscription account');
     const access = decodeJwt(tokens.access_token);
@@ -58,6 +61,7 @@ function weeklyLimit(value) {
 
 function atomicWrite(file, contents) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.backup-${crypto.randomUUID()}`, fs.constants.COPYFILE_EXCL);
     const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
     try {
         fs.writeFileSync(tmp, contents);
@@ -87,6 +91,17 @@ module.exports = function createOpenAIAccounts(options) {
     const usageInflight = new Map();
     let login = null;
     let disposed = false;
+
+    function isReader() {
+        const file = process.env.MODEL_ROUTER_AUTHORITY_FILE || path.join(stateDir, 'credential-authority.json');
+        if (!fs.existsSync(file)) return false;
+        let value;
+        try { value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); }
+        catch (_) { throw new Error('Credential authority configuration is unavailable.'); }
+        if (value?.version !== 1 || typeof value.authorityHost !== 'string')
+            throw new Error('Credential authority configuration is unavailable.');
+        return value.authorityHost.toLowerCase() !== os.hostname().toLowerCase();
+    }
 
     function readIndex() {
         try {
@@ -134,7 +149,7 @@ module.exports = function createOpenAIAccounts(options) {
 
     function publicStatus() {
         let authError = null;
-        try { syncCanonical(); }
+        try { if (!isReader()) syncCanonical(); }
         catch (_) { authError = 'OpenAI is signed out'; }
         const active = readIndex().active || null;
         const accounts = profileAccounts().map(account => ({
@@ -154,6 +169,7 @@ module.exports = function createOpenAIAccounts(options) {
     }
 
     async function withAuthLock(fn) {
+        if (isReader()) throw new Error('OpenAI credentials are owned by the UI machine.');
         let handle = null;
         for (let i = 0; i < 200 && !disposed; i++) {
             try {
@@ -176,6 +192,12 @@ module.exports = function createOpenAIAccounts(options) {
     }
 
     async function freshAccount(id) {
+        if (isReader()) {
+            const { readerCredential } = await import('../../../router/credential-authority.mjs');
+            const account = authIdentity(authFile, JSON.stringify({ tokens: readerCredential('openai') }));
+            if (account.id !== id) throw new Error('Inactive account usage is owned by the UI machine.');
+            return account;
+        }
         let account = readAuth(profileFile(id));
         const expiry = jwtExpiry(JSON.parse(account.raw).tokens?.access_token);
         if (!expiry || Date.now() <= expiry - 300000) return account;
@@ -260,6 +282,7 @@ module.exports = function createOpenAIAccounts(options) {
     }
 
     async function autoSwitch(threshold, currentSettings) {
+        if (isReader()) return { switched: false, reason: 'authority-owned' };
         const limit = Number(threshold);
         if (!Number.isFinite(limit)) return { switched: false, reason: 'invalid-threshold' };
 
@@ -392,6 +415,7 @@ module.exports = function createOpenAIAccounts(options) {
     }
 
     function startLogin() {
+        if (isReader()) throw new Error('OpenAI sign-in is owned by the UI machine.');
         if (login?.phase === 'waiting') return publicStatus();
         const home = path.join(stateDir, `openai-login-${crypto.randomBytes(8).toString('hex')}`);
         fs.mkdirSync(home, { recursive: true });
