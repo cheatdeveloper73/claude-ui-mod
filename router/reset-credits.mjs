@@ -49,9 +49,10 @@ export function appServerRequest(method, params, options = {})
 {
     const { command, shell } = options.binary || codexBinary();
     const timeoutMs = options.timeoutMs ?? 30000;
+    const env = options.env ? { ...process.env, ...options.env } : process.env;
     return new Promise((resolve, reject) => {
         let child;
-        try { child = spawn(command, ['app-server'], { stdio: ['pipe', 'pipe', 'pipe'], shell, windowsHide: true }); }
+        try { child = spawn(command, ['app-server'], { stdio: ['pipe', 'pipe', 'pipe'], shell, windowsHide: true, env }); }
         catch (error) { reject(new Error(`codex app-server could not start: ${String(error?.message || error)}`)); return; }
 
         let settled = false;

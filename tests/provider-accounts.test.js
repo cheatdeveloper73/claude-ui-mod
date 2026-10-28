@@ -247,6 +247,214 @@ test('usage reads each stored account once and returns no credentials', async ()
     }
 });
 
+test('usage exposes reset-credit count and consumes only the selected account before rereading it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-reset-credit-account-'));
+    const stateDir = path.join(root, '.state');
+    const authFile = path.join(root, '.codex', 'auth.json');
+    fs.mkdirSync(path.dirname(authFile), { recursive: true });
+    fs.writeFileSync(authFile, auth('account-one', 'one@example.test', 'One', 'plus'));
+    const usageCalls = [];
+    const consumeCalls = [];
+    const remaining = new Map([['account-one', [2]], ['account-two', [5, 5, 4]]]);
+    const manager = createOpenAIAccounts({
+        authFile, stateDir, usageCacheMs: 60000, spawnLogin() { throw new Error('unused'); },
+        fetch: async (_url, options) => {
+            const id = options.headers['chatgpt-account-id'];
+            usageCalls.push(id);
+            const values = remaining.get(id) || [];
+            const resetCredits = values.shift();
+            return new Response(JSON.stringify({
+                rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 604800, reset_at: 1893456000 } },
+                rate_limit_reset_credits: { available_count: resetCredits },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        },
+        appServerRequest: async (method, params, options) => {
+            assert.equal(method, 'account/rateLimitResetCredit/consume');
+            const scopedHome = options.env.CODEX_HOME;
+            const scoped = JSON.parse(fs.readFileSync(path.join(scopedHome, 'auth.json'), 'utf8'));
+            consumeCalls.push({ id: scoped.tokens.account_id, key: params.idempotencyKey, scopedHome });
+            return { outcome: 'reset' };
+        },
+    });
+    try {
+        manager.status();
+        const target = addProfile(stateDir, auth('account-two', 'two@example.test', 'Two', 'pro'));
+        const before = await manager.usage();
+        assert.equal(before.accounts.find(account => account.id === target.id).usage.resetCredits, 5);
+
+        const after = await manager.consumeResetCredit(target.id);
+        assert.equal(after.accountId, target.id);
+        assert.equal(after.outcome, 'reset');
+        assert.equal(after.usage.resetCredits, 4);
+        assert.deepEqual(consumeCalls.map(call => call.id), ['account-two']);
+        assert.match(consumeCalls[0].key, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        assert.equal(fs.existsSync(consumeCalls[0].scopedHome), false, 'scoped auth home must be removed after the request');
+        assert.equal(JSON.parse(fs.readFileSync(authFile, 'utf8')).tokens.account_id, 'account-one',
+            'consumption must never switch the canonical account');
+        assert.deepEqual(usageCalls, ['account-one', 'account-two', 'account-two', 'account-two']);
+    } finally {
+        manager.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('reset retries reuse their key and overlapping requests consume once', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-reset-retry-'));
+    const authFile = path.join(root, 'auth.json');
+    fs.writeFileSync(authFile, auth('account-one', 'one@example.test', 'One', 'plus'));
+    const keys = [];
+    let fail = true;
+    const options = {
+        authFile, stateDir: path.join(root, '.state'),
+        fetch: async () => new Response(JSON.stringify({
+            rate_limit: { primary_window: { used_percent: fail ? 99 : 0, limit_window_seconds: 604800, reset_at: 1893456000 } },
+            rate_limit_reset_credits: { available_count: fail ? 2 : 1 },
+        })),
+        appServerRequest: async (_method, params) => {
+            keys.push(params.idempotencyKey);
+            await new Promise(resolve => setTimeout(resolve, 15));
+            if (fail) throw new Error('response lost');
+            return { outcome: 'alreadyRedeemed' };
+        },
+    };
+    let manager = createOpenAIAccounts(options);
+    try {
+        const id = manager.status().active;
+        await assert.rejects(manager.consumeResetCredit(id), /response lost/);
+        await assert.rejects(manager.consumeResetCredit(id), /response lost/);
+        assert.equal(keys[0], keys[1], 'a new usage observation must not create a second redemption key');
+        fail = false;
+        manager.dispose();
+        manager = createOpenAIAccounts(options);
+        const results = await Promise.all([manager.consumeResetCredit(id), manager.consumeResetCredit(id)]);
+        assert.equal(keys.length, 3);
+        assert.equal(keys[2], keys[0], 'a lost response can already have reduced the API credit count');
+        assert.equal(results[0].usage.weekly.usedPercent, 0);
+        assert.deepEqual(results[0], results[1]);
+    } finally {
+        manager.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+function resetRendererHarness() {
+    const source = fs.readFileSync(path.join(__dirname, '../src/plugins/provider-picker/renderer.js'), 'utf8');
+    const nodes = [];
+    const calls = [];
+    let answer = { accountId: 'one', outcome: 'reset', usage: { observedAt: 'after', resetCredits: 1, weekly: { usedPercent: 0 } } };
+    const context = vm.createContext({
+        document: { createElement() {
+            const handlers = {};
+            const node = { style: {}, setAttribute() {}, append(icon) { this.icon = icon; }, addEventListener: (event, fn) => { handlers[event] = fn; },
+                dispatch: (event, detail = 1) => handlers[event]?.({ detail }) };
+            nodes.push(node);
+            return node;
+        } },
+        cuimod: { rpc: async (method, params) => { calls.push({ method, params }); if (answer instanceof Error) throw answer; return answer; } },
+        queueMicrotask,
+    });
+    vm.runInContext(`let accountState = { accounts: [{ id: 'one', usage: { observedAt: 'before', resetCredits: 2, weekly: { usedPercent: 99 } } }] };
+        let accountBusy = false, accountResetBusy = null, accountResetConfirm = null;
+        let accountUsageBusy = false, disposed = false;
+        function paintAccountPanel() {}
+        const accountName = account => account.id;
+        ${source.slice(source.indexOf('function mergeAccountUsage('), source.indexOf('function resetDate('))}
+        ${source.slice(source.indexOf('function accountButton('), source.indexOf('function accountAction('))}
+        ${source.slice(source.indexOf('function accountResetButton('), source.indexOf('function paintAccountPanel('))}
+        function make() { return accountResetButton(accountState.accounts[0], false, false); }
+        function state() { return accountState.accounts[0].usage; }`, context);
+    return { context, calls, make: () => vm.runInContext('make()', context), state: () => vm.runInContext('state()', context),
+        fail: () => { answer = new Error('refresh failed'); } };
+}
+
+test('displayed reset count requires a double click and repaints returned usage', async () => {
+    const ui = resetRendererHarness();
+    const button = ui.make();
+    assert.match(button.textContent, /2 resets/);
+    assert.equal(button.icon?.innerHTML?.includes('stroke-width="2.4"'), true, 'reset icon must use a drawn, legible stroke');
+    assert.equal(button.textContent.includes('↻'), false, 'the font glyph must not be used');
+    await button.dispatch('click', 1);
+    assert.equal(ui.calls.length, 0, 'single click only arms confirmation');
+    await button.dispatch('click', 2);
+    assert.equal(ui.calls.length, 0, 'the second click event alone must not redeem');
+    await button.dispatch('dblclick', 2);
+    assert.equal(ui.calls.length, 1);
+    assert.equal(ui.calls[0].params.id, 'one');
+    assert.equal(ui.state().weekly.usedPercent, 0);
+    assert.equal(ui.state().resetCredits, 1);
+});
+
+test('changed usage invalidates double-click confirmation and duplicate events cannot redeem twice', async () => {
+    const ui = resetRendererHarness();
+    const button = ui.make();
+    await button.dispatch('click', 1);
+    vm.runInContext("accountState.accounts[0].usage.observedAt = 'newer'", ui.context);
+    await button.dispatch('dblclick', 2);
+    assert.equal(ui.calls.length, 0);
+    await button.dispatch('click', 1);
+    await Promise.all([button.dispatch('dblclick', 2), button.dispatch('dblclick', 2)]);
+    assert.equal(ui.calls.length, 1);
+});
+
+test('zero or unknown reset credits never reach the consume transport', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-reset-unavailable-'));
+    const authFile = path.join(root, 'auth.json');
+    fs.writeFileSync(authFile, auth('account-one', 'one@example.test', 'One', 'plus'));
+    let count = 0;
+    let calls = 0;
+    const manager = createOpenAIAccounts({
+        authFile, stateDir: path.join(root, '.state'),
+        fetch: async () => new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: count } })),
+        appServerRequest: async () => { calls++; throw new Error('must never consume'); },
+    });
+    try {
+        const id = manager.status().active;
+        for (count of [0, null, -1, 1.5]) await assert.rejects(manager.consumeResetCredit(id), /No OpenAI reset credit/);
+        assert.equal(calls, 0);
+    } finally {
+        manager.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('failed post-reset read invalidates the cached pre-reset meter', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-reset-refresh-'));
+    const authFile = path.join(root, 'auth.json');
+    fs.writeFileSync(authFile, auth('account-one', 'one@example.test', 'One', 'plus'));
+    let consumed = false;
+    const manager = createOpenAIAccounts({
+        authFile, stateDir: path.join(root, '.state'),
+        fetch: async () => {
+            if (consumed) throw new Error('usage read failed');
+            return new Response(JSON.stringify({ rate_limit_reset_credits: { available_count: 2 },
+                rate_limit: { primary_window: { used_percent: 99, limit_window_seconds: 604800, reset_at: 1893456000 } } }));
+        },
+        appServerRequest: async () => { consumed = true; return { outcome: 'reset' }; },
+    });
+    try {
+        const id = manager.status().active;
+        await manager.usage();
+        await assert.rejects(manager.consumeResetCredit(id), /usage read failed/);
+        const current = (await manager.usage()).accounts[0].usage;
+        assert.equal(current.weekly, undefined);
+        assert.match(current.error, /usage read failed/);
+    } finally {
+        manager.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('failed reset refresh clears the stale usage bar', async () => {
+    const ui = resetRendererHarness();
+    ui.fail();
+    const button = ui.make();
+    await button.dispatch('click', 1);
+    await button.dispatch('dblclick', 2);
+    assert.equal(ui.calls.length, 1);
+    assert.equal(ui.state().weekly, undefined);
+    assert.match(ui.state().error, /refresh failed/);
+});
+
 test('an inactive account refreshes for usage without replacing the active account', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-inactive-refresh-'));
     const stateDir = path.join(root, '.state');
@@ -306,6 +514,20 @@ test('OpenAI account controls stay outside the native model menu', () => {
         'the pool selector must stay scoped to the Gemini provider tab');
     assert.doesNotMatch(decoration, /poolStrip[\s\S]*menuitemradio/,
         'pool accounts are controls, never fake model rows');
+    assert.match(source, /copy\.append\(usage\);/,
+        'reset credits must not add a fourth line to the account details');
+    assert.match(source, /actions\.append\(creditLine\);/,
+        'reset credits belong above the account action in its existing right-hand space');
+    assert.match(source, /accountResetConfirm/,
+        'reset consumption must have a renderer-side confirmation state');
+    assert.match(source, /provider-picker\.accountResetCredit/,
+        'the reset action must target the account RPC rather than the active-account switch');
+    assert.match(source, /current\.usage\?\.observedAt !== accountResetConfirm\.observedAt/,
+        'a confirmation from an older usage read must not consume a newer account state');
+    assert.match(source, /markAccountUsageError\(account\.id/,
+        'a failed post-consumption usage read must not retain a stale bar');
+    const main = fs.readFileSync(path.join(__dirname, '../src/plugins/provider-picker/main.js'), 'utf8');
+    assert.match(main, /ctx\.method\('accountResetCredit', p => accounts\.consumeResetCredit\(p\?\.id\)\)/);
 });
 
 test('provider strip recognizes current generic menu rows without data-model-id', () => {

@@ -57,6 +57,12 @@ const DROPPED_HEADERS = new Set(['content-encoding', 'content-length', 'transfer
 const CODE_RE = /^https:\/\/claude\.ai\/epitaxy(?:[/?#]|$)/;
 const CANARY_PARAM = 'cuimod_pin_canary';
 const HEALTH_TIMEOUT_MS = 30000;
+// A fail-open covers the load that failed, not the rest of the app session.
+// The gate re-arms after this backoff, doubling per failure until a pinned
+// page mounts, so a release that genuinely cannot mount reloads rarely.
+const RETRY_BASE_MS = 15000;
+const RETRY_MAX_MS = 15 * 60 * 1000;
+const ERR_ABORTED = -3;
 const KEEP_REDIRECTS = 20;
 const EVENT_LOG_LIMIT = 256 * 1024;
 
@@ -71,7 +77,7 @@ function readInitialEnabled(ctx) {
 }
 
 function newNavigation() {
-    return {};
+    return { startedAt: Date.now() };
 }
 
 // The bundled twin of a release-wide sheet. Feature-specific chunk sheets keep
@@ -135,6 +141,26 @@ function payloadShape(value, depth) {
     return out;
 }
 
+// cowork_slate_finch_min_versions: { <model>: { local, remote, cli } }. The
+// picker greys a model out with "Update Claude to use this model" when the
+// Desktop shell is older than its entry, which is exactly the shell a pinned
+// setup keeps (Haiku 5.5 on 2.9939.4, 2026-10-11). Matched by value shape
+// because the key arrives hashed.
+const MIN_VERSION_KEYS = new Set(['local', 'remote', 'cli']);
+function isModelMinVersions(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const entries = Object.entries(value);
+    return entries.length > 0 && entries.some(([model]) => /^claude-/.test(model))
+        && entries.every(([, row]) => row && typeof row === 'object' && !Array.isArray(row)
+            && Object.keys(row).length > 0 && Object.keys(row).every(key => MIN_VERSION_KEYS.has(key)));
+}
+function holdsModelMinVersions(feature) {
+    if (!feature || typeof feature !== 'object') return false;
+    if (isModelMinVersions(feature.defaultValue)) return true;
+    return Array.isArray(feature.rules) && feature.rules.some(rule => isModelMinVersions(rule?.force)
+        || (Array.isArray(rule?.variations) && rule.variations.some(isModelMinVersions)));
+}
+
 // Returns { text } with the rewritten JSON, or { shape } when nothing changed.
 function rewriteBootstrap(text) {
     let payload;
@@ -142,6 +168,11 @@ function rewriteBootstrap(text) {
     if (!payload || typeof payload !== 'object') return { shape: typeof payload };
     let changed = false;
     for (const features of featureMaps(payload, 0, [])) {
+        for (const [flag, feature] of Object.entries(features)) {
+            if (!holdsModelMinVersions(feature)) continue;
+            features[flag] = { defaultValue: {} };
+            changed = true;
+        }
         for (const [flag, value] of Object.entries(PINNED_FLAGS)) {
             const current = features[flag];
             if (current && current.defaultValue === value && !current.rules) continue;
@@ -181,6 +212,7 @@ module.exports = function (ctx) {
     const attached = new Map();
     const detachWaiters = new Map();
     const failed = new Map();
+    const strikes = new Map();
     const recoveryReloads = new WeakSet();
     const redirects = [];
     let enabled = readInitialEnabled(ctx);
@@ -199,7 +231,7 @@ module.exports = function (ctx) {
         try {
             fs.mkdirSync(path.dirname(eventLog), { recursive: true });
             try { if (fs.statSync(eventLog).size > EVENT_LOG_LIMIT) fs.renameSync(eventLog, eventLog + '.1'); } catch (_) {}
-            fs.appendFileSync(eventLog, JSON.stringify({ at: new Date().toISOString(), ...event }) + '\n');
+            fs.appendFileSync(eventLog, JSON.stringify({ at: new Date().toISOString(), gen: ctx.boot?.generation ?? null, ...event }) + '\n');
         } catch (_) {}
     }
 
@@ -229,11 +261,20 @@ module.exports = function (ctx) {
         record.reason = reason;
     }
 
-    function failOpen(wc, reason, reload) {
-        if (failed.has(wc)) return;
-        logEvent({ event: 'fail-open', viewId: wc.id, reason, reload, url: safeUrl(wc) });
-        lastError = reason;
+    function markFailed(wc, reason) {
+        const strike = strikes.get(wc) || { count: 0, retryAt: Infinity };
+        strike.count++;
+        strike.retryAt = Date.now() + Math.min(RETRY_BASE_MS * 2 ** (strike.count - 1), RETRY_MAX_MS);
+        strikes.set(wc, strike);
         failed.set(wc, reason);
+        return strike.retryAt - Date.now();
+    }
+
+    function failOpen(wc, reason, reload, detail) {
+        if (failed.has(wc)) return;
+        lastError = reason;
+        const retryMs = markFailed(wc, reason);
+        logEvent({ event: 'fail-open', viewId: wc.id, reason, reload, retryMs, ...detail, url: safeUrl(wc) });
         const finish = async () => {
             await detachOne(wc, 'fail-open');
             if (!reload || disposed || wc.isDestroyed() || !CODE_RE.test(safeUrl(wc))) return;
@@ -292,6 +333,7 @@ module.exports = function (ctx) {
                     }
                     continued = true;
                     recoveryReloads.delete(wc);
+                    record.liveRecovery = false;
                     record.awaitingHealthUntil = Date.now() + HEALTH_TIMEOUT_MS;
                     record.awaitingLoadFinish = true;
                     record.staleHealthOrigin = record.lastHealthyOrigin;
@@ -304,8 +346,8 @@ module.exports = function (ctx) {
                         injectedApp: plan.injectApp,
                     });
                 }
-            } else if (responseStage && active && record.pinnedDocument && params.responseStatusCode === 200
-                && BOOTSTRAP_RE.test(requestUrl)) {
+            } else if (responseStage && active && params.responseStatusCode === 200 && BOOTSTRAP_RE.test(requestUrl)
+                && (record.pinnedDocument || await pagePinned(wc, record))) {
                 const response = await command('Fetch.getResponseBody', { requestId });
                 const text = response?.base64Encoded
                     ? Buffer.from(response.body || '', 'base64').toString('utf8')
@@ -393,7 +435,11 @@ module.exports = function (ctx) {
         wc.debugger.once('detach', retry);
     }
 
-    async function attachOne(wc, navigating = false) {
+    // `url` is the navigation being started. One that starts before the gate is
+    // ready has its document request in flight already and Fetch.enable cannot
+    // pause it, so it is issued again once the gate is armed. Chromium aborts
+    // the first with ERR_ABORTED, which the app's load-failure handlers ignore.
+    async function attachOne(wc, navigating = false, url = null) {
         if (disposed || !enabled || failed.has(wc) || wc.isDestroyed()) return false;
         if (!assets) { failed.set(wc, BUNDLE_ERROR); return false; }
         const current = attached.get(wc);
@@ -401,6 +447,7 @@ module.exports = function (ctx) {
             if (navigating) {
                 current.navigation = newNavigation();
                 current.pinnedDocument = false;
+                if (current.attaching) current.reissue = url;
             }
             return current.ready;
         }
@@ -425,7 +472,9 @@ module.exports = function (ctx) {
             lastHealthyOrigin: null,
             staleHealthOrigin: null,
             pinnedDocument: false,
+            liveRecovery: false,
             navigation: navigating ? newNavigation() : null,
+            reissue: navigating ? url : null,
             onMessage: null,
             onDetach: null,
         };
@@ -436,7 +485,7 @@ module.exports = function (ctx) {
             if (record.detaching) return;
             forgetAttached(wc, record);
             lastError = 'view ' + wc.id + ' debugger detached: ' + reason;
-            if (!wc.isDestroyed()) failed.set(wc, lastError);
+            if (!wc.isDestroyed()) markFailed(wc, lastError);
         };
         attached.set(wc, record);
         try {
@@ -465,6 +514,13 @@ module.exports = function (ctx) {
             record.attaching = false;
             record.ready = true;
             lastError = null;
+            const reissue = record.reissue;
+            record.reissue = null;
+            if (reissue && record.navigation && CODE_RE.test(reissue)) {
+                record.navigation = newNavigation();
+                logEvent({ event: 'navigation-reissued', viewId: wc.id, url: reissue });
+                Promise.resolve().then(() => wc.loadURL(reissue)).catch(() => {});
+            }
             // A generation that arrives while the Code document is still loading
             // (a host reload during a slow cold launch) cannot pause a request that
             // is already in flight. Arming the transaction makes did-finish-load
@@ -486,22 +542,33 @@ module.exports = function (ctx) {
     // bootstrap refetches still carry live flag values, so it reads the
     // page's entry script to learn whether it is pinned.
     function adoptOpenPage(wc, record) {
+        Promise.resolve().then(() => pagePinned(wc, record)).catch(() => {});
+    }
+
+    // Asked over this generation's own CDP session: executeJavaScript waits for
+    // a loading main frame to stop, and the bootstrap arrives well before that.
+    // The answer marks the record pinned only when no document load is in
+    // flight to replace the page it describes.
+    async function pagePinned(wc, record) {
         const probe = '!!document.querySelector(' + JSON.stringify('script[src="' + PINNED_ENTRY + '"]') + ')';
-        Promise.resolve()
-            .then(() => wc.executeJavaScript(probe, false))
-            .then((pinned) => {
-                if (pinned !== true || attached.get(wc) !== record || record.navigation || disposed) return;
-                record.pinnedDocument = true;
-                logEvent({ event: 'open-page-adopted', viewId: wc.id, url: safeUrl(wc) });
-            })
-            .catch(() => {});
+        let pinned = false;
+        try {
+            const reply = await wc.debugger.sendCommand('Runtime.evaluate', { expression: probe, returnByValue: true });
+            pinned = reply?.result?.value === true;
+        } catch (_) {}
+        if (pinned && !record.pinnedDocument && !record.navigation && attached.get(wc) === record && !disposed) {
+            record.pinnedDocument = true;
+            logEvent({ event: 'open-page-adopted', viewId: wc.id, via: 'cdp', url: safeUrl(wc) });
+        }
+        return pinned;
     }
 
     // The page that just finished loading is either already pinned (an earlier
     // generation rewrote it) or the live release. A live one has only just
     // loaded, so one reload with the gate armed costs nothing; a second miss on
     // the same view fails open rather than reloading forever.
-    function recoverMissedDocument(wc, record) {
+    function recoverMissedDocument(wc, record, navigation) {
+        const detail = navigation?.startedAt ? { sinceStartMs: Date.now() - navigation.startedAt } : {};
         const probe = '!!document.querySelector(' + JSON.stringify('script[src="' + PINNED_ENTRY + '"]') + ')';
         Promise.resolve()
             .then(() => wc.executeJavaScript(probe, false))
@@ -514,11 +581,11 @@ module.exports = function (ctx) {
                     return;
                 }
                 if (recoveryReloads.has(wc)) {
-                    failOpen(wc, 'release gate did not see the document response', false);
+                    failOpen(wc, 'release gate did not see the document response', false, detail);
                     return;
                 }
                 recoveryReloads.add(wc);
-                logEvent({ event: 'document-missed-reload', viewId: wc.id, url: safeUrl(wc) });
+                logEvent({ event: 'document-missed-reload', viewId: wc.id, ...detail, url: safeUrl(wc) });
                 try { wc.reload(); } catch (_) {}
             });
     }
@@ -527,8 +594,14 @@ module.exports = function (ctx) {
         if (!isMainFrame) return;
         const record = attached.get(wc);
         if (!isInPlace) logEvent({ event: 'navigation', viewId: wc.id, url, attached: !!record?.ready, failed: failed.get(wc) || null });
+        // The document whose mount was awaited is gone; a pinned successor
+        // sets its own deadline when it is rewritten.
+        if (!isInPlace && record) {
+            record.awaitingHealthUntil = 0;
+            record.awaitingLoadFinish = false;
+        }
         if (CODE_RE.test(url)) {
-            void attachOne(wc, !isInPlace);
+            void attachOne(wc, !isInPlace, isInPlace ? null : url);
             return;
         }
         if (!record) {
@@ -549,10 +622,12 @@ module.exports = function (ctx) {
         if (!record) return;
         try { wc.removeListener('did-start-navigation', record.onNavigation); } catch (_) {}
         try { wc.removeListener('did-finish-load', record.onFinished); } catch (_) {}
+        try { wc.removeListener('did-fail-load', record.onFailed); } catch (_) {}
         try { wc.removeListener('destroyed', record.onDestroyed); } catch (_) {}
         clearDetachWaiter(wc);
         watched.delete(wc);
         failed.delete(wc);
+        strikes.delete(wc);
         void detachOne(wc, 'view destroyed');
     }
 
@@ -563,17 +638,29 @@ module.exports = function (ctx) {
             onFinished: () => {
                 const pin = attached.get(wc);
                 if (pin?.navigation) {
+                    // The error page's finish; the app retries or navigates on its
+                    // own, and that navigation re-arms the gate.
+                    if (pin.navigation.failedLoad !== undefined) return;
+                    const navigation = pin.navigation;
                     pin.navigation = null;
-                    if (CODE_RE.test(safeUrl(wc))) recoverMissedDocument(wc, pin);
+                    if (CODE_RE.test(safeUrl(wc))) recoverMissedDocument(wc, pin, navigation);
                     return;
                 }
                 if (pin?.awaitingHealthUntil) pin.awaitingLoadFinish = false;
+            },
+            onFailed: (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+                const pin = attached.get(wc);
+                if (!isMainFrame || errorCode === ERR_ABORTED || !pin?.navigation) return;
+                pin.navigation.failedLoad = errorCode;
+                logEvent({ event: 'document-load-failed', viewId: wc.id, errorCode, errorDescription,
+                    sinceStartMs: Date.now() - pin.navigation.startedAt, url: String(validatedURL || '') });
             },
             onDestroyed: () => unwatch(wc),
         };
         watched.set(wc, record);
         wc.on('did-start-navigation', record.onNavigation);
         wc.on('did-finish-load', record.onFinished);
+        wc.on('did-fail-load', record.onFailed);
         wc.on('destroyed', record.onDestroyed);
         if (CODE_RE.test(safeUrl(wc))) void attachOne(wc);
     }
@@ -582,11 +669,18 @@ module.exports = function (ctx) {
         if (disposed) return;
         for (const wc of webContents.getAllWebContents()) watch(wc);
         if (!enabled) return;
+        const now = Date.now();
+        for (const [wc, strike] of strikes) {
+            if (now < strike.retryAt || !failed.has(wc) || wc.isDestroyed()) continue;
+            strike.retryAt = Infinity;
+            failed.delete(wc);
+            recoveryReloads.delete(wc);
+            logEvent({ event: 'gate-retry', viewId: wc.id, strikes: strike.count, url: safeUrl(wc) });
+        }
         for (const wc of watched.keys()) {
             if (!wc.isDestroyed() && CODE_RE.test(safeUrl(wc)) && !attached.has(wc) && !failed.has(wc))
                 void attachOne(wc);
         }
-        const now = Date.now();
         for (const [wc, record] of attached) {
             if (record.awaitingHealthUntil && now > record.awaitingHealthUntil)
                 failOpen(wc, 'pinned frontend did not mount within ' + HEALTH_TIMEOUT_MS + 'ms', true);
@@ -603,7 +697,7 @@ module.exports = function (ctx) {
             for (const wc of [...attached.keys()]) void detachOne(wc, 'disabled');
             return;
         }
-        if (changed) failed.clear();
+        if (changed) { failed.clear(); strikes.clear(); }
         scan();
     }
 
@@ -664,6 +758,22 @@ module.exports = function (ctx) {
         return { ok, failed: !ok };
     });
 
+    // A Code page can come up live without a Code document load: a relogin
+    // lands on /login and the app routes back to /epitaxy in place, so the
+    // gate never sees a document to rewrite. The renderer reports such a page
+    // and it gets the same single recovery reload as a missed document.
+    ctx.method('reloadLive', (_params, event) => {
+        const wc = event?.sender;
+        const record = wc && attached.get(wc);
+        if (!enabled || !record?.ready || record.liveRecovery || record.navigation || record.pinnedDocument
+            || record.awaitingHealthUntil || failed.has(wc) || !CODE_RE.test(safeUrl(wc))) return false;
+        if (!event.senderFrame || event.senderFrame !== wc.mainFrame) return false;
+        record.liveRecovery = true;
+        logEvent({ event: 'live-page-reload', viewId: wc.id, url: safeUrl(wc) });
+        recoverMissedDocument(wc, record);
+        return true;
+    });
+
     ctx.method('healthy', (params, event) => {
         const wc = event?.sender;
         const record = wc && attached.get(wc);
@@ -672,6 +782,8 @@ module.exports = function (ctx) {
         if (record.awaitingHealthUntil && record.awaitingLoadFinish) return false;
         if (record.awaitingHealthUntil && (!event?.senderFrame || !wc.mainFrame || event.senderFrame !== wc.mainFrame)) return false;
         if (record.awaitingHealthUntil && record.staleHealthOrigin === timeOrigin) return false;
+        // A pinned page that mounted ends the backoff.
+        if (record.awaitingHealthUntil) strikes.delete(wc);
         record.lastHealthyOrigin = timeOrigin;
         record.staleHealthOrigin = null;
         record.awaitingHealthUntil = 0;

@@ -8,6 +8,7 @@ const TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const WEEK_MIN_SECONDS = 6 * 24 * 60 * 60;
+const RESET_OUTCOMES = new Set(['reset', 'alreadyRedeemed']);
 
 function decodeJwt(token) {
     try { return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8')); }
@@ -87,8 +88,12 @@ module.exports = function createOpenAIAccounts(options) {
     const usageUrl = options.usageUrl || USAGE_URL;
     const usageCacheMs = options.usageCacheMs ?? 5 * 60 * 1000;
     const log = options.log || (() => {});
+    const appServerRequestOverride = options.appServerRequest || null;
     const usageCache = new Map();
     const usageInflight = new Map();
+    const usageVersions = new Map();
+    const resetInflight = new Map();
+    let appServerRequestPromise = null;
     let login = null;
     let disposed = false;
 
@@ -238,10 +243,25 @@ module.exports = function createOpenAIAccounts(options) {
         });
     }
 
+    function usageVersion(id) {
+        return usageVersions.get(id) || 0;
+    }
+
+    function invalidateUsage(id) {
+        usageVersions.set(id, usageVersion(id) + 1);
+        usageCache.delete(id);
+        usageInflight.delete(id);
+    }
+
     async function accountUsage(id, force) {
         const cached = usageCache.get(id);
         if (!force && cached && Date.now() - cached.at < usageCacheMs) return cached.value;
-        if (usageInflight.has(id)) return usageInflight.get(id);
+        const running = usageInflight.get(id);
+        if (running) {
+            if (!force) return running;
+            await running.catch(() => {});
+        }
+        const version = usageVersion(id);
         const promise = (async () => {
             const account = await freshAccount(id);
             const tokens = JSON.parse(account.raw).tokens;
@@ -258,12 +278,95 @@ module.exports = function createOpenAIAccounts(options) {
             return {
                 observedAt: new Date().toISOString(),
                 weekly: weeklyLimit(value),
+                resetCredits: Number.isSafeInteger(value?.rate_limit_reset_credits?.available_count)
+                    && value.rate_limit_reset_credits.available_count >= 0 ? value.rate_limit_reset_credits.available_count : null,
             };
         })().then(value => {
-            usageCache.set(id, { at: Date.now(), value });
+            if (usageVersion(id) === version) usageCache.set(id, { at: Date.now(), value });
             return value;
-        }).finally(() => usageInflight.delete(id));
+        });
         usageInflight.set(id, promise);
+        promise.then(
+            () => { if (usageInflight.get(id) === promise) usageInflight.delete(id); },
+            () => { if (usageInflight.get(id) === promise) usageInflight.delete(id); },
+        );
+        return promise;
+    }
+
+    async function consumeResetViaCodex(account, idempotencyKey) {
+        if (!appServerRequestOverride && !appServerRequestPromise)
+            appServerRequestPromise = import('../../../router/reset-credits.mjs');
+        const appServerRequest = appServerRequestOverride || (await appServerRequestPromise).appServerRequest;
+        const home = path.join(stateDir, `openai-reset-${account.id}-${crypto.randomUUID()}`);
+        fs.mkdirSync(home, { recursive: true });
+        try {
+            fs.writeFileSync(path.join(home, 'auth.json'), account.raw, { mode: 0o600 });
+            return await appServerRequest('account/rateLimitResetCredit/consume', { idempotencyKey }, {
+                env: { ...process.env, CODEX_HOME: home },
+            });
+        } finally {
+            try { fs.rmSync(home, { recursive: true, force: true }); } catch (_) {}
+        }
+    }
+
+    async function consumeResetCreditOnce(id) {
+        if (disposed) throw new Error('OpenAI account manager is unavailable');
+        if (isReader()) throw new Error('OpenAI reset credits are owned by the UI machine.');
+        readAuth(profileFile(id));
+        const before = await accountUsage(id, true);
+        // Usage may refresh an expired profile; redeem with the token just read,
+        // not the credential snapshot that preceded that refresh.
+        const account = readAuth(profileFile(id));
+        const requestFile = path.join(stateDir, `openai-reset-request-${account.id}.json`);
+        function pendingKey() {
+            try {
+                const key = JSON.parse(fs.readFileSync(requestFile, 'utf8')).idempotencyKey;
+                if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(key))
+                    throw new Error('Invalid pending OpenAI reset request');
+                return key;
+            } catch (error) {
+                if (error?.code === 'ENOENT') return null;
+                throw error;
+            }
+        }
+        // A lost response can already have spent the credit. Keep the exact
+        // request key across usage changes and host reloads until its outcome
+        // is known; deriving a new key from the reduced count spends another.
+        let idempotencyKey = pendingKey();
+        if (!idempotencyKey) {
+            if (!Number.isFinite(before.resetCredits) || before.resetCredits < 1)
+                throw new Error('No OpenAI reset credit available');
+            idempotencyKey = crypto.randomUUID();
+            fs.mkdirSync(stateDir, { recursive: true });
+            try { fs.writeFileSync(requestFile, JSON.stringify({ idempotencyKey }), { flag: 'wx' }); }
+            catch (error) {
+                if (error?.code !== 'EEXIST') throw error;
+                idempotencyKey = pendingKey();
+                if (!idempotencyKey) throw new Error('Reset request completed; reread usage before retrying');
+            }
+        }
+        let result;
+        try { result = await consumeResetViaCodex(account, idempotencyKey); }
+        finally { invalidateUsage(id); }
+        const outcome = result?.outcome;
+        if (RESET_OUTCOMES.has(outcome) || outcome === 'noCredit' || outcome === 'nothingToReset')
+            fs.rmSync(requestFile, { force: true });
+        if (!RESET_OUTCOMES.has(outcome)) throw new Error(`OpenAI reset credit was not consumed (${outcome || 'unknown outcome'})`);
+        let quota;
+        try { quota = await accountUsage(id, true); }
+        catch (error) { throw new Error(`Reset credit applied; usage refresh failed: ${error?.message || error}`); }
+        return { accountId: id, outcome, usage: quota };
+    }
+
+    async function consumeResetCreditForAccount(id) {
+        const running = resetInflight.get(id);
+        if (running) return running;
+        const promise = consumeResetCreditOnce(id);
+        resetInflight.set(id, promise);
+        promise.then(
+            () => { if (resetInflight.get(id) === promise) resetInflight.delete(id); },
+            () => { if (resetInflight.get(id) === promise) resetInflight.delete(id); },
+        );
         return promise;
     }
 
@@ -374,7 +477,7 @@ module.exports = function createOpenAIAccounts(options) {
                 }
             }
             fs.rmSync(file, { force: true });
-            usageCache.delete(id);
+            invalidateUsage(id);
             return publicStatus();
         });
     }
@@ -460,7 +563,7 @@ module.exports = function createOpenAIAccounts(options) {
         cancelLogin();
     }
 
-    return { status: publicStatus, usage, autoSwitch, switchAccount, removeAccount, startLogin, cancelLogin, dispose };
+    return { status: publicStatus, usage, consumeResetCredit: consumeResetCreditForAccount, autoSwitch, switchAccount, removeAccount, startLogin, cancelLogin, dispose };
 };
 
 module.exports.authIdentity = authIdentity;

@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const rescue = require('../src/plugins/file-pane-access/rescue');
 const plugin = require('../src/plugins/file-pane-access/main');
@@ -156,4 +157,153 @@ test('hot reload never stacks wrappers and disposal restores the shell handler',
     assert.notEqual(registry.get(key), original);
     disposeSecond();
     assert.equal(registry.get(key), original);
+});
+
+test('the shipped remote image consumer reads Windows guest images outside its roots', {
+    skip: !process.env.CUIMOD_FILE_PANE_NATIVE_CHUNK,
+}, async () => {
+    const source = fs.readFileSync(process.env.CUIMOD_FILE_PANE_NATIVE_CHUNK, 'utf8');
+    const native = source.match(/class e\{constructor\(e\)\{this\.deps=e,this\.remoteRootRealpathCache=new Map\}.*?invalidateRemoteRootCache\(e\)\{return this\.remoteRootRealpathCache\.delete\(e\)\}\}/s)?.[0];
+    assert.ok(native, 'native SessionFileReads class must be present in the inspected shell');
+    const image = process.env.CUIMOD_FILE_PANE_REMOTE_PNG;
+    const bytes = fs.readFileSync(image);
+    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    const positive = path.join(cwd, 'control.png');
+    fs.writeFileSync(positive, bytes);
+    let reads = 0;
+    const realpath = async file => {
+        try { return fs.realpathSync(path.win32.normalize(file.replace(/^\/([A-Za-z]:)/, '$1'))).replace(/\\/g, '/'); }
+        catch (_) { return null; }
+    };
+    const controller = {
+        connected: true, isWindows: true, remoteHome: os.homedir().replace(/\\/g, '/'),
+        expandRemoteTilde: value => value,
+        ensureReady: async () => {}, ensureReadyInBackground: async () => {},
+        realpath,
+        withSftp: async fn => fn({ realpath: (file, done) => realpath(file).then(value => done(null, value)) }),
+        lstat: async file => {
+            try { const stat = fs.lstatSync(file); return { isDirectory: stat.isDirectory(), isSymbolicLink: stat.isSymbolicLink() }; }
+            catch (_) { return 'absent'; }
+        },
+        readBinaryFileWithStatus: async (file, max, expected) => {
+            reads++;
+            if (await realpath(file) !== expected) return { ok: false, reason: 'readError' };
+            const data = fs.readFileSync(file);
+            return data.length > max ? { ok: false, reason: 'tooLarge' } : { ok: true, data };
+        },
+    };
+    const target = { kind: 'ssh' };
+    const session = { sessionId: SID, backend: { kind: 'ssh', remoteTarget: target }, sshConfig: target,
+        cliSessionId: process.env.CUIMOD_FILE_PANE_REMOTE_CLI, cwd };
+    const remote = { i: () => controller };
+    const refuseNetwork = value => /^[/\\]{2}/.test(value);
+    // Inspected 2.7032.0 and 2.9939.4 use different minified import aliases.
+    const NativeReads = vm.runInNewContext('(' + native + ')', {
+        G: path, y: remote, m: remote,
+        t: { cf: 10485760, af: 10485760, IY: refuseNetwork, KK: refuseNetwork, pv: (home, sid) => home + '/.claude/uploads/' + sid },
+        a: { _: () => true }, i: { _: () => true },
+    });
+    const consumer = new NativeReads({ getSession: () => session, collectContainmentAdditionalDirectories: async () => [] });
+    const expected = 'data:image/png;base64,' + bytes.toString('base64');
+    function assertImage(value, label) {
+        assert.equal(typeof value, 'string', label);
+        assert.equal(value.length, expected.length, label + ' byte count');
+        assert.ok(value === expected, label + ' exact PNG bytes');
+    }
+    assertImage(await consumer.readSessionImageAsDataUrl(SID, positive), 'native in-root positive control');
+    assert.equal(reads, 1, 'positive control reaches the binary reader');
+    session.cwd = process.env.CUIMOD_FILE_PANE_REMOTE_CWD;
+    const base = await consumer.readSessionImageAsDataUrl(SID, image);
+    assert.equal(base, null, 'shipped shell currently refuses Windows owned scratch');
+    assert.equal(reads, 1, 'base refuses before binary retrieval');
+    const managerKey = path.join(tempRoot, 'native-manager.cjs');
+    const poolKey = path.join(tempRoot, 'native-remote-pool.cjs');
+    const $ = new Map([[target, controller]]);
+    require.cache[managerKey] = { exports: { claudeCodeSessionManager: { sessionFileReads: consumer } } };
+    require.cache[poolKey] = { exports: {
+        a: function lookup(value) { return $.get(value); },
+        i: function select(value) { return value.kind === 'wsl' ? null : $.get(value); },
+    } };
+    const dispose = fakeHost(new Map());
+    try {
+        assertImage(await consumer.readSessionImageAsDataUrl(SID, image), 'owned remote PNG must reach the unchanged native image consumer');
+        assert.equal(reads, 2);
+        assertImage(await consumer.readSessionImageAsDataUrl(SID, image, false, { automatic: true }), 'automatic owned scratch preview');
+        assertImage(await consumer.readSessionImageAsDataUrl(SID, image.toUpperCase().replace(/\//g, '\\')), 'Windows case and slash variants');
+        assertImage(await consumer.readSessionImageAsDataUrl(SID, '/' + image.replace(/\\/g, '/')), 'OpenSSH drive spelling');
+        const { remoteFile } = require('../src/plugins/file-pane-access/remote-image');
+        const junction = { ...controller, realpath: async () => '//host/share/file.png' };
+        assert.equal(await remoteFile(session, image, junction), null, 'a junction onto a network path stays refused');
+        assert.equal(await remoteFile(session, image, { ...controller, connected: false }), null, 'preview cannot dial a new controller');
+        assert.equal(await remoteFile(session, image + ':private', controller), null, 'alternate data streams stay refused');
+        assert.equal(await remoteFile(session, '\\\\host\\share\\file.png', controller), null, 'network paths stay refused');
+        const binary = controller.readBinaryFileWithStatus;
+        try {
+            controller.readBinaryFileWithStatus = async (_file, max) => {
+                assert.equal(max, 10 * 1024 * 1024, 'native image size cap');
+                return { ok: false, reason: 'tooLarge' };
+            };
+            assert.equal(await consumer.readSessionImageAsDataUrl(SID, image, false, { automatic: true }), null, 'oversized images retain the native refusal');
+            controller.readBinaryFileWithStatus = async () => ({ ok: false, reason: 'readError' });
+            await assert.rejects(consumer.readSessionImageAsDataUrl(SID, image, false, { automatic: true }), /Remote image read failed/);
+        } finally { controller.readBinaryFileWithStatus = binary; }
+        assertImage(await consumer.readRemoteSessionImageAsDataUrl(session, target, positive, {}), 'an image beside the cwd on the guest reaches the consumer');
+        const wrapper = consumer.readRemoteSessionImageAsDataUrl;
+        const disposeNext = fakeHost(new Map());
+        dispose();
+        assert.notEqual(consumer.readRemoteSessionImageAsDataUrl, wrapper);
+        disposeNext();
+        assert.equal(await consumer.readSessionImageAsDataUrl(SID, image), null, 'disposal restores native containment');
+    } finally {
+        dispose();
+        delete require.cache[managerKey];
+        delete require.cache[poolKey];
+    }
+});
+
+test('WSL native image results never enter the SSH-only fallback', async () => {
+    const { wrapRemoteImage } = require('../src/plugins/file-pane-access/remote-image');
+    const getController = () => { throw new Error('SSH lookup must not run for WSL'); };
+    const owner = { constructor: { REMOTE_IMAGE_EXT_TO_MIME: { '.png': 'image/png' } } };
+    const target = { kind: 'wsl' };
+    const wrapper = wrapRemoteImage(async () => null, getController);
+    assert.equal(await wrapper.call(owner, {}, target, 'C:/image.png', {}), null);
+    const failure = new Error('Remote image path could not be resolved');
+    const failed = wrapRemoteImage(async () => { throw failure; }, getController);
+    await assert.rejects(failed.call(owner, {}, target, 'C:/image.png', { automatic: true }), error => error === failure);
+});
+
+test('a Windows guest image outside every native root reaches the image consumer', async () => {
+    const { wrapRemoteImage } = require('../src/plugins/file-pane-access/remote-image');
+    const bytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const file = path.join(tempRoot, 'records', 'captures', 'm16_keyframes.png');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, bytes);
+    const real = file.replace(/\\/g, '/');
+    const canonical = value => {
+        try { return fs.realpathSync(path.win32.normalize(value.replace(/^\/([A-Za-z]:)/, '$1'))).replace(/\\/g, '/'); }
+        catch (_) { return null; }
+    };
+    const controller = {
+        connected: true, isWindows: true, remoteHome: 'C:/Users/Administrator',
+        realpath: async value => canonical(value),
+        lstat: async value => { try { return { isDirectory: fs.statSync(value).isDirectory(), isSymbolicLink: false }; } catch (_) { return 'absent'; } },
+        withSftp: async fn => fn({ realpath: (value, done) => done(null, canonical(value)) }),
+        readBinaryFileWithStatus: async (value, max, expected) => {
+            assert.equal(canonical(value), expected);
+            return { ok: true, data: fs.readFileSync(value) };
+        },
+    };
+    const owner = { constructor: { REMOTE_IMAGE_EXT_TO_MIME: { '.png': 'image/png' }, REMOTE_IMAGE_MAX_BYTES: 10485760 } };
+    const session = { cwd: path.join(tempRoot, 'repo'), cliSessionId: 'ff55f517-e330-4256-993a-e45f82180ef0' };
+    const target = { kind: 'ssh' };
+    const native = async () => { throw new Error('Remote image path could not be resolved'); };
+    const wrapper = wrapRemoteImage(native, () => controller);
+    const expected = 'data:image/png;base64,' + bytes.toString('base64');
+    assert.equal(await wrapper.call(owner, session, target, file, { automatic: true }), expected);
+    assert.equal(await wrapper.call(owner, session, target, '/' + real, {}), expected);
+    await assert.rejects(wrapper.call(owner, session, target, '\\\\host\\share\\m16.png', { automatic: true }), /could not be resolved/);
+    await assert.rejects(wrapper.call(owner, session, target, file + ':hidden', { automatic: true }), /could not be resolved/);
+    const offline = wrapRemoteImage(native, () => ({ ...controller, connected: false }));
+    await assert.rejects(offline.call(owner, session, target, file, { automatic: true }), /could not be resolved/);
 });

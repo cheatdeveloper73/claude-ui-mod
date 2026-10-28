@@ -99,6 +99,12 @@ test('Desktop usage RPC caches the full snapshot and returns only the active pro
         assert.equal('history' in pooled.analytics.meters[0], false);
         assert.ok(Buffer.byteLength(JSON.stringify(openai)) < 5000);
         assert.ok(Buffer.byteLength(JSON.stringify(pooled)) < 20000);
+
+        // The live Fireworks drain is its own uncached route: the popover polls
+        // it every second, so it must not carry the analytics snapshot.
+        const live = await methods.get('fireworksLive')();
+        assert.equal(routes.at(-1), '/fireworksz');
+        assert.ok(Array.isArray(live.meters), 'the live route returns the router payload unchanged');
     } finally {
         if (oldRouter === undefined) delete process.env.CUIMOD_ROUTER_URL; else process.env.CUIMOD_ROUTER_URL = oldRouter;
         if (oldPlan === undefined) delete process.env.CUIMOD_PLAN_USAGE_FILE; else process.env.CUIMOD_PLAN_USAGE_FILE = oldPlan;

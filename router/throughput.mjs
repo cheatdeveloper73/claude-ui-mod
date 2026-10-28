@@ -147,6 +147,9 @@ export function summarize(records, keyOf)
     {
         const tokens = rows.reduce((total, row) => total + (row.tokens?.outputTokens || 0), 0);
         const streamMs = rows.reduce((total, row) => total + (finite(row.streamMs) || 0), 0);
+        // Only tokens generated inside a measured window belong over that window;
+        // a non-streaming or burst response adds tokens and no time.
+        const timedTokens = rows.reduce((total, row) => total + (finite(row.streamMs) === null ? 0 : row.tokens?.outputTokens || 0), 0);
         out.push({
             key,
             responses: rows.length,
@@ -157,7 +160,7 @@ export function summarize(records, keyOf)
             // group sustained. Deliberately not the mean of the per-response
             // rates: that would weight a 12-token response the same as a
             // 4,000-token one.
-            sustainedTps: rate(tokens, streamMs),
+            sustainedTps: rate(timedTokens, streamMs),
             outputTps: percentiles(rows.map(row => row.outputTps)),
             endToEndTps: percentiles(rows.map(row => row.endToEndTps)),
             ttftMs: percentiles(rows.map(row => row.ttftMs)),
@@ -278,7 +281,10 @@ class Sample
 
         const end = this.terminalAt === null ? this.ledger.now() : this.terminalAt;
         const totalMs = end - this.startedAt;
-        const streamMs = this.firstDeltaAt === null ? null : end - this.firstDeltaAt;
+        // A provider that buffers a short answer and sends it in one network read
+        // has no observable generation interval: its first and last delta land in
+        // the same millisecond. The caller says so; ttft is still real.
+        const streamMs = this.firstDeltaAt === null || value.burst === true ? null : end - this.firstDeltaAt;
         const tokens = normalizeUsage(value.usage);
 
         return this.ledger.write({

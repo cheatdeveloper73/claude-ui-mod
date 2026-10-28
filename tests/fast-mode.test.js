@@ -54,6 +54,18 @@ test('the fast switch resolves for a routed GPT row and for Opus 5.5, and nowher
     assert.equal(section()[0].fast_mode, undefined, 'dispose must restore the untouched native rows');
 });
 
+test('Haiku 5.5 is offered under its [1m] id, so the CLI is launched with a 1M window', () => {
+    const { section, native } = runPage([], [{ id: 'claude-opus-5-5', name: 'Opus 5.5' }, { id: 'claude-haiku-5-5', name: 'Haiku 5.5' }]);
+    const visible = section().filter(m => (m.section ?? 'main') === 'main' || m.section === 'overflow').map(m => m.id);
+    assert.deepEqual(visible, ['claude-opus-5-5', 'claude-haiku-5-5[1m]']);
+    const tagged = section().find(m => m.id === 'claude-haiku-5-5[1m]');
+    assert.equal(tagged.supports_1m_context, true);
+    assert.equal(section().find(m => m.id === 'claude-haiku-5-5').section, 'legacy', 'a session on the bare id must still resolve');
+
+    native.dispose();
+    assert.deepEqual(section().map(m => m.id), ['claude-opus-5-5', 'claude-haiku-5-5']);
+});
+
 async function withHome(fn) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fast-home-'));
     // A test run from inside a routed Claude Code session inherits that
@@ -145,6 +157,9 @@ async function withCreditsManager(fn) {
         sessions: new Map([[session.sessionId, session]]),
         handleFastModeCreditsNotice: nativeCreditsNotice,
         emitStreamMessage: nativeEmitStreamMessage,
+        formatSessionForEvent(s) { return { sessionId: s.sessionId, model: s.model,
+            fastModeState: s.fastModeState, fastModeDisabledReason: s.fastModeDisabledReason }; },
+        emitSessionUpdated(s) { this.emit('event', { type: 'session_updated', session: this.formatSessionForEvent(s) }); },
         async setFastMode(id, value) { applied.push([id, value]); },
         emit(name, event) { events.push([name, event]); },
     };
@@ -169,6 +184,40 @@ async function withCreditsManager(fn) {
     try { await fn({ manager, session, notice, deliver, events, applied, methods, load, disposers, timers, root }); }
     finally { disposers.forEach(fn => fn()); delete require.cache[key]; fs.rmSync(root, { recursive: true, force: true }); }
 }
+
+test('OpenAI metadata ignores Anthropic billing gates without erasing the worker report', () => withHome(() => withCreditsManager(({ manager, session, load, disposers, events }) => {
+    const first = manager.formatSessionForEvent;
+    for (const model of ['claude-gpt-6.1-sol[1m]', 'gpt-6.1-sol:high']) {
+        session.model = model;
+        for (const reason of ['extra_usage_disabled', 'preference', 'free', 'not_first_party']) {
+            session.fastModeDisabledReason = reason;
+            assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, undefined, model + ': ' + reason);
+            assert.equal(session.fastModeDisabledReason, reason, 'raw worker report survives projection');
+        }
+    }
+    for (const model of ['claude-opus-5-5', 'claude-gpt-5.4[1m]', 'claude-stub-external[1m]']) {
+        session.model = model;
+        assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, 'not_first_party', model);
+    }
+    session.model = 'claude-gpt-6.1-sol[1m]';
+    for (const reason of ['disabled_by_env', 'model_not_allowed', 'new_reason']) {
+        session.fastModeDisabledReason = reason;
+        assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, reason);
+    }
+    session.fastModeDisabledReason = 'extra_usage_disabled';
+    events.length = 0;
+    load();
+    assert.notEqual(manager.formatSessionForEvent, first);
+    assert.ok(events.some(([, e]) => e.type === 'session_updated' && e.session.fastModeDisabledReason === undefined),
+        'hot attachment refreshes already-mounted controls');
+    disposers[0]();
+    assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, undefined);
+    session.model = 'claude-opus-5-5';
+    assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, 'extra_usage_disabled');
+    session.model = 'claude-gpt-6.1-sol[1m]';
+    disposers[1]();
+    assert.equal(manager.formatSessionForEvent(session).fastModeDisabledReason, 'extra_usage_disabled');
+})));
 
 test('Anthropic credit notices cannot disable external fast intent or notify the desktop', () => withCreditsManager(({ session, notice, deliver, applied, events, methods, root }) => {
     for (const model of ['claude-gpt-6.1-sol[1m]', 'gpt-6.1-sol:high', 'claude-stub-external[1m]']) {

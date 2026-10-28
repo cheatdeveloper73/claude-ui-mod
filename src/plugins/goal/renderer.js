@@ -133,9 +133,9 @@ function firstSentence(text) {
 function mainComposer() {
     let best = null, bestRect = null;
     for (const p of document.querySelectorAll('.epitaxy-prompt')) {
-        if (p.closest('.epitaxy-composer-width')) return p;
         const r = p.getBoundingClientRect();
-        if (r.width < 120) continue;
+        if (r.width < 120 || r.height <= 0) continue;
+        if (p.closest('.epitaxy-composer-width')) return p;
         if (!bestRect || r.width > bestRect.width + 8 ||
             (Math.abs(r.width - bestRect.width) <= 8 && r.bottom > bestRect.bottom)) {
             best = p; bestRect = r;
@@ -166,63 +166,34 @@ function composerCommand() {
     return m ? m[1].toLowerCase() : null;
 }
 
-// The queue rail hangs off the same edge of the same box. Measure it rather
-// than reserve a constant for it: its height is the row count, and it animates.
-function railTop() {
-    const q = document.getElementById('cuimod-queue');
-    const rail = q && q.shadowRoot ? q.shadowRoot.querySelector('.rail') : null;
-    if (!rail) return null;
-    const r = rail.getBoundingClientRect();
-    return r.height > 4 ? r : null;
-}
-
-/* The prompt box is NOT the top of the composer. Aux rows stack above it inside
- * the same container — the branch/PR row, and the usage band when it is up — so
- * a band hung off the prompt's top edge lands on top of one of them. Measured
- * at a 1040px window: the branch row spans 907..947, the prompt starts at 953,
- * and a 27px band hung off the prompt sits at 918..945, entirely inside it.
- *
- * They are found by geometry, never by class. The usage band is display:none
- * with a zero rect when it is not up, `.epitaxy-branch-row` is claude.ai's own
- * name on its own release cadence, and a row added tomorrow has no name here at
- * all. What identifies one is that it is in the composer's column, above the
- * prompt, and has a real box. */
-function composerStackTop(promptEl, r) {
+const schedulePlace = ctx.layout((layout) => {
+    if (!host) return null;
+    const p = layout.mainComposer();
+    if (!p) return { hidden: true };
+    const r = layout.rect(p);
+    if (!r.width) return { hidden: true };
+    // Branch/usage rows above the prompt and the independently animated queue
+    // occupy this same strip. Measure their boxes rather than reserving a gap.
     let top = r.top;
-    const box = promptEl.parentElement;
-    if (box) {
-        for (const n of box.children) {
-            if (n === promptEl) continue;
-            const b = n.getBoundingClientRect();
-            if (b.width < 40 || b.height < 4) continue;          // hidden, or screen-reader only
-            if (b.bottom > r.top + 2) continue;                  // not above the prompt
-            if (b.right < r.left + 40 || b.left > r.right - 40) continue;   // another column
-            if (b.top < top) top = b.top;
-        }
+    for (const n of p.parentElement?.children || []) {
+        if (n === p) continue;
+        const b = layout.rect(n);
+        if (b.width < 40 || b.height < 4 || b.bottom > r.top + 2) continue;
+        if (b.right < r.left + 40 || b.left > r.right - 40) continue;
+        top = Math.min(top, b.top);
     }
-    return top;
-}
-
-function place() {
-    if (!host) return;
-    const p = mainComposer();
-    if (!p) { host.style.visibility = 'hidden'; return; }
-    const r = p.getBoundingClientRect();
-    if (!r.width) { host.style.visibility = 'hidden'; return; }
-
-    let top = composerStackTop(p, r);
-    const rail = railTop();
-    // Only when it is genuinely in this strip and overlapping our column. A rail
-    // that belongs to another pane must not push the band up for nothing.
-    if (rail && rail.bottom <= r.top + 6 && rail.left < r.right && rail.right > r.left) {
-        top = Math.min(top, rail.top);
-    }
-
-    host.style.visibility = '';
-    host.style.left = Math.round(r.left) + 'px';
-    host.style.width = Math.round(r.width) + 'px';
-    host.style.bottom = Math.round(innerHeight - top + V.gap) + 'px';
-}
+    const q = layout.query('#cuimod-queue');
+    const rail = q?.shadowRoot?.querySelector('.rail');
+    const qr = rail ? layout.rect(rail) : null;
+    if (qr && qr.height > 4 && qr.bottom <= r.top + 6 && qr.left < r.right && qr.right > r.left) top = Math.min(top, qr.top);
+    return { left: Math.round(r.left) + 'px', width: Math.round(r.width) + 'px', bottom: Math.round(innerHeight - top + V.gap) + 'px' };
+}, (value) => {
+    if (!host || !value) return;
+    const set = (key, val) => { if (host.style[key] !== val) host.style[key] = val; };
+    set('visibility', value.hidden ? 'hidden' : '');
+    if (!value.hidden) { set('left', value.left); set('width', value.width); set('bottom', value.bottom); }
+});
+function place() { schedulePlace(); }
 
 // ------------------------------------------------------------------ styles
 /* The surface is neutral and the accent is a mark, never a fill. That is the
@@ -813,9 +784,6 @@ function retime() {
 }
 ctx.onDispose(() => { clearInterval(timer); clearTimeout(metTimer); });
 
-ctx.every(180, () => { if (host) place(); });
-ctx.observe(document.documentElement, { childList: true, subtree: true }, () => { if (host) place(); });
-ctx.track(window, 'resize', () => place());
 ctx.track(document, 'visibilitychange', () => { if (!document.hidden) pull(); });
 cuimod.onSessionChange(() => {
     st = null; hist = null; dismissed = ''; rearmed = ''; open = false;

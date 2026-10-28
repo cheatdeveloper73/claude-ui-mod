@@ -1,0 +1,6 @@
+tokenizer.json from https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+at revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027, unmodified.
+sha256 c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b
+
+DeepSeek-V4.1-Flash is released under the MIT License, Copyright (c) 2023 DeepSeek.
+Used by router/deepseek-v41.mjs for exact Fireworks prompt counts.

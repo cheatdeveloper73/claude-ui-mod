@@ -14,17 +14,56 @@ const MIN_W = 120;
 const CTX_CHANNEL = cuimod.eipc('claude.web', 'LocalSessions', 'getContextUsage');
 
 let cfg = null;
-let data = { plan: null, openai: null, pool: null, analytics: null, ctx: null, native: null };
+let data = { plan: null, openai: null, pool: null, livePool: null, analytics: null, ctx: null, native: null };
 let resetsText = null;
 let host = null, shadow = null, bar = null, sheet = null;
 let timer = null;
 let raf = 0;
+let livePopoverAt = 0;
+let liveFlight = null;
 let compactToggleBusy = false;
 let compactToggleOwner = null;
 let compactToggleWant = null;
 let compactToggleUntil = 0;
 let rendererDisposed = false;
 const ringOriginal = new WeakMap();
+// Cache candidates, never the selected composer. Each placement still validates
+// every candidate's current geometry; React can leave the old pane connected.
+let rowCandidates = null;
+let ringCandidates = null;
+let popoverCandidates = null;
+let shellTimer = null;
+const TRANSCRIPT = '[data-testid="epitaxy-virtual-transcript"]';
+const USAGE_OWN = '[data-cuimod-provider-limits], [id^="cuimod-"], [class*="cuimod-"]';
+function usageElement(node) { return node?.nodeType === 1 ? node : node?.parentElement; }
+function usageOwn(node) { return !!usageElement(node)?.closest?.(USAGE_OWN); }
+function invalidateUsageShell() {
+    rowCandidates = null;
+    ringCandidates = null;
+    popoverCandidates = null;
+}
+function queueUsageShell(records) {
+    // contain:strict isolates transcript layout. Its text cannot change the
+    // composer, ring, bands or portal popover; inserted/removed roots still can.
+    for (const record of records) for (const node of record.addedNodes || []) {
+        if (node.nodeType === 1 && node.id === HOST_ID && node !== host) node.remove();
+    }
+    if (!records.some(record => !(usageElement(record.target)?.closest?.(TRANSCRIPT)
+        && !(record.type === 'attributes' && record.target.matches?.(TRANSCRIPT)))
+        && !usageOwn(record.target)
+        && !(record.type === 'attributes' && record.target.closest?.('[data-cuimod-provider-usage]'))
+        && !(record.type === 'attributes' && record.oldValue === record.target.getAttribute(record.attributeName))
+        && (record.type !== 'childList' || [...record.addedNodes, ...record.removedNodes].some(node => !usageOwn(node))))) return;
+    invalidateUsageShell();
+    if (shellTimer !== null || rendererDisposed) return;
+    shellTimer = setTimeout(() => {
+        shellTimer = null;
+        if (rendererDisposed) return;
+        scanBands();
+        syncNativeUsage();
+        schedule();
+    }, 0);
+}
 
 function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -34,6 +73,14 @@ function el(tag, cls, text) {
 }
 
 const clamp01 = (value) => Math.max(0, Math.min(1, Number(value) || 0));
+
+// The limits payload from /usage/api is cached for half a minute. While the
+// popover is open on a Fireworks session a much fresher snapshot arrives every
+// second, and it wins -- but only for the provider it belongs to, so a stale
+// live reading can never be shown against a different adapter's session.
+function currentPool() {
+    return data.livePool && data.provider === 'fireworks' ? data.livePool : data.pool;
+}
 
 function short(value) {
     if (!Number.isFinite(value)) return '—';
@@ -163,7 +210,7 @@ function buildBar(root, value) {
     const toggle = el('button', 'compact-toggle', '⟳');
     toggle.type = 'button';
     toggle.setAttribute('aria-label', 'Toggle auto-compact for this session');
-    toggle.addEventListener('click', toggleAutoCompact);
+    ctx.track(toggle, 'click', toggleAutoCompact);
     const built = el('div', 'bar');
     built.append(meter, toggle);
     root.append(built);
@@ -177,22 +224,22 @@ function paintComposer() {
     const have = !!(context && context.rawMaxTokens);
     const fraction = have ? clamp01(context.totalTokens / context.rawMaxTokens) : 0;
     const colour = contextColour(fraction);
-    meter.style.setProperty('--c', colour);
-    meter.querySelector('.fill').style.width = (fraction * 100).toFixed(2) + '%';
+    setStyle(meter, '--c', colour);
+    setStyle(meter.querySelector('.fill'), 'width', (fraction * 100).toFixed(2) + '%');
 
     const compactAt = have && context.isAutoCompactEnabled && context.autoCompactThreshold
         ? clamp01(context.autoCompactThreshold / context.rawMaxTokens) : null;
     const compact = meter.querySelector('.compact');
-    compact.style.left = ((compactAt || 0) * 100).toFixed(2) + '%';
-    compact.style.opacity = cfg.showCompaction && compactAt ? '1' : '0';
+    setStyle(compact, 'left', ((compactAt || 0) * 100).toFixed(2) + '%');
+    setStyle(compact, 'opacity', cfg.showCompaction && compactAt ? '1' : '0');
 
     const countInfo = cuimod.contextCountInfo(context);
-    meter.querySelector('.value').textContent = have
+    setText(meter.querySelector('.value'), have
         ? (countInfo.exact ? '' : '~') + Math.round(fraction * 100) + '%'
-        : '—';
+        : '—');
     const sub = meter.querySelector('.sub');
-    sub.textContent = have ? short(context.totalTokens) + ' / ' + short(context.rawMaxTokens) : 'no session';
-    sub.title = have ? countInfo.description + '\n' + contextTitle(context) : '';
+    setText(sub, have ? short(context.totalTokens) + ' / ' + short(context.rawMaxTokens) : 'no session');
+    setAttribute(sub, 'title', have ? countInfo.description + '\n' + contextTitle(context) : '');
 
     const toggle = bar.querySelector('.compact-toggle');
     const enabled = context?.isAutoCompactEnabled === true;
@@ -204,14 +251,16 @@ function paintComposer() {
         compactToggleWant = null;
         compactToggleUntil = 0;
     }
-    toggle.classList.toggle('on', enabled);
-    toggle.disabled = compactToggleBusy || !!compactToggleWant || !desktopSessionId();
-    toggle.title = compactToggleWant
+    if (toggle.classList.contains('on') !== enabled) toggle.classList.toggle('on', enabled);
+    const disabled = compactToggleBusy || !!compactToggleWant || !desktopSessionId();
+    if (toggle.disabled !== disabled) toggle.disabled = disabled;
+    const title = compactToggleWant
         ? 'Change accepted · waiting for this worker to report its effective state'
         : enabled
             ? 'Auto-compact is on for this session · click to turn it off'
             : 'Auto-compact is off for this session · click to turn it on at this model’s native window';
-    toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    setAttribute(toggle, 'title', title);
+    setAttribute(toggle, 'aria-pressed', enabled ? 'true' : 'false');
 }
 
 function saveSessionOverride(cliSessionId, enabled) {
@@ -391,7 +440,7 @@ function openAIRows() {
 // Some adapters report one subscription with shared rolling windows, rather
 // than the per-account pool shape used by other providers.
 function subscriptionRows() {
-    const usage = data.pool;
+    const usage = currentPool();
     if (!usage || usage.error) return { rows: [], error: usage?.error || 'Subscription usage is unavailable' };
     const rows = [];
     const add = (window, key, label, includeMinuteWithDays = false) => {
@@ -411,10 +460,42 @@ function subscriptionRows() {
     return { rows, error: rows.length ? '' : 'Provider returned no rolling-window limits' };
 }
 
+// A prepaid provider. The ring is the share of the last top-up spent; the
+// balance is live (the provider's figure minus responses it has not deducted
+// yet), and the runout is that balance over a decayed rate of the exact spend
+// the router has seen -- so a burst moves the estimate within minutes instead of
+// waiting for the flat one-hour window to catch up.
+function balanceRows() {
+    const usage = currentPool();
+    const balance = usage?.balance;
+    if (!balance || typeof balance.live !== 'number') return { rows: [], error: usage?.error || 'Balance is unavailable' };
+    const dollars = (value) => (value < 0 ? '-$' : '$') + Math.abs(value).toFixed(Math.abs(value) < 10 ? 3 : 2);
+    const smoothed = usage.burn?.smoothedPerHour;
+    const perHour = Number.isFinite(smoothed) ? smoothed : usage.burn?.usdPerHour || 0;
+    const activity = usage.activity || null;
+    const reset = balance.live <= 0 ? 'out of credit'
+        : usage.runout?.at ? formatCountdown(usage.runout.at) + ' left'
+        : 'idle';
+    // Three figures only: the live rate, the live token throughput, and the
+    // runout on the right. Anything else the snapshot carries is noise here.
+    const facts = [];
+    if (perHour > 0) facts.push(dollars(perHour) + '/h');
+    if (activity?.tokensPerMinute > 0)
+        facts.push((activity.tokensExact === false ? '~' : '') + short(Math.round(activity.tokensPerMinute)) + ' tok/min');
+    return { rows: [{
+        key: 'balance',
+        label: 'Balance',
+        pct: Number.isFinite(usage.usedPercent) ? usage.usedPercent : balance.live <= 0 ? 100 : 0,
+        percentLabel: dollars(balance.live),
+        reset,
+        insight: { text: facts.join(' · ') },
+    }], error: '' };
+}
+
 // An adapter provider backed by several accounts. Each active account gets a
 // row; the ring shows the one the scheduler would actually pick.
 function poolRows(model, provider) {
-    const usage = data.pool;
+    const usage = currentPool();
     if (!Array.isArray(usage?.accounts)) return { rows: [], error: usage?.error || 'Account usage is unavailable' };
     if (usage.poolMeter?.missingUsedPercent === 0) {
         const accounts = usage.accounts.filter(account => account?.status === 'active' && account.schedulable === true);
@@ -459,9 +540,11 @@ function snapshot() {
     // of the turns already taken, so it is the fallback, not the authority.
     const model = data.native?.model || data.ctx?.model;
     const provider = providerOfModel(model);
+    const pool = currentPool();
     let result;
     if (provider === 'openai') result = openAIRows();
-    else if (data.pool?.windowLimits) result = subscriptionRows();
+    else if (pool?.windowLimits) result = subscriptionRows();
+    else if (pool?.balance) result = balanceRows();
     else if (provider !== 'claude') result = poolRows(model, provider);
     else result = { rows: claudeRows(model), error: '' };
 
@@ -470,7 +553,7 @@ function snapshot() {
     // cannot serve the next request, so it cannot make the ring look healthier.
     // A single subscription has multiple windows instead; its ring shows the
     // most consumed window, as Claude and OpenAI do.
-    const pooled = Array.isArray(data.pool?.accounts);
+    const pooled = Array.isArray(pool?.accounts);
     const eligibleRows = pooled ? rows.filter((row) => row.schedulable !== false) : rows;
     const ringRows = eligibleRows.length ? eligibleRows : rows;
     const ringRow = pooled
@@ -490,9 +573,13 @@ function snapshot() {
 }
 
 function ringButton() {
-    return document.querySelector('[data-testid="chat-context-ring"]')
-        || Array.from(document.querySelectorAll('button')).find((button) => /^Usage:/.test(button.getAttribute('aria-label') || ''))
-        || null;
+    if (!ringCandidates) {
+        const primary = Array.from(document.querySelectorAll('[data-testid="chat-context-ring"]'));
+        ringCandidates = primary.length ? primary : Array.from(document.querySelectorAll('button'))
+            .filter((button) => /^Usage:/.test(button.getAttribute('aria-label') || ''));
+    }
+    return ringCandidates.find((button) => button.isConnected
+        && (ringCandidates.length === 1 || button.getBoundingClientRect().width > 0)) || null;
 }
 
 function ringColour(pct) {
@@ -505,8 +592,17 @@ function setAttribute(node, name, value) {
     if (node.getAttribute(name) !== value) node.setAttribute(name, value);
 }
 
+const styleValues = new WeakMap();
 function setStyle(node, property, value) {
-    if (node.style.getPropertyValue(property) !== value) node.style.setProperty(property, value);
+    const actual = node.style.getPropertyValue(property);
+    let held = styleValues.get(node);
+    if (!held) styleValues.set(node, held = new Map());
+    const previous = held.get(property);
+    // CSSOM canonicalizes percentages and SVG numbers. Compare both the last
+    // requested value and its serialized result, without masking React writes.
+    if (previous?.value === value && previous.actual === actual) return;
+    if (actual !== value) node.style.setProperty(property, value);
+    held.set(property, { value, actual: node.style.getPropertyValue(property) });
 }
 
 function syncRing() {
@@ -651,12 +747,12 @@ function paintLimitRows(container, rows, error, notice) {
         const insight = node.querySelector('.cuimod-limit-insight');
         const insightText = row.insight?.text ?? 'Learning burn rate and tokens per 1%';
         setText(insight, insightText);
-        insight.hidden = !insightText;
+        if (insight.hidden !== !insightText) insight.hidden = !insightText;
         const track = node.querySelector('[role="progressbar"]');
         setAttribute(track, 'aria-valuetext', percentText);
         const fill = track.firstElementChild;
         const width = (clamp01(row.pct / 100) * 100).toFixed(2) + '%';
-        requestAnimationFrame(() => { setStyle(fill, 'width', width); });
+        setStyle(fill, 'width', width);
         setStyle(fill, 'background-color', ringColour(row.pct));
     }
 
@@ -710,7 +806,7 @@ function transformPopover(popover) {
         const header = el('div', 'flex items-center justify-between gap-2 px-lg py-xs min-h-[20px]');
         const open = el('button', 'cuimod-usage-open text-footnote text-muted shrink-0', 'Open Usage Atlas ↗');
         open.type = 'button';
-        open.addEventListener('click', (event) => {
+        ctx.track(open, 'click', (event) => {
             event.preventDefault(); event.stopPropagation();
             cuimod.rpc('usage-bar.openDashboard').catch(() => {});
         });
@@ -725,18 +821,22 @@ function transformPopover(popover) {
     const header = custom.firstElementChild;
     setText(header.firstElementChild, 'Usage intelligence · ' + picked.title);
     paintLimitRows(custom.lastElementChild, picked.rows, picked.error, picked.notice);
+    // Stamp the visit. The one-second loop polls the Fireworks live drain only
+    // while this is fresh, so a closed popover costs nothing.
+    if (picked.provider === 'fireworks') livePopoverAt = Date.now();
 }
 
 function syncNativeUsage() {
     syncRing();
-    for (const node of document.querySelectorAll('[role="dialog"], [data-cds="Popover"]')) transformPopover(node);
+    if (!popoverCandidates) popoverCandidates = Array.from(document.querySelectorAll('[role="dialog"], [data-cds="Popover"]'));
+    for (const node of popoverCandidates) if (node.isConnected) transformPopover(node);
 }
 
 function scanBands() {
     let found = null;
-    for (const band of document.querySelectorAll('.epitaxy-composer-band')) {
+    for (const band of document.querySelectorAll('.epitaxy-composer-band, .epitaxy-band-enter')) {
         const text = band.textContent || '';
-        if (!/usage limit/i.test(text)) {
+        if (!/(?:usage|weekly|session)\s+(?:usage\s+)?limit/i.test(text)) {
             band.removeAttribute('data-cuimod-usage');
             continue;
         }
@@ -780,12 +880,29 @@ function refreshOwned(owner) {
         && owner.sessionId === observedDesktopId && owner.sessionId === desktopSessionId();
 }
 
+// The Fireworks live drain. The router recomputes the rate and the trailing
+// activity in memory, so this is cheap enough to run every second; only the
+// balance poll behind it reaches the gateway, and that stays on its own cadence.
+// A failed poll is dropped, leaving the last good reading in place.
+function pollLivePool() {
+    if (liveFlight || rendererDisposed) return;
+    const generation = refreshGeneration;
+    liveFlight = within(cuimod.rpc('usage-bar.fireworksLive'), 4000).then((value) => {
+        if (rendererDisposed || generation !== refreshGeneration) return;
+        if (!value || value.error || !value.balance) return;
+        data.livePool = value;
+        syncNativeUsage();
+    }).catch(() => {}).finally(() => { liveFlight = null; });
+}
+
 function clearProviderObservation() {
     data.native = null;
     data.openai = null;
     data.pool = null;
+    data.livePool = null;
     data.analytics = null;
     data.provider = null;
+    livePopoverAt = 0;
     lastLimitsAt = 0;
     lastLimitsProvider = null;
     lastLimitsModel = null;
@@ -903,52 +1020,51 @@ async function refresh(forceLimits = false) {
 }
 
 const ROW_MAX_DEPTH = 8;
-function rowFrom(group) {
-    const row = group.parentElement;
-    if (!row) return null;
-    const rect = row.getBoundingClientRect();
-    if (rect.height < 12 || rect.height > 52 || rect.width < 220) return null;
-    return { row, right: group, rowRect: rect, rightRect: group.getBoundingClientRect() };
-}
-
-function rowIn(scope) {
-    for (const group of scope.querySelectorAll('[class*="ml-auto"], [class*="ms-auto"]')) {
-        const found = rowFrom(group);
-        if (found) return found;
+function findRow(snapshot) {
+    if (!rowCandidates) {
+        const queryAll = (selector, root = document) => snapshot
+            ? snapshot.queryAll(selector, root) : root.querySelectorAll(selector);
+        const candidates = [];
+        for (const scope of queryAll('.epitaxy-composer-width')) {
+            candidates.push(...queryAll('[class*="ml-auto"], [class*="ms-auto"]', scope));
+        }
+        let node = !candidates.some(group => {
+            const row = group.parentElement;
+            const rect = row && (snapshot ? snapshot.rect(row) : row.getBoundingClientRect());
+            return rect && rect.height >= 12 && rect.height <= 52 && rect.width >= 220;
+        }) && (document.querySelector('.epitaxy-prompt') || document.querySelector('.epitaxy-prompt-input'));
+        for (let depth = 0; node && depth < ROW_MAX_DEPTH; depth += 1, node = node.parentElement) {
+            candidates.push(...queryAll('[class*="ml-auto"], [class*="ms-auto"]', node));
+        }
+        rowCandidates = [...new Set(candidates)];
+    }
+    for (const group of rowCandidates) {
+        if (!group.isConnected) continue;
+        const row = group.parentElement;
+        if (!row) continue;
+        const rect = snapshot ? snapshot.rect(row) : row.getBoundingClientRect();
+        if (rect.height < 12 || rect.height > 52 || rect.width < 220) continue;
+        return { row, right: group, rowRect: rect,
+            rightRect: snapshot ? snapshot.rect(group) : group.getBoundingClientRect() };
     }
     return null;
 }
 
-function findRow() {
-    for (const scope of document.querySelectorAll('.epitaxy-composer-width')) {
-        const found = rowIn(scope);
-        if (found) return found;
-    }
-    let node = document.querySelector('.epitaxy-prompt') || document.querySelector('.epitaxy-prompt-input');
-    for (let depth = 0; node && depth < ROW_MAX_DEPTH; depth += 1, node = node.parentElement) {
-        const found = rowIn(node);
-        if (found) return found;
-    }
-    return null;
-}
-
-function place() {
-    if (!host || !cfg) return;
-    for (const node of document.querySelectorAll('#' + HOST_ID)) if (node !== host) node.remove();
-    const wrap = shadow.querySelector('.wrap');
-    if (!cfg.enabled || !cfg.composerContext) { wrap.classList.remove('show'); return; }
-    const found = findRow();
-    if (!found) { wrap.classList.remove('show'); return; }
-
+function measurePlacement(snapshot) {
+    if (!host || !cfg) return null;
+    if (!cfg.enabled || !cfg.composerContext) return { show: false };
+    const found = findRow(snapshot);
+    if (!found) return { show: false };
+    const rectOf = node => snapshot ? snapshot.rect(node) : node.getBoundingClientRect();
     let leftEdge = found.rowRect.left;
     for (const child of found.row.children) {
         if (child === found.right) break;
-        const rect = child.getBoundingClientRect();
+        const rect = rectOf(child);
         if (rect.width > 0) leftEdge = Math.max(leftEdge, rect.right);
     }
     const voiceHost = document.getElementById('cuimod-voice-agent');
     const voicePill = voiceHost?.shadowRoot?.querySelector('.pill.on');
-    const voiceRect = voicePill?.getBoundingClientRect();
+    const voiceRect = voicePill && rectOf(voicePill);
     if (voiceRect && voiceRect.width > 0
         && voiceRect.bottom > found.rowRect.top && voiceRect.top < found.rowRect.bottom
         && voiceRect.right > found.rowRect.left && voiceRect.left < found.rightRect.left) {
@@ -956,22 +1072,37 @@ function place() {
     }
     const left = Math.round(leftEdge + GAP);
     const width = Math.round(found.rightRect.left - GAP - left);
-    if (width < MIN_W) { wrap.classList.remove('show'); return; }
-
-    wrap.style.left = left + 'px';
-    wrap.style.top = Math.round(found.rowRect.top + (found.rowRect.height - BAR_H) / 2) + 'px';
-    wrap.style.width = width + 'px';
-    wrap.style.height = BAR_H + 'px';
-    wrap.classList.add('show');
+    return { show: width >= MIN_W, left, width,
+        top: Math.round(found.rowRect.top + (found.rowRect.height - BAR_H) / 2) };
 }
 
+function paintPlacement(placement) {
+    if (!placement || !shadow) return;
+    const wrap = shadow.querySelector('.wrap');
+    if (placement.show) {
+        setStyle(wrap, 'left', placement.left + 'px');
+        setStyle(wrap, 'top', placement.top + 'px');
+        setStyle(wrap, 'width', placement.width + 'px');
+        setStyle(wrap, 'height', BAR_H + 'px');
+    }
+    if (wrap.classList.contains('show') !== placement.show) wrap.classList.toggle('show', placement.show);
+}
+
+function place() {
+    paintPlacement(measurePlacement());
+}
+const layoutPlacement = typeof ctx.layout === 'function' ? ctx.layout(measurePlacement, paintPlacement) : null;
+
 function schedule() {
+    if (layoutPlacement) { layoutPlacement(); return; }
+    if (document.hidden) { place(); return; }
     if (raf) return;
     raf = requestAnimationFrame(() => { raf = 0; place(); });
 }
 
 function apply(value) {
     cfg = value;
+    invalidateUsageShell();
     if (host && !host.isConnected) { host = null; shadow = null; bar = null; sheet = null; }
     for (const node of document.querySelectorAll('#' + HOST_ID)) if (node !== host) node.remove();
 
@@ -997,7 +1128,12 @@ function apply(value) {
   [data-cuimod-provider-limits] [role="progressbar"] > div { transition-duration: 1ms !important; }
 }` : '';
     docStyle.textContent = value.hideBanner ? '[data-cuimod-usage="1"] { display: none !important; }' : '';
+    scanBands();
     paintComposer();
+    if (!value.enabled) {
+        restoreRing();
+        for (const popover of document.querySelectorAll('[role="dialog"], [data-cds="Popover"]')) restorePopover(popover);
+    }
     schedule();
     lastLimitsAt = 0;
     refresh(true);
@@ -1011,28 +1147,35 @@ nativeStyle.id = STYLE_ID;
 (document.head || document.documentElement).append(nativeStyle);
 
 ctx.track(window, 'resize', schedule, { passive: true });
-ctx.track(window, 'scroll', schedule, { passive: true, capture: true });
-ctx.track(window, 'cuimod:voice-layout', place);
-ctx.track(document, 'visibilitychange', schedule);
-ctx.observe(document.documentElement, { childList: true, subtree: true }, () => {
-    schedule();
-    scanBands();
-    syncNativeUsage();
+ctx.track(window, 'scroll', (event) => {
+    if (!usageElement(event.target)?.closest?.(TRANSCRIPT)) schedule();
+}, { passive: true, capture: true });
+ctx.track(window, 'cuimod:voice-layout', () => {
+    if (layoutPlacement) layoutPlacement.measure(); else place();
 });
+ctx.track(document, 'visibilitychange', () => { invalidateUsageShell(); schedule(); syncNativeUsage(); });
+ctx.observe(document.documentElement, { childList: true, characterData: true, subtree: true,
+    attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'hidden', 'data-testid', 'role'] }, queueUsageShell);
 ctx.every(1000, () => {
     if (syncObservationIdentity()) refresh(true);
-    place();
+    // The bridge owns layout invalidation when available. Older bridges retain
+    // direct hidden-window placement without re-discovering shell candidates.
+    if (!layoutPlacement) place();
     syncNativeUsage();
+    if (Date.now() - livePopoverAt < 2500) pollLivePool();
 });
 ctx.every(8000, () => { scanBands(); refresh(); });
-cuimod.onSessionChange((cliSessionId) => {
+ctx.onDispose(cuimod.onSessionChange((cliSessionId) => {
+    invalidateUsageShell();
+    schedule();
     const desktopId = desktopSessionId();
     const nextCli = cliSessionId || null;
     if (desktopId !== observedDesktopId || nextCli !== observedCliSessionId)
         invalidateObservation(desktopId, nextCli);
     refresh(true);
-});
+}));
 ctx.onDispose(() => {
+    clearTimeout(shellTimer);
     rendererDisposed = true;
     refreshGeneration++;
     refreshFlight = null;

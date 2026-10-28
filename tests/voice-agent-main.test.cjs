@@ -266,6 +266,25 @@ test('wake command uses next priority for a running target session', async () =>
     } finally { await f.close(); }
 });
 
+// App 2.9939.4 moved isCliProvablyIdle off the manager into a module-local
+// function; hasAgentRunInProgress(sessionId) is the surviving public wrapper.
+test('wake command steers a running target on a manager without isCliProvablyIdle', async () => {
+    const f = await fixture([{ id: 1, kind: 'command.final', intent: 'prompt', command: 'run the tests', target: {
+        desktopSessionId: SID, cliSessionId: CLI, webContentsId: 17,
+    } }]);
+    try {
+        const manager = require.cache[path.join(f.root, 'manager-fixture.cjs')].exports.claudeCodeSessionManager;
+        delete manager.isCliProvablyIdle;
+        manager.hasAgentRunInProgress = sid => manager.sessions.get(sid).busy;
+        f.session.cliLastTurnMessageWasResult = true;
+        await f.poll();
+        assert.deepEqual(f.sent, [{
+            sid: SID, text: 'run the tests', attachments: undefined,
+            options: { initiator: 'user', priority: 'next' },
+        }]);
+    } finally { await f.close(); }
+});
+
 test('reliable acoustic emotion is separate from the spoken command', async () => {
     const f = await fixture([{ id: 1, kind: 'command.final', intent: 'prompt', command: 'that worked',
         emotion: { label: 'happy', confidence: 0.985, reliable: true }, target: {
@@ -434,7 +453,7 @@ test('recovered in-flight reservation is held instead of duplicated', async () =
 
 test('voice status starts after the complete native left control cluster', () => {
     const source = fs.readFileSync(path.join(__dirname, '../src/plugins/voice-agent/renderer.js'), 'utf8');
-    const start = source.indexOf('function place() {');
+    const start = source.indexOf('const place = ctx.layout(');
     const end = source.indexOf('\n\nasync function refreshStatus', start);
     assert.ok(start >= 0 && end > start);
 
@@ -461,9 +480,18 @@ test('voice status starts after the complete native left control cluster', () =>
     };
     const host = { style: {} };
     let notifications = 0;
-    const place = new Function('document', 'pill', 'host', 'RECORD_LABEL', 'SETTINGS_LABEL', 'notifyLayout',
+    // place is a ctx.layout read/write pair; run both phases synchronously
+    // against the same fixtures the coordinator would measure.
+    const main = {};
+    const layout = {
+        mainComposer: () => main,
+        query: (selector, root) => (root === main ? document.querySelector(selector) : null),
+        rect: node => node.getBoundingClientRect(),
+    };
+    const ctx = { layout: (read, write) => () => write(read(layout)) };
+    const place = new Function('ctx', 'pill', 'host', 'RECORD_LABEL', 'SETTINGS_LABEL', 'notifyLayout',
         source.slice(start, end) + '\nreturn place;')(
-        document, pill, host, 'Press and hold to record', 'Dictation settings', () => { notifications++; });
+        ctx, pill, host, 'Press and hold to record', 'Dictation settings', () => { notifications++; });
     place();
     assert.equal(host.style.left, '308px');
     assert.equal(host.style.maxWidth, '364px');

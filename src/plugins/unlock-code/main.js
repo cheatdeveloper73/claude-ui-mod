@@ -61,7 +61,9 @@ module.exports = function (ctx) {
 
     function replace(target, key, factory) {
         const current = target?.[key];
-        if (typeof current !== 'function' || current[GENERATION] === owner) return false;
+        // The send barrier may sit above our wrapper; auth is still installed.
+        if (typeof current !== 'function' || current[GENERATION] === owner
+            || current.__cuimodLiveMoveOriginal?.[GENERATION] === owner) return false;
         const original = current[ORIGINAL] || current;
         const wrapped = factory(original);
         Object.defineProperty(wrapped, ORIGINAL, { value: original });

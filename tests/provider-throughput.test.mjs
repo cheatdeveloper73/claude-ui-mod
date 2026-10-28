@@ -336,3 +336,30 @@ test('a stale live entry is swept rather than accumulating', () => {
     ledger.begin({ provider: 'claude', requestedModel: 'claude-opus-5', streaming: true });
     assert.equal(ledger.live.size, 1, 'the abandoned sample is gone, the new one remains');
 });
+
+test('a response delivered in one burst keeps its ttft but reports no generation rate', () => {
+    const c = clock();
+    const ledger = ledgerAt('burst.jsonl', c);
+    const sample = ledger.begin({ provider: 'stub', requestedModel: 'Stub-Compat-agent', streaming: true });
+    c.tick(3000);
+    sample.anthropic({ type: 'message_start', message: { id: 'b1', model: 'stub-compat-1', usage: { output_tokens: 0 } } });
+    sample.anthropic({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'all at once' } });
+    c.tick(2);
+    sample.complete({ responseId: 'b1', servedModel: 'stub-compat-1', burst: true, usage: { input_tokens: 5, output_tokens: 37 } });
+
+    const [record] = ledger.records;
+    assert.equal(record.ttftMs, 3000);
+    assert.equal(record.streamMs, null, 'a burst has no observable generation interval');
+    assert.equal(record.outputTps, null);
+    assert.equal(record.endToEndTps, 12.33);
+});
+
+test('a group rate counts only the tokens whose generation time was measured', () => {
+    const rows = [
+        { tokens: { outputTokens: 100 }, streamMs: 1000, provider: 'claude', completedAt: '2026-09-01T00:00:00.000Z' },
+        { tokens: { outputTokens: 5000 }, streamMs: null, provider: 'claude', completedAt: '2026-09-01T00:01:00.000Z' },
+    ];
+    const [group] = summarize(rows, row => row.provider);
+    assert.equal(group.outputTokens, 5100);
+    assert.equal(group.sustainedTps, 100, 'an untimed response must not add tokens to the timed window');
+});

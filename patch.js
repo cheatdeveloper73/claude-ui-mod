@@ -81,6 +81,28 @@ function buildPayloads(originalPreload) {
     return { pre, main, channel: prefix };
 }
 
+// The marker proves an archive was patched, not with which loader. A loader
+// fix (b288ad5) sat unbaked for 19 days because every sweep saw the marker and
+// stopped. Current means both baked tails equal what src would bake now.
+function payloadCurrent(preloadText, mainText) {
+    const sep = '\n' + MARKER + '\n';
+    const i = preloadText.indexOf(sep);
+    const j = mainText.indexOf(sep);
+    if (i < 0 || j < 0) return false;
+    let want;
+    try { want = buildPayloads(preloadText.slice(0, i)); } catch (_) { return false; }
+    return preloadText.slice(i + sep.length) === want.pre && mainText.slice(j + sep.length) === want.main;
+}
+
+function isCurrent(a) {
+    try {
+        return payloadCurrent(asar.readFile(a.asar, PRELOAD_ENTRY).toString('utf8'),
+            asar.readFile(a.asar, MAIN_ENTRY).toString('utf8'));
+    } catch (_) {
+        return false;
+    }
+}
+
 // Desktop removes agent-to-agent messaging twice, at two layers, and both have
 // to go or the symptom just changes shape.
 //
@@ -164,6 +186,10 @@ function unbanSendMessage(source, log) {
     const AUDITED = {
         '62f0a21d5a95750273b3a44900009019f73c521c976711c5fdd6ffbba6daf288': '2.7032.0',
         'c5274bb77257bc824d5d02bb10eb503a0ad1a693ebee05dc953ab9d130701ad5': '2.9939.4',
+        // Same shape as 2.9939.4: Dl="SendMessage", PreToolUse guard Ol() only
+        // refuses session/socket targets; appends carry Edit denies, SubscribePR,
+        // and the ShareOnboardingGuide/SuggestSkills trim.
+        '3d9a6d22d92d1f7eeb8d00eae14038a1e784809a73a559d9d77bea9c113e894c': '2.31226.1',
     };
     const audited = AUDITED[asar.headerHash(source)];
     if (found.registry === 0 && found.call === 0 && audited) {
@@ -242,7 +268,7 @@ function apply(opts = {}) {
     verifyFrontend();
     const list = appDirs();
     if (!list.length) throw new Error('no app-<version> directory under ' + ROOT);
-    const targets = (opts.all ? list : [list[0]]).filter((a) => opts.rebuild || !isPatched(a));
+    const targets = (opts.all ? list : [list[0]]).filter((a) => opts.rebuild || !isCurrent(a));
     if (!targets.length) { console.log('already patched'); return; }
     if (!opts.force && running()) {
         throw new Error('Claude is running. Quit it from the tray icon and re-run, or pass --force.');
@@ -282,12 +308,13 @@ function status() {
         console.log(
             (i === 0 ? '* ' : '  ') + a.name +
             '  patched=' + (isPatched(a) ? 'yes' : 'no') +
+            '  current=' + (isCurrent(a) ? 'yes' : 'no') +
             '  backup=' + (fs.existsSync(a.backup) ? 'yes' : 'no')
         );
     });
 }
 
-module.exports = { appDirs, isPatched, patchOne, apply, revert, status, running, unbanSendMessage, MARKER, ROOT };
+module.exports = { appDirs, isPatched, isCurrent, payloadCurrent, patchOne, apply, revert, status, running, unbanSendMessage, MARKER, ROOT };
 
 if (require.main === module) {
     const args = process.argv.slice(2);

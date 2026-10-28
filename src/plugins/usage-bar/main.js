@@ -209,6 +209,12 @@ module.exports = function (ctx) {
         return event.sender.executeJavaScript(pageSource, false);
     });
     ctx.method('allLimits', (params) => readAllLimits(params?.force === true, params?.model));
+    // The Fireworks live drain. The router recomputes the decayed rate and the
+    // trailing activity from its spend log without touching the gateway, so the
+    // popover can poll this while open without the analytics snapshot cost the
+    // allLimits route carries. No caching here: the whole point is the movement
+    // between one second and the next.
+    ctx.method('fireworksLive', () => routerJSON('/fireworksz'));
     ctx.method('openDashboard', () => {
         ctx.electron.shell.openExternal(ROUTER + '/usage/');
         return true;

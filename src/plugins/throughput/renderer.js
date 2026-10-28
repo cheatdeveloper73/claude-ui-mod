@@ -39,8 +39,7 @@ let parts = null;         // its keyed sub-containers
 let lastPoll = 0;
 let busy = false;
 let sessionId = cuimod.sessionId || null;
-
-cuimod.onSessionChange((id) => { sessionId = id; lastPoll = 0; });
+let sessionGeneration = 0;
 
 // ---------------------------------------------------------------- formatting
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -183,7 +182,9 @@ function build() {
     const footText = el('span', null, '');
     const reveal = el('div', 'btn', 'Show ledger');
     reveal.addEventListener('click', () => {
-        cuimod.rpc('throughput.revealLedger').catch((e) => cuimod.log('throughput: reveal failed: ' + (e && e.message)));
+        cuimod.rpc('throughput.revealLedger', { sessionId, desktopSessionId: cuimod.desktopSessionId })
+            .then(value => { if (!value.ok) fail(value.error); })
+            .catch((e) => fail('throughput: reveal failed: ' + (e && e.message)));
     });
     foot.append(footText, reveal);
 
@@ -366,12 +367,17 @@ async function poll() {
     lastPoll = now;
     busy = true;
     try {
-        const snapshot = await cuimod.rpc('throughput.snapshot', { sessionId, scope: settings.scope });
+        const owner = { sessionId, desktopSessionId: cuimod.desktopSessionId, generation: sessionGeneration };
+        const owned = () => owner.generation === sessionGeneration && owner.sessionId === sessionId && owner.desktopSessionId === cuimod.desktopSessionId;
+        const snapshot = await cuimod.rpc('throughput.snapshot', { ...owner, scope: settings.scope });
+        if (!owned()) return;
         if (now - historyAt > 15000) {
             historyAt = now;
-            historyCache = await cuimod.rpc('throughput.history', {
-                sessionId, scope: settings.scope, hours: settings.historyHours || null,
+            const history = await cuimod.rpc('throughput.history', {
+                ...owner, scope: settings.scope, hours: settings.historyHours || null,
             }).catch(() => historyCache);
+            if (!owned()) return;
+            historyCache = history;
         }
         paint(snapshot, historyCache);
     } catch (err) {
@@ -607,6 +613,15 @@ function paintChip(value) {
 }
 
 let chipBusy = false;
+cuimod.onSessionChange((id) => {
+    sessionId = id;
+    sessionGeneration++;
+    lastPoll = 0;
+    historyAt = 0;
+    historyCache = null;
+    chipTimer = 0;
+    removeChip();
+});
 
 async function pollChip() {
     if (!settings.showChip || document.visibilityState === 'hidden') return;
@@ -618,9 +633,10 @@ async function pollChip() {
     chipTimer = now;
     chipBusy = true;
     try {
-        const value = await cuimod.rpc('throughput.live', { sessionId });
-        paintChip(value);
-    } catch (_) { /* a blue-green router swap; the next tick retries */ }
+        const owner = { sessionId, desktopSessionId: cuimod.desktopSessionId, generation: sessionGeneration };
+        const value = await cuimod.rpc('throughput.live', owner);
+        if (owner.generation === sessionGeneration && owner.sessionId === sessionId && owner.desktopSessionId === cuimod.desktopSessionId) paintChip(value);
+    } catch (_) { removeChip(); }   // never retain a rate from an unavailable host
     finally { chipBusy = false; }
 }
 

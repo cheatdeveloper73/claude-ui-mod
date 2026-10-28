@@ -47,6 +47,9 @@ function readSession(sessionId, root = sessionsRoot()) {
             let data;
             try { data = JSON.parse(fs.readFileSync(path.join(root, account.name, workspace.name, filename), 'utf8')); } catch (_) { continue; }
             if (!data) continue;
+            // The identical cwd can name the PC standby copy and guest authority.
+            // A native remote miss must not be rescued from this machine's disk.
+            if (data.sshConfig || data.wslConfig || data.remoteTarget || data.backend?.remoteTarget) return none;
             const extra = Array.isArray(data.additionalDirectories) ? data.additionalDirectories : [];
             const roots = [data.cwd, data.originCwd, data.worktreePath, data.harnessCwd, ...extra]
                 .filter((p) => typeof p === 'string' && WIN.isAbsolute(p) && !isRemoteOrDevice(p))

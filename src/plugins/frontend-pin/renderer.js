@@ -132,8 +132,8 @@ async function refreshStatus() {
         }
         const error = status.failed || (!status.ready && status.lastError);
         const livePage = document.readyState === 'complete' && document.querySelector('.epitaxy-prompt') && !pinnedPage();
-        showWarning(error ? 'Unsupported Code frontend: ' + error
-            : livePage ? 'Frontend pin is armed. This page is still on the live release; reload Code when convenient to use the bundled frontend.' : null);
+        showWarning(error ? 'Unsupported Code frontend: ' + error : null);
+        if (!error && livePage && enabled && status.ready) cuimod.rpc('frontend-pin.reloadLive').catch(() => {});
         const release = spec.controls.find((control) => control.key === 'release');
         const label = pinnedEntry ? pinnedEntry.slice(pinnedEntry.lastIndexOf('/') + 1) + ' · ' + status.bundledAssets + ' bundled assets' : 'Bundle unavailable';
         if (release.text !== label) {

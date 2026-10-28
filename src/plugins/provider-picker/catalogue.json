@@ -33,6 +33,70 @@
         "provider": "openai"
     },
     {
+        "id": "gpt-6.1-terra",
+        "name": "GPT-6.1-Terra",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "low",
+        "priority": 3,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-6-sol",
+        "name": "GPT-6-Sol",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "medium",
+        "priority": 3,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6-Sol",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "low",
+        "priority": 4,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
+        "id": "gpt-5.6-terra",
+        "name": "GPT-5.6-Terra",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+        ],
+        "defaultEffort": "medium",
+        "priority": 5,
+        "context": 1050000,
+        "maxOutput": 128000,
+        "provider": "openai"
+    },
+    {
         "id": "gpt-6-luna",
         "name": "GPT-6-Luna",
         "efforts": [
@@ -43,7 +107,7 @@
             "max"
         ],
         "defaultEffort": "medium",
-        "priority": 3,
+        "priority": 6,
         "context": 1050000,
         "maxOutput": 128000,
         "provider": "openai"
@@ -87,6 +151,68 @@
             "secret": "meta"
         },
         "context": 1048576
+    },
+    {
+        "id": "fireworks-deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "contextNote": "Fireworks serverless. Zero data retention is Fireworks' default for open models on inference endpoints; contextLength 1048576 per the model's Fireworks metadata.",
+        "efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+        ],
+        "defaultEffort": "high",
+        "effortField": "reasoning_effort",
+        "effortValues": {
+            "none": "none",
+            "low": 25,
+            "medium": 50,
+            "high": 75,
+            "xhigh": 100,
+            "max": 100
+        },
+        "context": 1048576,
+        "maxOutput": 131072,
+        "provider": "fireworks",
+        "providerLabel": "Fireworks",
+        "upstreamId": "accounts/fireworks/models/deepseek-v4p1-flash",
+        "counter": "deepseek-v4.1-fireworks",
+        "backend": {
+            "protocol": "anthropic-messages",
+            "baseUrl": "https://api.fireworks.ai/inference/v1",
+            "apiKeyHeader": "authorization",
+            "secret": "fireworks"
+        }
+    },
+    {
+        "id": "fireworks-glm-5.3",
+        "name": "GLM 5.3",
+        "contextNote": "Fireworks serverless, thinking-only. The template has three effort headers (Low, High, Max); Max is the model's default. contextLength 1048576 per the model's Fireworks metadata.",
+        "efforts": [
+            "low",
+            "high",
+            "max"
+        ],
+        "defaultEffort": "max",
+        "effortField": "reasoning_effort",
+        "effortValues": {
+            "low": "low",
+            "high": "high",
+            "max": "max"
+        },
+        "context": 1048576,
+        "maxOutput": 131072,
+        "provider": "fireworks",
+        "providerLabel": "Fireworks",
+        "upstreamId": "accounts/fireworks/models/glm-5p3",
+        "counter": "glm-5.3-fireworks",
+        "backend": {
+            "protocol": "anthropic-messages",
+            "baseUrl": "https://api.fireworks.ai/inference/v1",
+            "apiKeyHeader": "authorization",
+            "secret": "fireworks"
+        }
     },
     {
         "id": "deepseek-v4.1-flash",

@@ -40,14 +40,20 @@ import { ProviderLimits } from './limits.mjs';
 import { ResetCredits } from './reset-credits.mjs';
 import { AdapterRegistry } from './adapter-registry.mjs';
 import { readAutoCompactBudget, readCompactionSettings, readContextSettings, readProviderSettings } from './settings.mjs';
+import { filterBypassSafeguardContext } from './bypass-context.mjs';
 import { UsageLedger, normalizeUsage } from './telemetry.mjs';
 import { ThroughputLedger, isSubagentRequest } from './throughput.mjs';
 import { estimateOpenAIInput } from './count-tokens.mjs';
+import { FireworksBilling, sshPeers } from './fireworks-billing.mjs';
+import { costOfTokens } from './pricing.mjs';
+import { countDeepSeekV41, deepSeekV41Status, listLoadedDeepSeekV41Tools, neutralizeDeepSeekV41Text, warmDeepSeekV41 } from './deepseek-v41.mjs';
+import { countGlm53, glm53Status } from './glm-53.mjs';
 import { applyPromptPolicy, promptPolicyHeaders, resolvePromptPolicy } from './prompt-policy.mjs';
 import { capturePrompt } from './prompt-capture.mjs';
 import { fastTier } from './fast-mode.mjs';
-import { openAIRequest } from './openai-transport.mjs';
-import { authorityConfig, authorizeClaude, readerCredential } from './credential-authority.mjs';
+import { openAIRequest, openAITransportState } from './openai-transport.mjs';
+import { fireworksRequest, fireworksTransportState } from './fireworks-transport.mjs';
+import { authorityConfig, authorizeClaude, readerCredential, recoverClaudeRotation } from './credential-authority.mjs';
 import {
     CompactionStore,
     anthropicSummaryResponse,
@@ -105,7 +111,19 @@ import {
     windowCutsMatch,
 } from './context-management.mjs';
 import { publicRouterPort, rejectRequest } from './request-guard.mjs';
+import { guardGoalEvaluator, isGoalEvaluatorRequest } from './goal-guard.mjs';
 import {
+    ADVISOR_CONSULT_HEADER,
+    ADVISOR_MAX_CONSULTS,
+    ADVISOR_TOOL_NAME,
+    advisorErrorContent,
+    advisorFeedbackText,
+    buildConsultBody,
+    consultAdvisor as dispatchAdvisor,
+    consultHeaders,
+} from './advisor.mjs';
+import {
+    compatibleCredentials,
     compatibleHeaders,
     compatibleModelEntries,
     compatibleStatus,
@@ -121,7 +139,9 @@ import {
     anthropicPing,
     anthropicUsage,
     collectAnthropicMessage,
+    ADVISOR_RESULT_EVENT,
     ResponsesToAnthropic,
+    RoundRecorder,
     buildResponsesRequest,
     chatgptAuth,
     isOpenAI,
@@ -227,6 +247,9 @@ const log = (s) =>
 
 function recordProviderUsage(value)
 {
+    if (value?.provider === 'fireworks')
+        try { fireworksBilling.observe({ ...value, tokens: normalizeUsage(value.usage) }); }
+        catch (error) { log(`fireworks billing observe failed: ${String(error?.message || error).slice(0, 200)}`); }
     let stored = false;
     try { stored = usageLedger.record(value); }
     catch (error) { log(`usage ledger write failed: ${String(error?.message || error).slice(0, 240)}`); }
@@ -261,10 +284,29 @@ const providerAdapters = await AdapterRegistry.load({
     throughput,
 });
 
+// The account's live prepaid balance, for the usage circle. Its key is the
+// catalogue's, so the first configured Fireworks entry supplies it.
+const fireworksBilling = new FireworksBilling({
+    stateFile: path.join(HERE, 'fireworks-billing-v1.json'),
+    getApiKey: () => {
+        const model = compatibleModelEntries().find(entry => entry.provider === 'fireworks');
+        try { return model ? compatibleCredentials(model).apiKey : null; } catch (_) { return null; }
+    },
+    costOf: (record) => costOfTokens('fireworks', record.servedModel, record.tokens, record.observedAt)?.total ?? 0,
+    // Other routers on the account, from an ignored per-machine file.
+    peers: sshPeers(fileURLToPath(new URL('../.state/fireworks-billing-peers.json', import.meta.url))),
+});
+
+// The limits cache holds a poll for a minute, but pending cost, burn and
+// runout move with every response; recompute them from the last poll on read.
+const liveLimits = (limits) => limits?.fireworks && limits.fireworks.balance
+    ? { ...limits, fireworks: { ...limits.fireworks, ...fireworksBilling.snapshot() } } : limits;
+
 const providerLimits = new ProviderLimits({
     openAIUsageURL: OPENAI_USAGE_URL,
     getOpenAIAuth: () => chatgptAuth(log),
     adapters: providerAdapters,
+    extra: { fireworks: (force) => fireworksBilling.getApiKey() ? fireworksBilling.read(force) : undefined },
     // Some provider accounts are paid seats. Cache regular reads so the
     // dashboard and Desktop share a snapshot without multiplying calls.
     cacheMs: 60000,
@@ -383,7 +425,7 @@ function pruneRequest(body)
 function prepareCompatibleBody(body, model, selection)
 {
     let out = prepareProviderBody(stripCheckpointMarkers(stripContextResetMarkers(body)));
-    out.model = model.id;
+    out.model = model.upstreamId;
     out = applyPromptPolicy(out, selection);
 
     // These providers select reasoning behavior through the model variant.
@@ -391,7 +433,25 @@ function prepareCompatibleBody(body, model, selection)
     // a model switch, so never let them silently change the selected variant.
     delete out.output_config;
     delete out.thinking;
-    return pruneRequest(out);
+    out = pruneRequest(out);
+    // A provider that takes its reasoning budget in its own field gets the tier
+    // the session asked for: a `:tier` in the model id (subagent profiles pin
+    // one), else the native slider's output_config.effort, else the default.
+    // The counter names the prompt dialect; that dialect's control tokens
+    // cannot appear as text (see neutralizeDeepSeekV41Text), and it cannot call
+    // a tool its tool list does not name (see listLoadedDeepSeekV41Tools).
+    // GLM 5.3 on Fireworks already tokenizes control-token text as text.
+    if (model.counter === 'deepseek-v4.1-fireworks') out = neutralizeDeepSeekV41Text(out);
+    // Fireworks' adapter, for every model measured, drops defer_loading tools and
+    // adds tool_use_tool; another provider keeps its tool list untouched.
+    if (model.provider === 'fireworks') out = listLoadedDeepSeekV41Tools(out);
+    if (model.effortField)
+    {
+        const asked = model.effort || String(body.output_config?.effort || '').toLowerCase() || model.defaultEffort;
+        const value = model.effortValues[asked] ?? model.effortValues[model.defaultEffort];
+        if (value !== undefined) out[model.effortField] = value;
+    }
+    return out;
 }
 
 const compatibleCounts = new Map();
@@ -399,6 +459,7 @@ const compatibleCounts = new Map();
 async function handleCompatibleCount(req, res, body, model)
 {
     const selection = resolvePromptPolicy(body, model.provider, readProviderSettings(), req.headers['x-claude-code-session-id']);
+    if (model.counter) return countCompatibleLocally(res, prepareCompatibleBody(body, model, selection), model, selection);
     const serialized = JSON.stringify(prepareCompatibleBody(body, model, selection));
     const key = crypto.createHash('sha256').update(model.provider + '\n' + model.route.baseUrl + '\n' + serialized).digest('hex');
     const cached = compatibleCounts.get(key);
@@ -437,17 +498,62 @@ async function handleCompatibleCount(req, res, body, model)
     res.end(result.payload);
 }
 
+const COUNTERS = { 'deepseek-v4.1-fireworks': countDeepSeekV41, 'glm-5.3-fireworks': countGlm53 };
+
+// Counts the exact body handleCompatible would send, so the number is the
+// provider's own input_tokens for that request rather than an estimate of it.
+function countCompatibleLocally(res, prepared, model, selection)
+{
+    let tokens;
+    try { tokens = COUNTERS[model.counter](prepared); }
+    catch (error)
+    {
+        // A 400 is the provider rejecting this body too; anything else is the
+        // counter itself, which must not pass for a count.
+        const status = error.status === 400 ? 400 : 503;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(errorBody(`${model.counter} count failed: ${error.message}`, status === 400 ? 'invalid_request_error' : 'api_error'));
+        return;
+    }
+    res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'X-Cuimod-Token-Count-Source': `${model.counter}.local`,
+        'X-Cuimod-Token-Count-Exact': 'true',
+        ...promptPolicyHeaders(selection),
+    });
+    res.end(JSON.stringify({ input_tokens: tokens }));
+}
+
+function downstreamGone(req, res)
+{
+    const controller = new AbortController();
+    const cleanup = () => {
+        req.off('aborted', abort);
+        res.off('close', abort);
+        res.off('finish', cleanup);
+    };
+    const abort = () => { controller.abort(); cleanup(); };
+    req.once('aborted', abort);
+    res.once('close', abort);
+    res.once('finish', cleanup);
+    if (req.aborted || res.destroyed) abort();
+    const gone = () => controller.signal.aborted || res.writableEnded || res.destroyed;
+    gone.signal = controller.signal;
+    return gone;
+}
+
 async function handleCompatible(req, res, body, model)
 {
-    const gone = () => res.writableEnded || res.destroyed;
+    const gone = downstreamGone(req, res);
     const clientModel = body.model;
     const selection = resolvePromptPolicy(body, model.provider, readProviderSettings(), req.headers['x-claude-code-session-id']);
     const source = prepareProviderBody(body);
     const prepared = prepareCompatibleBody(body, model, selection);
+    const serialized = JSON.stringify(prepared);
     capturePrompt({ provider: model.provider, sessionId: req.headers['x-claude-code-session-id'], model: prepared.model,
         selection, system: source.system, tools: source.tools,
         effectiveSystem: prepared.system, effectiveTools: prepared.tools });
-    log(`${model.provider} ${body.model} -> ${prepared.model} stream=${!!body.stream} msgs=${body.messages?.length ?? 0} tools=${body.tools?.length ?? 0} body=${JSON.stringify(prepared).length}B`);
+    log(`${model.provider} ${body.model} -> ${prepared.model}${model.effortField ? ` ${model.effortField}=${prepared[model.effortField]}` : ''} stream=${!!body.stream} msgs=${body.messages?.length ?? 0} tools=${body.tools?.length ?? 0} body=${Buffer.byteLength(serialized)}B`);
 
     // This arm used to pass no usage observer at all, so a compatible provider
     // produced no exact token record and therefore no rate either. It speaks
@@ -466,11 +572,16 @@ async function handleCompatible(req, res, body, model)
         rate.complete(sample);
     };
 
-    const upstream = await fetchResilient(`${model.route.baseUrl}/messages`, {
+    const url = `${model.route.baseUrl}/messages`;
+    const options = {
         method: 'POST',
         headers: compatibleHeaders(model, req.headers),
-        body: JSON.stringify(prepared),
-    }, model.provider, gone, NO_STATUS_RETRY, log);
+        body: serialized,
+        signal: gone.signal,
+    };
+    const upstream = model.provider === 'fireworks'
+        ? await fireworksRequest(url, options, gone, log)
+        : await fetchResilient(url, options, model.provider, gone, NO_STATUS_RETRY, log);
     rate.upstream();
 
     if (gone()) { rate.end(); return; }
@@ -484,7 +595,8 @@ async function handleCompatible(req, res, body, model)
         await pipeBody(upstream, res);
         return;
     }
-    try { await pipeAnthropicBody(upstream, res, clientModel, !!body.stream, recordUsage, event => rate.anthropic(event)); }
+    try { await pipeAnthropicBody(upstream, res, clientModel, !!body.stream, recordUsage, event => rate.anthropic(event),
+        { stopOnMessageStop: model.provider === 'fireworks' }); }
     finally { rate.end(); }
 }
 
@@ -940,6 +1052,25 @@ async function prepareContextManagement({ payload, model, sessionId, tokens, key
     };
 }
 
+// Native advisor. A consultation is a request this router sends to itself, so the
+// reviewer named in the tool declaration is routed, credentialed and accounted by
+// exactly the arm that serves that model for any other request. The secrets in
+// this set are what lets that arm recognise the request as the router's own.
+const advisorConsults = new Set();
+const ADVISOR_LANE = Symbol('advisor-lane');
+const isAdvisorConsult = req => {
+    const secret = req.headers[ADVISOR_CONSULT_HEADER];
+    return req[ADVISOR_LANE] === true || (typeof secret === 'string' && advisorConsults.has(secret));
+};
+const isAdvisorCall = item => item?.type === 'function_call' && item.name === ADVISOR_TOOL_NAME && !item.namespace;
+// The worker's own listener, not the configured port: tests listen on port 0, and a
+// supervised worker sits on a private port behind the public one.
+function workerOrigin()
+{
+    const address = server.address();
+    return address && typeof address === 'object' ? `http://127.0.0.1:${address.port}` : null;
+}
+
 // Model-only calls, executed here and replayed as ordinary tool output. Nothing
 // about a call or its result is logged: the arguments are the model's own notes
 // and the result is ciphertext this process cannot read anyway.
@@ -989,12 +1120,14 @@ async function runContextCalls(calls, { context, sessionId, tokens, model, paylo
 
 async function handleOpenAI(req, res, body)
 {
-    const gone = () => res.writableEnded || res.destroyed;
+    const gone = downstreamGone(req, res);
     const clientModel = body.model;
     const settings = readProviderSettings();
     const contextSettings = readContextSettings();
     const sessionId = req.headers['x-claude-code-session-id'];
-    const subagent = isSubagentRequest(body);
+    // A consultation is another model's side conversation about this session, not
+    // the session's root lane: it must not touch the lead's context window state.
+    const subagent = isAdvisorConsult(req) || isGoalEvaluatorRequest(body) ? true : isSubagentRequest(body);
     // buildResponsesRequest restores local reset markers. Isolate the root first,
     // or the first request after this upgrade could still consume a mixed-agent
     // cut before prepareContextManagement gets a chance to migrate the store.
@@ -1004,7 +1137,7 @@ async function handleOpenAI(req, res, body)
         catch (error) { contextHealth = { ...contextHealth, lastError: `window store: ${String(error?.message || error).slice(0, 160)}` }; }
     }
     const selection = resolvePromptPolicy(body, 'openai', settings, sessionId);
-    const { req: payload, key, model, effort, promptSurface, restoration, webSearchMaxUses } = buildResponsesRequest(body, settings, selection, {
+    const { req: payload, key, model, effort, promptSurface, restoration, webSearchMaxUses, advisor } = buildResponsesRequest(body, settings, selection, {
         restoreCompaction: restoreForSession(sessionId, subagent !== true),
         fast: fastTier({ body, model: parseOpenAIModel(body.model).id, sessionId, subagent }),
     });
@@ -1017,8 +1150,17 @@ async function handleOpenAI(req, res, body)
     // results is not the end of the turn, and settling the rate sample there
     // would measure the first leg instead of the whole answer.
     let translator = null;
-    let nonstreamPending = false;
-    const moreRounds = () => translator ? translator.pendingCalls.length > 0 : nonstreamPending;
+    let nonstreamResumes = () => false;
+    // Calls the router answers itself. The advisor is only one while its typed
+    // declaration is present: a user function that happens to be named advisor is
+    // an ordinary client tool and goes to Claude Code like any other.
+    let context = null;
+    const isHidden = item => (context !== null && isContextCall(item)) || (advisor !== null && isAdvisorCall(item));
+    // An advisor call next to an ordinary tool call cannot be resumed past: the
+    // ordinary call is already with the client and its result has not been seen.
+    const resumes = (pending, recorder) => pending.length > 0
+        && !(advisor !== null && pending.some(isAdvisorCall) && recorder.hasOtherCalls(pending));
+    const moreRounds = () => translator ? resumes(translator.pendingCalls, translator.recorder) : nonstreamResumes();
     const identities = new Set();
     function observeIdentity(event) {
         if (!settings.logUpstreamIdentity || !['response.created', 'response.completed', 'response.incomplete'].includes(event?.type)) return;
@@ -1085,7 +1227,6 @@ async function handleOpenAI(req, res, body)
     // never surface to Claude Code, which is why one Anthropic message can span
     // several upstream responses. A failed preparation degrades to an ordinary
     // turn rather than to no turn.
-    let context = null;
     if (subagent !== true)
     {
         try { context = await prepareContextManagement({ payload, model, sessionId, tokens, key, settings: contextSettings, restoration, autoCompact }); }
@@ -1106,12 +1247,94 @@ async function handleOpenAI(req, res, body)
 
     // Runs the model-only calls a round produced and appends both halves to the
     // outbound history, so the next round sees exactly what Codex would.
-    const advanceRound = async (calls) => {
-        const outputs = await runContextCalls(calls, {
+    //
+    // Advisor calls are consulted first-class here: the reviewer runs, the native
+    // server_tool_use + advisor_tool_result pair goes to the client through `emit`,
+    // and the lead resumes from its own reasoning, preamble, call and the feedback.
+    let advisorUsed = 0;
+    let advisorPartial = [];
+    const advisorRound = (recorder, outputs) => recorder.transcript(call => call.name === ADVISOR_TOOL_NAME)
+        .concat(outputs.map(output => ({ type: 'tool_result', tool_use_id: output.call_id, content: output.output })));
+    const consultOnce = async (recorder, outputs) => {
+        if (advisorUsed >= ADVISOR_MAX_CONSULTS) return { content: advisorErrorContent('max_uses_exceeded'), detail: 'consult limit' };
+        advisorUsed++;
+        const origin = workerOrigin();
+        if (!origin) return { content: advisorErrorContent('unavailable'), detail: 'no listener' };
+        const secret = crypto.randomUUID();
+        advisorConsults.add(secret);
+        const started = Date.now();
+        try
+        {
+            const portable = stripCheckpointMarkers(stripContextResetMarkers(body));
+            const partial = advisorPartial.concat(advisorRound(recorder, outputs));
+            const consulted = await dispatchAdvisor({
+                origin, tool: advisor, signal: gone.signal,
+                headers: consultHeaders(req.headers, { token: secret }),
+                body: buildConsultBody({ tool: advisor, system: portable.system, messages: portable.messages, partial }),
+            });
+            if (!consulted.aborted)
+                log(`advisor ${advisor.model} session=${sessionId || 'none'} ${consulted.content.type === 'advisor_result' ? 'ok' : consulted.content.error_code}`
+                    + `${consulted.detail ? ` (${consulted.detail})` : ''} ${Date.now() - started}ms`);
+            return consulted;
+        }
+        finally { advisorConsults.delete(secret); }
+    };
+    const advanceRound = async (calls, recorder, emit) => {
+        const advisorCalls = advisor !== null ? calls.filter(isAdvisorCall) : [];
+        const others = calls.filter(call => !advisorCalls.includes(call));
+        const outputs = others.length ? await runContextCalls(others, {
             context, sessionId, tokens, model, payload: outbound, settings: contextSettings,
-        });
-        outbound = { ...outbound, input: outbound.input.concat(calls, outputs) };
-        return outbound;
+        }) : [];
+        if (!advisorCalls.length)
+        {
+            if (advisor !== null) advisorPartial = advisorPartial.concat(advisorRound(recorder, outputs));
+            const byId = new Map(calls.map(call => [call.call_id, call]));
+            const replay = advisor !== null ? recorder.replay(id => byId.get(id)) : calls;
+            outbound = { ...outbound, input: outbound.input.concat(replay, outputs) };
+            return { resume: true };
+        }
+
+        const consulted = await consultOnce(recorder, outputs);
+        if (consulted.aborted) return { aborted: true };
+        // No parameters and the whole conversation: parallel calls in one response
+        // ask the same question, so they share one consultation and one bill.
+        const answered = advisorCalls.map((call, i) => ({
+            call, content: consulted.content, iteration: i === 0 ? consulted.iteration : null,
+            output: { type: 'function_call_output', call_id: call.call_id, output: advisorFeedbackText(consulted.content) },
+        }));
+        for (const entry of answered) emit(entry);
+        advisorPartial = advisorPartial.concat(advisorRound(recorder, outputs), [{ type: 'advisor_tool_result', content: consulted.content }]);
+        if (!resumes(calls, recorder)) return { resume: false };
+
+        const normalized = new Map(calls.map(call => [call.call_id, advisorCalls.includes(call)
+            ? { type: 'function_call', call_id: call.call_id, name: ADVISOR_TOOL_NAME, arguments: '{}' } : call]));
+        const replay = recorder.replay(id => normalized.get(id));
+        const replayed = new Set(replay.filter(item => item.type === 'function_call').map(item => item.call_id));
+        for (const [id, call] of normalized) if (!replayed.has(id)) replay.push(call);
+        outbound = { ...outbound, input: outbound.input.concat(replay, outputs, answered.map(entry => entry.output)) };
+        return { resume: true };
+    };
+    // The request for the round after round `round`. The last round is served
+    // without the model-only tools, so a model that keeps taking notes or asking
+    // for advice still has to answer; the advisor is also withdrawn once its
+    // consultation budget is spent.
+    const nextRequest = (round) => {
+        const last = round + 1 >= MAX_CONTEXT_ROUNDS;
+        let request = last ? { ...outbound, tools: (payload.tools || []) } : outbound;
+        if (last && !request.tools.length) delete request.tools;
+        if (advisor !== null && (last || advisorUsed >= ADVISOR_MAX_CONSULTS) && request.tools)
+        {
+            const kept = request.tools.filter(tool => !(tool.type === 'function' && tool.name === ADVISOR_TOOL_NAME));
+            request = { ...request, tools: kept };
+            if (request.tool_choice?.type === 'function' && request.tool_choice.name === ADVISOR_TOOL_NAME)
+                request.tool_choice = 'auto';
+            if (!kept.length)
+            {
+                delete request.tools;
+                if (request.tool_choice === 'required' || typeof request.tool_choice === 'object') request.tool_choice = 'auto';
+            }
+        }
+        return request;
     };
 
     // The backend keeps prompt-cache affinity per thread, so this must be one
@@ -1166,12 +1389,14 @@ async function handleOpenAI(req, res, body)
                 const pending = [];
                 const internal = new Set();
                 const argumentsByIndex = new Map();
-                nonstreamPending = false;
+                const recorder = new RoundRecorder({ reasoningEnabled: settings.reasoningEnabled !== false });
+                nonstreamResumes = () => resumes(pending, recorder);
                 let terminal = false;
                 const feed = sseParser((e) => {
                     if (terminal) return;
+                    recorder.observe(e);
                     const oi = e?.output_index ?? 0;
-                    if (e?.type === 'response.output_item.added' && isContextCall(e.item)) {
+                    if (e?.type === 'response.output_item.added' && isHidden(e.item)) {
                         internal.add(oi);
                         argumentsByIndex.set(oi, typeof e.item?.arguments === 'string' ? e.item.arguments : '');
                     }
@@ -1182,7 +1407,6 @@ async function handleOpenAI(req, res, body)
                         pending.push({ ...e.item, type: 'function_call',
                             arguments: typeof e.item?.arguments === 'string' && e.item.arguments
                                 ? e.item.arguments : (argumentsByIndex.get(oi) || '') });
-                        nonstreamPending = true;
                     }
                     if (!hidden) events.push(e);
                     observe(e);
@@ -1206,17 +1430,18 @@ async function handleOpenAI(req, res, body)
 
                 // A hidden round's terminal belongs to that upstream response,
                 // while the Anthropic message remains open for the final answer.
-                kept.push(...(pending.length
-                    ? events.filter(event => !['response.completed', 'response.incomplete'].includes(event?.type))
-                    : events));
+                const isTerminal = event => ['response.completed', 'response.incomplete'].includes(event?.type);
+                if (!pending.length) { kept.push(...events); break; }
+                kept.push(...events.filter(event => !isTerminal(event)));
 
-                if (!context || !pending.length) break;
-                const next = await advanceRound(pending);
-                // The final round is served without the model-only tools, so a
-                // model that keeps taking notes still has to answer.
-                const last = round + 1 >= MAX_CONTEXT_ROUNDS;
-                const request = last ? { ...next, tools: (payload.tools || []) } : next;
-                if (last && !request.tools.length) delete request.tools;
+                const step = await advanceRound(pending, recorder, entry => kept.push({
+                    type: ADVISOR_RESULT_EVENT, call_id: entry.call.call_id, content: entry.content, iteration: entry.iteration,
+                }));
+                if (step.aborted || gone()) return;
+                // The round ended on an ordinary client tool call: its terminal
+                // event closes the message.
+                if (!step.resume) { kept.push(...events.filter(isTerminal)); break; }
+                const request = nextRequest(round);
                 upstream = await openAIRequest(RESPONSES_URL, {
                     method: 'POST', headers: upstreamHeaders(), body: JSON.stringify(request),
                 }, gone, log);
@@ -1269,7 +1494,7 @@ async function handleOpenAI(req, res, body)
         ...settings,
         webSearchMaxUses,
         speed,
-        ...(context ? { suppressCall: isContextCall, deferFinish: true } : {}),
+        ...(context || advisor !== null ? { suppressCall: isHidden, deferFinish: true } : {}),
     });
     translator = out;
     const feed = sseParser((e) => {
@@ -1311,19 +1536,20 @@ async function handleOpenAI(req, res, body)
             const calls = out.closed ? [] : out.takePendingCalls();
             if (!calls.length) break;
 
-            // The model asked for notes, history or a window reset. Run them,
-            // append both halves, and continue the same Anthropic message.
-            let next;
-            try { next = await advanceRound(calls); }
+            // The model asked for notes, history, a window reset or the advisor.
+            // Run them, append both halves, and continue the same Anthropic message.
+            let step;
+            try { step = await advanceRound(calls, out.recorder, entry => out.emitAdvisor(entry)); }
             catch (error)
             {
                 out.fail(`context tools failed: ${String(error?.message || error).slice(0, 200)}`);
                 res.end();
                 return;
             }
-            const last = round + 1 >= MAX_CONTEXT_ROUNDS;
-            const request = last ? { ...next, tools: (payload.tools || []) } : next;
-            if (last && !request.tools.length) delete request.tools;
+            if (step.aborted || gone()) return;
+            // The round ended on an ordinary client tool call: finish as tool_use.
+            if (!step.resume) break;
+            const request = nextRequest(round);
             out.nextResponse();
             upstream = await openAIRequest(RESPONSES_URL, {
                 method: 'POST', headers: upstreamHeaders(), body: JSON.stringify(request),
@@ -1360,10 +1586,10 @@ async function handleOpenAI(req, res, body)
 
 async function handlePassthrough(req, res, rawBody, body, urlPath)
 {
-    const gone = () => res.writableEnded || res.destroyed;
-    let headers = {};
-    for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k.toLowerCase())) headers[k] = v;
-    headers = await authorizeClaude(headers, log);
+    const gone = downstreamGone(req, res);
+    const incoming = {};
+    for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k.toLowerCase())) incoming[k] = v;
+    const headers = await authorizeClaude(incoming, log);
 
     let selection = null;
     let outgoing = rawBody;
@@ -1389,11 +1615,18 @@ async function handlePassthrough(req, res, rawBody, body, urlPath)
         }, res)
         : null;
 
-    const upstream = await fetchResilient(ANTHROPIC + req.url, {
+    const send = sent => fetchResilient(ANTHROPIC + req.url, {
         method: req.method,
-        headers,
+        headers: sent,
         body: ['GET', 'HEAD'].includes(req.method) ? undefined : outgoing,
+        // A client that went away while Anthropic was still answering headers
+        // used to leave this request running; an advisor consultation depends on
+        // it being cancelled with the executor.
+        signal: gone.signal,
     }, 'anthropic', gone, NO_STATUS_RETRY, log);
+    // Nothing is written to the client before this returns, so a resend after
+    // a rotation 401 cannot duplicate a committed response.
+    const upstream = await recoverClaudeRotation(await send(headers), incoming, headers, send, { gone, log });
     rate?.upstream();
 
     if (gone()) { rate?.end(); return upstream.status; }
@@ -1492,6 +1725,16 @@ function inheritControlPlaneModel(req, body)
         return body;
     }
 
+    if (isGoalEvaluatorRequest(body))
+    {
+        // A goal is part of the selected OpenAI session, not a dependency on its
+        // launch-time helper provider. Recover the last root model after a worker
+        // swap; helper evaluations themselves never qualify as root records.
+        const session = key.slice(0, key.indexOf('\0'));
+        const model = controlPlaneModels.get(key) || (agent === 'root'
+            ? throughput.query({ session, limit: 40 }).records.reverse().find(row => row.subagent === false)?.requestedModel : null);
+        return isOpenAI(model) && model !== body.model ? { ...body, model } : body;
+    }
     if (tools.length !== 0 || !systemText(body).includes(AUTO_MODE_SYSTEM_MARKER)) return body;
     const model = controlPlaneModels.get(key);
     if (!model || model === body.model) return body;
@@ -1503,6 +1746,8 @@ const server = http.createServer((req, res) =>
     // First, before admission bookkeeping or any body is read: a browser page
     // must not be able to spend credits or read state through this port.
     if (rejectRequest(req, res, [req.socket.localPort, publicRouterPort()])) return;
+    if (isAdvisorConsult(req)) req[ADVISOR_LANE] = true;
+    delete req.headers[ADVISOR_CONSULT_HEADER];
     const earlyPath = (req.url || '').split('?')[0];
     let admissionKey = null;
     if (req.method === 'POST' && earlyPath === '/v1/messages')
@@ -1553,10 +1798,23 @@ const server = http.createServer((req, res) =>
 
         try
         {
+            if (req.method === 'POST' && ['/v1/messages', '/v1/messages/count_tokens'].includes(urlPath) && body)
+            {
+                const filtered = filterBypassSafeguardContext(body, req.headers['x-claude-code-session-id']);
+                if (filtered.neutralized)
+                {
+                    body = filtered.body;
+                    rawBody = Buffer.from(JSON.stringify(body));
+                    log(`bypass safeguard companion neutralized (${filtered.neutralized})`);
+                }
+            }
+
             if (req.method === 'POST' && urlPath === '/v1/messages' && body)
             {
                 const originalModel = body.model;
                 body = inheritControlPlaneModel(req, body);
+                // Evaluator errors must block stopping instead of skipping the native Stop hook.
+                res = guardGoalEvaluator(req, res, body, { log }) || res;
                 if (body.model !== originalModel)
                 {
                     rawBody = Buffer.from(JSON.stringify(body));
@@ -1605,10 +1863,23 @@ const server = http.createServer((req, res) =>
 
             if (req.method === 'GET' && urlPath === '/limitsz')
             {
-                const limits = await providerLimits.refresh(requestURL.searchParams.get('force') === '1');
+                const limits = liveLimits(await providerLimits.refresh(requestURL.searchParams.get('force') === '1'));
                 res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
                     'X-Content-Type-Options': 'nosniff' });
                 res.end(JSON.stringify(limits));
+                return;
+            }
+
+            // The Fireworks live drain, read in-memory only. snapshot() recomputes
+            // the decayed rate and the trailing activity from the spend log without
+            // touching the gateway, so the usage popover can poll it every second
+            // while the balance itself stays on its own poll cadence -- GetBalance
+            // is minutes behind spend and has nothing to say at one hertz.
+            if (req.method === 'GET' && urlPath === '/fireworksz')
+            {
+                res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
+                    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+                res.end(JSON.stringify(fireworksBilling.snapshot()));
                 return;
             }
 
@@ -1697,7 +1968,7 @@ const server = http.createServer((req, res) =>
             {
                 const limits = requestURL.searchParams.get('scope') === 'claude'
                     ? { version: 1, observedAt: new Date().toISOString(), openai: null, gemini: null }
-                    : await providerLimits.refresh(requestURL.searchParams.get('force') === '1');
+                    : liveLimits(await providerLimits.refresh(requestURL.searchParams.get('force') === '1'));
                 const usage = usageLedger.snapshot(requestURL.searchParams.get('session'));
 
                 // Spooled responses have to reach the segments before the
@@ -1841,6 +2112,8 @@ const server = http.createServer((req, res) =>
                     models: OPENAI_MODELS.map((m) => m.id),
                     modelRoutes,
                     compatible: compatibleStatus(),
+                    transports: { openai: openAITransportState(), fireworks: fireworksTransportState() },
+                    counters: { 'deepseek-v4.1-fireworks': deepSeekV41Status(), 'glm-5.3-fireworks': glm53Status() },
                     // Adapters report readiness, never a credential value.
                     adapters: adapterHealth,
                     providerSettings: readProviderSettings(),
@@ -1875,12 +2148,15 @@ const server = http.createServer((req, res) =>
                 // Optional upstream model metadata must not make locally routed
                 // providers unavailable during an Anthropic outage. Bound this
                 // metadata request independently of inference retries.
+                const incoming = Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP_REQ.has(k.toLowerCase())));
+                const sent = await authorizeClaude(incoming, log);
+                const signal = AbortSignal.timeout(3000);
+                const send = headers => fetch(ANTHROPIC + req.url, { method: 'GET', signal, headers });
                 const [upstream, adapterIds] = await Promise.all([
-                    fetch(ANTHROPIC + req.url, {
-                        method: 'GET',
-                        signal: AbortSignal.timeout(3000),
-                        headers: await authorizeClaude(Object.fromEntries(Object.entries(req.headers).filter(([k]) => !DROP_REQ.has(k.toLowerCase()))), log),
-                    }).then(async response => response.ok ? await response.json().catch(() => null) : (await response.body?.cancel(), null)).catch(() => null),
+                    // waitMs 0: resend only if the snapshot already moved; the
+                    // 3 s metadata bound above is not extended for a rotation.
+                    send(sent).then(response => recoverClaudeRotation(response, incoming, sent, send, { waitMs: 0, log }))
+                        .then(async response => response.ok ? await response.json().catch(() => null) : (await response.body?.cancel(), null)).catch(() => null),
                     providerAdapters.modelIds(),
                 ]);
 
@@ -2071,6 +2347,13 @@ if (isEntryPoint)
         log(`router listen failed: ${e.code || e.message}`);
         process.exitCode = 1;
     });
+    // The tokenizer costs ~0.4 s to load. A worker boots on a private port and
+    // takes no traffic until the supervisor's health gate, so loading here
+    // stalls nothing; loading on the first count would stall live streams.
+    try { warmDeepSeekV41(); log('deepseek-v4.1 tokenizer loaded'); }
+    catch (e) { log(`deepseek-v4.1 tokenizer unavailable: ${e.message}`); }
+    // GLM's synchronous tokenizer load can exceed the worker's health deadline.
+    // Its encoder is lazy; unrelated providers must remain deployable.
     server.listen(PORT, '127.0.0.1', () => log(`listening 127.0.0.1:${PORT} -> anthropic=${ANTHROPIC}`
         + ` adapters=[${providerAdapters.adapters.map(a => a.id).join(',') || 'none'}]`));
 }

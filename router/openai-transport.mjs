@@ -1,5 +1,11 @@
 import http2 from 'node:http2';
 import { Readable } from 'node:stream';
+import { responsesWebSocketRequest, openAIWebSocketState } from './openai-websocket.mjs';
+
+export function openAITransportState()
+{
+    return openAIWebSocketState();
+}
 
 const HEADERS_TIMEOUT_MS = 120000;
 const MAX_ATTEMPTS = 3;
@@ -21,7 +27,8 @@ function fetchFallback(url, options, clientGone)
 {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), HEADERS_TIMEOUT_MS);
-    return fetch(url, { ...options, signal: ac.signal }).finally(() => clearTimeout(timer)).then(response => {
+    const signal = options.signal ? AbortSignal.any([ac.signal, options.signal]) : ac.signal;
+    return fetch(url, { ...options, signal }).finally(() => clearTimeout(timer)).then(response => {
         if (clientGone?.()) response.body?.cancel().catch(() => {});
         return response;
     });
@@ -45,13 +52,20 @@ function http2Request(url, options)
             else session.destroy(error);
         }, HEADERS_TIMEOUT_MS);
 
+        const abort = () => {
+            const error = new Error('client disconnected');
+            if (responseStarted) stream?.destroy(error);
+            else fail(error);
+        };
         const finishSession = () => {
+            options.signal?.removeEventListener('abort', abort);
             clearTimeout(timer);
             if (!session.closed && !session.destroyed) session.close();
         };
         const fail = error => {
             if (settled) return;
             settled = true;
+            options.signal?.removeEventListener('abort', abort);
             clearTimeout(timer);
             if (!session.destroyed) session.destroy();
             reject(error);
@@ -69,7 +83,10 @@ function http2Request(url, options)
             }
         });
 
+        options.signal?.addEventListener('abort', abort, { once: true });
+        if (options.signal?.aborted) { abort(); return; }
         session.once('connect', () => {
+            if (settled) return;
             const headers = {
                 ':method': options.method || 'POST',
                 ':path': target.pathname + target.search,
@@ -129,9 +146,18 @@ function http2Request(url, options)
     });
 }
 
+
 export async function openAIRequest(url, options, clientGone, log = () => {})
 {
     const target = new URL(url);
+    const signal = options.signal || clientGone?.signal;
+    options = { ...options, signal };
+    // ChatGPT inference is WebSocket-only, as the owner requires. Oversized
+    // history, stale continuations and handshake failures recover over the
+    // socket in openai-websocket.mjs; there is no HTTP leg to fall back to.
+    if (['ws:', 'wss:'].includes(target.protocol)
+        || (target.protocol === 'https:' && target.hostname === 'chatgpt.com' && target.pathname.endsWith('/responses')))
+        return responsesWebSocketRequest(url, options, clientGone);
     if (!['https:', 'h2c:'].includes(target.protocol)) return fetchFallback(url, options, clientGone);
 
     let last = null;

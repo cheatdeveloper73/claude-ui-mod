@@ -58,6 +58,24 @@ function cleanupDom() {
 ctx.onDispose(cleanupDom);
 
 let cfg = null;
+const taggedBands = new Set();
+const taggedButtons = new Set();
+const taggedContainers = new Set();
+let scanTimer = null;
+let bandDisposed = false;
+let bandPath = location.pathname;
+function setTag(node, attribute, active, held) {
+    if (active) {
+        if (node.getAttribute(attribute) !== '1') node.setAttribute(attribute, '1');
+        held.add(node);
+    } else {
+        if (node.hasAttribute(attribute)) node.removeAttribute(attribute);
+        held.delete(node);
+    }
+}
+function clearHeld(held, attribute, keep = new Set()) {
+    for (const node of held) if (!keep.has(node)) setTag(node, attribute, false, held);
+}
 
 const DEFAULTS = {
     enabled: false,
@@ -141,6 +159,12 @@ function composerRows(out) {
         const rows = child.tagName === 'NAV' ? Array.from(child.children) : [child];
         for (const row of rows) {
             const r = row.getBoundingClientRect();
+            // Our hidden rows have no geometry. Keep them candidates while
+            // they still precede the prompt so a second pass cannot unhide them.
+            if (taggedBands.has(row) && (child.compareDocumentPosition(prompt) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                out.add(row);
+                continue;
+            }
             if (r.width <= 0 || r.height <= 0) continue;
             if (r.top >= promptTop) continue;   // footer row, popovers, menus
             out.add(row);
@@ -149,62 +173,68 @@ function composerRows(out) {
 }
 
 function clearTags() {
-    for (const e of document.querySelectorAll('[' + ATTR_BAND + ']')) e.removeAttribute(ATTR_BAND);
-    for (const e of document.querySelectorAll('[' + ATTR_BTN + ']')) e.removeAttribute(ATTR_BTN);
-    for (const e of document.querySelectorAll('[' + ATTR_CONTAINER + ']')) e.removeAttribute(ATTR_CONTAINER);
+    clearHeld(taggedBands, ATTR_BAND);
+    clearHeld(taggedButtons, ATTR_BTN);
+    clearHeld(taggedContainers, ATTR_CONTAINER);
 }
 
 function scanBands() {
     if (!cfg || !cfg.enabled) { clearTags(); return; }
-
     const v = cfg;
     const bands = new Set(document.querySelectorAll('.epitaxy-band-enter'));
     composerRows(bands);
-
     const tagged = new Set();
+    const buttons = new Set();
     const containers = new Set();
-
+    const hiddenContainers = new Set();
     for (const band of bands) {
-        const match = shouldHideBand(band.textContent || '', v);
-
-        if (match) {
-            band.setAttribute(ATTR_BAND, '1');
+        if (shouldHideBand(band.textContent || '', v)) {
+            setTag(band, ATTR_BAND, true, taggedBands);
             tagged.add(band);
-
             if (v.hideButton || v.mode === 'button_only') {
-                const btns = band.querySelectorAll('button, a[role="button"]');
-                for (const b of btns) {
-                    if (/get\s+more|upgrade|usage|buy\s+credits|keep\s+working|switch\s+models|turn\s+on|request/i.test(b.textContent || '')) {
-                        b.setAttribute(ATTR_BTN, '1');
+                for (const button of band.querySelectorAll('button, a[role="button"]')) {
+                    if (/get\s+more|upgrade|usage|buy\s+credits|keep\s+working|switch\s+models|turn\s+on|request/i.test(button.textContent || '')) {
+                        setTag(button, ATTR_BTN, true, taggedButtons);
+                        buttons.add(button);
                     }
                 }
             }
-        } else {
-            if (band.hasAttribute(ATTR_BAND)) band.removeAttribute(ATTR_BAND);
-            for (const b of band.querySelectorAll('[' + ATTR_BTN + ']')) b.removeAttribute(ATTR_BTN);
         }
-
         const parent = band.parentElement;
         if (parent && parent.tagName === 'NAV') containers.add(parent);
     }
-
-    // A band that scrolled out of the composer keeps its attribute otherwise.
-    for (const e of document.querySelectorAll('[' + ATTR_BAND + ']')) {
-        if (!tagged.has(e)) e.removeAttribute(ATTR_BAND);
-    }
-
+    clearHeld(taggedBands, ATTR_BAND, tagged);
+    clearHeld(taggedButtons, ATTR_BTN, buttons);
     for (const container of containers) {
-        const children = Array.from(container.children).filter((c) => {
-            if (c.hasAttribute(ATTR_BAND)) return true;   // hidden by us, still counts
-            const cs = window.getComputedStyle(c);
+        const children = Array.from(container.children).filter((child) => {
+            if (child.hasAttribute(ATTR_BAND)) return true;
+            const cs = window.getComputedStyle(child);
             return cs && cs.display !== 'none' && cs.visibility !== 'hidden';
         });
-        const allHidden = v.collapseEmptyContainer
-            && children.length > 0
-            && children.every((c) => c.hasAttribute(ATTR_BAND));
-        if (allHidden) container.setAttribute(ATTR_CONTAINER, '1');
-        else container.removeAttribute(ATTR_CONTAINER);
+        if (v.collapseEmptyContainer && children.length > 0 && children.every(child => child.hasAttribute(ATTR_BAND))) {
+            setTag(container, ATTR_CONTAINER, true, taggedContainers);
+            hiddenContainers.add(container);
+        }
     }
+    clearHeld(taggedContainers, ATTR_CONTAINER, hiddenContainers);
+}
+
+function queueBands(records) {
+    if (!cfg?.enabled || bandDisposed) return;
+    if (records && !records.some(record => {
+        const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (target?.closest?.('[data-testid="epitaxy-virtual-transcript"]')
+            && !(record.type === 'attributes' && target.matches?.('[data-testid="epitaxy-virtual-transcript"]'))) return false;
+        if (target?.closest?.('#cuimod-hide-usage-band, [data-cuimod-provider-limits]')) return false;
+        if (record.type === 'attributes' && record.oldValue === target.getAttribute(record.attributeName)) return false;
+        if (record.type === 'childList' && [...record.addedNodes, ...record.removedNodes].every(node => {
+            const el = node.nodeType === 1 ? node : node.parentElement;
+            return el?.closest?.('[id^="cuimod-"], [class*="cuimod-"]');
+        })) return false;
+        return true;
+    })) return;
+    if (scanTimer !== null) return;
+    scanTimer = setTimeout(() => { scanTimer = null; if (!bandDisposed) scanBands(); }, 0);
 }
 
 function generateCss(v) {
@@ -282,16 +312,23 @@ function apply(v) {
     // Stored settings only carry keys the panel has written, so a filter the
     // user never touched arrives undefined and would read as off.
     cfg = Object.assign({}, DEFAULTS, v);
-    style.textContent = generateCss(cfg);
+    const css = generateCss(cfg);
+    if (style.textContent !== css) style.textContent = css;
     scanBands();
 }
 
 // Observers and hooks
-ctx.observe(document.documentElement, { childList: true, subtree: true }, scanBands);
-ctx.track(window, 'resize', scanBands, { passive: true });
-ctx.track(document, 'visibilitychange', () => { if (!document.hidden) scanBands(); });
-ctx.every(800, scanBands);
-cuimod.onSessionChange(scanBands);
+ctx.observe(document.documentElement, { childList: true, characterData: true, subtree: true,
+    attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'hidden'] }, queueBands);
+ctx.track(window, 'resize', () => queueBands(), { passive: true });
+ctx.track(document, 'visibilitychange', () => { if (!document.hidden) queueBands(); });
+ctx.every(800, () => {
+    if (bandPath === location.pathname) return;
+    bandPath = location.pathname;
+    queueBands();
+});
+ctx.onDispose(cuimod.onSessionChange(() => queueBands()));
+ctx.onDispose(() => { bandDisposed = true; clearTimeout(scanTimer); clearTags(); });
 
 // ------------------------------------------------------------------ panel & preview
 const spec = {

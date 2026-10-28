@@ -74,20 +74,29 @@ module.exports = function (ctx) {
 
     const caches = new Map();      // route -> { at, value }
     const inflight = new Map();    // route -> promise
-    function cached(route, ttl) {
-        const hit = caches.get(route);
+    function routerFor(params) {
+        const source = globalThis[Symbol.for('cuimod.remote.router-source')];
+        const remote = source?.forSession(params?.sessionId, params?.desktopSessionId);
+        return remote || { key: 'local', readJSON: routerJSON };
+    }
+    function cached(route, ttl, router = { key: 'local', readJSON: routerJSON }) {
+        const key = router.key + '\n' + route;
+        const hit = caches.get(key);
         if (hit && Date.now() - hit.at < ttl) return Promise.resolve(hit.value);
-        if (inflight.has(route)) return inflight.get(route);
-        const promise = routerJSON(route)
-            .then((value) => { caches.set(route, { at: Date.now(), value }); return value; })
-            .finally(() => inflight.delete(route));
-        inflight.set(route, promise);
+        if (inflight.has(key)) return inflight.get(key);
+        const promise = router.readJSON(route)
+            .then((value) => { caches.set(key, { at: Date.now(), value }); return value; })
+            .finally(() => inflight.delete(key));
+        inflight.set(key, promise);
         return promise;
     }
 
     // --------------------------------------------------------- project dirs
     const projectDirs = new Map();  // cliSid -> { dir, at }
-    function projectDirFor(cliSid) {
+    function projectDirFor(cliSid, desktopSid) {
+        const remote = globalThis[Symbol.for('cuimod.remote.transcript-source')];
+        const mirror = remote?.directory(cliSid, desktopSid);
+        if (mirror) return mirror;
         const hit = projectDirs.get(cliSid);
         if (hit && Date.now() - hit.at < 60000) return hit.dir;
         let names = [];
@@ -193,11 +202,11 @@ module.exports = function (ctx) {
         return size - from;
     }
 
-    function attribute(cliSid, needed, sinceMs) {
+    function attribute(cliSid, needed, sinceMs, desktopSid) {
         if (typeof cliSid !== 'string' || !SESSION_RE.test(cliSid)) return new Map();
-        const index = indexFor(cliSid);
+        const dir = projectDirFor(cliSid, desktopSid);
+        const index = indexFor([desktopSid || '', cliSid, dir || ''].join('/'));
         const outstanding = new Set([...needed].filter((id) => !index.byResponse.has(id)));
-        const dir = projectDirFor(cliSid);
         if (!dir) return index.byResponse;
 
         const candidates = [];
@@ -208,17 +217,21 @@ module.exports = function (ctx) {
         } catch (_) { /* a session may have no parent file yet */ }
 
         const agentsDir = path.join(dir, cliSid, 'subagents');
-        let names = [];
-        try { names = fs.readdirSync(agentsDir); } catch (_) { names = []; }
-        for (const name of names) {
-            if (!name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
-            const file = path.join(agentsDir, name);
-            let stat = null;
-            try { stat = fs.statSync(file); } catch (_) { continue; }
-            candidates.push({
-                file, size: stat.size, mtime: stat.mtimeMs,
-                agentId: name.slice('agent-'.length, -'.jsonl'.length), dir: agentsDir,
-            });
+        // Desktop's SSH mirror puts agent transcripts beside the parent;
+        // local CLIs put them under <cliSid>/subagents/.
+        for (const directory of [agentsDir, dir]) {
+            let names = [];
+            try { names = fs.readdirSync(directory); } catch (_) { names = []; }
+            for (const name of names) {
+                if (!name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
+                const file = path.join(directory, name);
+                let stat = null;
+                try { stat = fs.statSync(file); } catch (_) { continue; }
+                candidates.push({
+                    file, size: stat.size, mtime: stat.mtimeMs,
+                    agentId: name.slice('agent-'.length, -'.jsonl'.length), dir: directory,
+                });
+            }
         }
 
         // Newest first, and never older than the oldest record being attributed.
@@ -312,14 +325,15 @@ module.exports = function (ctx) {
     // than its neighbour would filter it down to nothing and show an empty
     // panel while its own model was plainly answering.
     ctx.method('snapshot', async (params) => {
+        const router = routerFor(params);
         const sessionId = params && params.sessionId;
         const all = params && params.scope === 'all';
         const recentRoute = all || !sessionId
             ? '/throughputz'
             : '/throughput/api?limit=40&session=' + encodeURIComponent(sessionId);
         const [snapshot, scopedSource] = await Promise.all([
-            cached('/throughputz', SNAPSHOT_TTL_MS),
-            all || !sessionId ? null : cached(recentRoute, SNAPSHOT_TTL_MS),
+            cached('/throughputz', SNAPSHOT_TTL_MS, router),
+            all || !sessionId ? null : cached(recentRoute, SNAPSHOT_TTL_MS, router),
         ]);
         const scoped = scopedSource ? scopedSource.records : snapshot.recent;
         const live = all ? snapshot.live : snapshot.live.filter((row) => row.sessionId === sessionId);
@@ -327,7 +341,7 @@ module.exports = function (ctx) {
         const since = oldest(scoped);
         const byResponse = sessionId
             ? attribute(sessionId, new Set(scoped.map((row) => row.responseId)),
-                Number.isFinite(since) ? since - 60 * 60 * 1000 : NaN)
+                Number.isFinite(since) ? since - 60 * 60 * 1000 : NaN, params && params.desktopSessionId)
             : new Map();
         const recent = decorate(scoped, byResponse);
 
@@ -356,6 +370,7 @@ module.exports = function (ctx) {
     // History. The router owns the archive; this adds the agent join and the
     // per-lane rollup, which only make sense with the transcripts in hand.
     ctx.method('history', async (params) => {
+        const router = routerFor(params);
         const sessionId = params && params.sessionId;
         const scope = (params && params.scope) || 'session';
         const hours = Number(params && params.hours);
@@ -364,12 +379,12 @@ module.exports = function (ctx) {
         if (Number.isFinite(hours) && hours > 0) query.set('since', new Date(Date.now() - hours * 3600000).toISOString());
         query.set('limit', '2000');
 
-        const value = await cached('/throughput/api?' + query.toString(), HISTORY_TTL_MS);
+        const value = await cached('/throughput/api?' + query.toString(), HISTORY_TTL_MS, router);
         const rows = value.records || [];
         const since = oldest(rows);
         const byResponse = scope === 'session' && sessionId
             ? attribute(sessionId, new Set(rows.map((row) => row.responseId)),
-                Number.isFinite(since) ? since - 60 * 60 * 1000 : NaN)
+                Number.isFinite(since) ? since - 60 * 60 * 1000 : NaN, params && params.desktopSessionId)
             : new Map();
         const decorated = decorate(rows, byResponse);
 
@@ -393,6 +408,7 @@ module.exports = function (ctx) {
     // response has no id to join a transcript against anyway. No attribution, no
     // history, no rollups.
     ctx.method('live', async (params) => {
+        const router = routerFor(params);
         const sessionId = params && params.sessionId;
         // The last completed response comes back with the in-flight ones because
         // a turn is mostly NOT streaming: the model answers, tools run, the model
@@ -404,8 +420,8 @@ module.exports = function (ctx) {
         // router, so a busy neighbour would push this session's last response out
         // of it.
         const [snapshot, previous] = await Promise.all([
-            cached('/throughputz', SNAPSHOT_TTL_MS),
-            sessionId ? cached('/throughput/api?limit=1&session=' + encodeURIComponent(sessionId), SNAPSHOT_TTL_MS) : null,
+            cached('/throughputz', SNAPSHOT_TTL_MS, router),
+            sessionId ? cached('/throughput/api?limit=1&session=' + encodeURIComponent(sessionId), SNAPSHOT_TTL_MS, router) : null,
         ]);
         const rows = sessionId
             ? snapshot.live.filter((row) => row.sessionId === sessionId)
@@ -439,7 +455,9 @@ module.exports = function (ctx) {
         };
     });
 
-    ctx.method('revealLedger', async () => {
+    ctx.method('revealLedger', async (params) => {
+        const router = routerFor(params);
+        if (router.key !== 'local') return { ok: false, error: 'The ledger is stored on the remote execution host.' };
         let file = null;
         try { file = (await cached('/throughputz', SNAPSHOT_TTL_MS)).file; } catch (_) {}
         if (!file) return { ok: false, error: 'router unreachable' };

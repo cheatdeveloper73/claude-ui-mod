@@ -4,6 +4,187 @@ Established by reading the shipped bundle and by measurement, against
 **app 1.26832.0 / Electron 42.7.0 / Chrome 148.0.7778.280**. Do not re-derive; do re-verify the version
 if something behaves unexpectedly after an update.
 
+## GPT-5.5 and GPT-5.4 are retired on the ChatGPT-account Codex route (2026-10-23)
+
+`chatgpt.com/backend-api/codex/responses` answers both slugs with 400
+`The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.`
+(same text for `gpt-5.4`). Measured with the router's own OAuth token and
+headers at `codex_cli_rs` 0.159.0, 0.140.0, 0.120.0, 0.100.0, 0.80.0 and 0.60.0;
+every version refused, and `gpt-5.6-sol` completed on the same token in the same
+run. `GET codex/models?client_version=` lists neither slug at 0.159.0, only
+`codex-auto-review` at 0.120.0 and nothing at 0.80.0, so no older client
+contract revives them. The rejection is per model and immediate, so no context
+or fast-tier test is possible on this route.
+
+`OPENAI_MODELS` in `router/openai.mjs` still names both, which is why `/healthz`
+lists them. That entry only shapes effort and window handling; it does not mean
+the backend accepts the slug. Adding either to the picker catalogue would offer
+a model that fails every turn.
+
+## OpenAI goal evaluation follows the selected session model (2026-10-15)
+
+CLI **2.1.284** launches `/goal` checks on the small-fast helper. In a live
+OpenAI session that helper reached a different provider and returned 502; the
+guard below kept the goal unverified but could not obtain an actual verdict.
+
+The router now recognizes the exact native goal request before dispatch and
+inherits the associated OpenAI root or agent model. A cold worker recovers the
+latest root model from persisted throughput records. Unknown sessions and
+non-OpenAI roots retain their original helper route. Ordinary helper calls are
+unchanged. Goal evaluations stay on the side-query lane, without root context
+management tools. The Responses translation preserves the native JSON schema
+through `text.format`; optional `impossible` requires non-strict schema mode.
+
+Verified against the official OpenAI route with synthetic transcript evidence:
+an unfinished transcript returned `ok:false` in a JSON response, and a completed
+transcript returned `ok:true` through the native streaming response. Both used
+the selected OpenAI model and neither carried the guard fallback header.
+`tests/provider-goal-routing.test.mjs` fails three routing cases on the previous
+source and passes all six cases on the repair, including cold-worker recovery,
+agent isolation and provider-switch controls.
+
+Deployment also exposed synchronous GLM tokenizer warm-up exceeding the
+supervisor's worker health deadline. Its existing lazy encoder remains intact;
+worker boot no longer eagerly loads it. The supervisor accepted the repaired
+worker without restarting the listener or active sessions.
+
+## Goal evaluator failures must not skip the Stop hook (2026-10-15)
+
+Verified against CLI **2.1.284**, including an isolated native CLI through the
+real router and fake upstreams. `/goal` registers a prompt Stop hook without a
+model override. Its evaluator uses the small-fast helper, which can route to a
+different provider from the lead. It requests a tool-less, streaming Messages
+response with `output_config.format` requiring JSON `{ok, reason}` and optional
+`impossible`. API errors, invalid JSON/schema and the native timeout skip the
+hook instead of blocking the stop.
+
+`router/goal-guard.mjs` matches the exact native system/user prefixes and verdict
+schema before dispatch. It holds at most 1 MiB and validates the complete native
+message/stream lifecycle before releasing a verdict unchanged. A failed,
+malformed, truncated or overdue reply becomes an explicit `ok:false` response
+saying the goal remains unverified. This is not a successful evaluation and
+carries zero synthetic usage. No provider request is retried by the guard.
+Upstream work is cancelled when the guard answers before its handler finishes.
+
+The native evaluator has a 30-second deadline. The guard answers within its own
+20-second budget, capped at 25 seconds. Native context overflow gets its normal
+single retry with half the transcript; that retry shares the original guard
+budget, and another overflow becomes `ok:false`. Retry state is bounded and
+keyed by session, agent, model and a hash of the stopping condition.
+
+Native loopback evidence:
+
+```text
+malformed verdict  base: main 1, evaluations 1   repaired: main 2, evaluations 2
+context overflow   base: main 1, evaluations 2   repaired: main 2, evaluations 3
+```
+
+The fixture returns a valid success only after the failure cases. The repaired
+CLI reaches that later evaluation; the base CLI exits with the condition still
+unverified. This establishes the failure-path repair, not the cause of an
+uncaptured historical incident. Valid `met` and `impossible` judgments remain
+the evaluator's decisions. `tests/provider-goal-guard.test.mjs` covers both wire
+shapes, routing arms, cancellation, framing, bounded buffering and the deadline.
+
+## Native advisor on an OpenAI lead (2026-10-15)
+
+Verified against CLI **2.1.284** with an isolated CLI and loopback upstreams.
+The native declaration is `{type:'advisor_20260301', name:'advisor', model}`.
+It takes no parameters. It is a server tool: the response must contain
+`server_tool_use` and `advisor_tool_result`, followed by the lead continuing
+inside the same assistant message. Converting the declaration to a client
+function alone leaves Claude Code with a tool it cannot execute.
+
+`router/advisor.mjs` dispatches the configured reviewer through this worker's
+own listener. It uses a distinct session-agent admission key, strips its
+internal marker before provider dispatch, and keeps a GPT reviewer off the
+lead's context-management lane. The reviewer sees the conversation and current
+round's text and tool results. Provider-specific opaque thinking is excluded.
+The lead resumes with its reasoning, preamble, call and feedback in order.
+Native blocks replay as a function call/output pair on subsequent GPT turns.
+Errors remain native advisor errors, never successful feedback.
+
+CLI model-rank checks omit the tool for GPT aliases unless
+`CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`. The routing launch wrapper
+sets this capability without selecting a reviewer, including on Claude launches
+that may later switch to GPT. Explicit environment overrides and the disable
+flag win. `advisorModel` remains the owner's selection. This is a launch-time
+change: current `apply_flag_settings` does not update the process environment,
+so existing workers need their next launch to acquire the capability.
+
+The offline native check produced no reviewer call on the old router and one
+reviewer call on the repaired router; the repaired CLI consumed the native
+blocks, recorded the advisor usage iteration, and completed without a client
+tool error. `tests/provider-native-advisor.test.mjs` covers streaming, unary,
+replay, cancellation, consultation limits, context-tool evidence and dispatch.
+`tests/native-advisor-routing.test.cjs` covers launch capability and overrides.
+
+## Native OAuth rotation versus the router snapshot (2026-10-12)
+
+Observed against Desktop **2.9939.4**, CLI **2.1.284**, and the local authority
+host. At 03:39:51Z Desktop renewed its Code-tab token and pushed it to running
+CLIs. The router returned an Anthropic `/v1/messages` 401 at 03:39:53.220Z;
+its credential snapshot still held the predecessor until 03:39:57.405Z.
+The preserved snapshot's expiry was 03:44:50.816Z, so an expiry check admitted
+an already-revoked token. `credential-authority` publishes on a ten-second tick.
+
+The native CLI asks Desktop for a token after 401 and treats an unchanged
+credential as failed recovery. The router's substitution means that rejected
+upstream bearer can differ from the credential the CLI thinks it sent. The
+exact incoming bearer was not captured in this incident. Desktop subsequently
+expired its cached access token, tore down the failed query, and warmed a new
+CLI for the same conversation; the owner's `continue` then worked without login.
+
+Do not simply prefer the incoming bearer on this PC: terminal CLIs can carry a
+different account's login, and local probes intentionally send placeholder API
+keys. The configured authority remains the credential owner on both hosts.
+`recoverClaudeRotation` handles only an authority-substituted 401 whose JSON
+error type is `authentication_error`, before committing a response. It compares
+against tokens actually sent, waits for a different validated snapshot, and
+resends at most twice within one local 15-second / reader 30-second grace
+window. A changed authority source stops recovery; the caller's credential is
+never a fallback. `/v1/models` only adopts an already-published generation and
+retains its existing three-second metadata deadline.
+
+These are bounded recovery windows, not guarantees against publication outages.
+The reader handoff also depends on the OpenAI publication path and can take
+longer than its grace period. Genuine rejection or unavailable publication still
+surfaces an auth error. Successful streams are never replayed. Reader-host code
+coverage does not imply deployment to a separately deployed checkout.
+
+`tests/credential-authority-rotation.test.mjs` exercises the real HTTP router with
+synthetic credentials and a synthetic wait clock: the original worker passes
+12 cases and fails 13; the fixed worker passes all 25. It covers concurrent and
+double rotations, already-moved snapshots, cancellation, fail-closed views,
+response preservation, stream/usage uniqueness, and reader behavior. All router
+fixture processes must isolate `MODEL_ROUTER_AUTHORITY_FILE`; pointing upstream
+at a loopback mock alone does not prevent reading the live credential snapshot.
+
+## Send wrappers must recognize each other (2026-10-24)
+
+Against Desktop **2.9939.4**, the native send barrier and `unlock-code` auth
+wrapper each repaired their installation on a one-second sweep. Each recognized
+only itself at the top of `manager.sendMessage`, so each treated the other as a
+replacement and wrapped it again. A live traversal hit its 20,000-layer cap
+without reaching the native method. One captured send blocked the main heartbeat
+for 15.234 seconds while renderer timers continued; the native log records
+`LocalSessions.sendMessage` at 13:11:24 and `Sending message` at 13:11:40.
+Use `app.getPath('logs')`: this build writes under `%LOCALAPPDATA%\Claude\logs`;
+the older `%APPDATA%\Claude\logs` directory contains stale logs.
+
+Both installers must recognize their existing wrapper immediately underneath the
+other. Preventing further growth alone leaves the inherited chain live after a
+hot reload. The barrier therefore also retires stale auth/barrier delegates.
+Auth activates later in the host's plugin order, so the barrier revisits that
+captured delegate on subsequent sweeps after the auth owner changes. A currently
+active auth wrapper stays in place, including its async-local model context.
+
+A private send-wrapper test runs both real plugin modules with
+1,000 attachment sweeps. The old source produces 2,003 chain nodes and performs
+1,001 barrier checks and migration reconciliations for one send. The repair
+keeps three nodes (auth, barrier, native) and one check each. An inherited-chain
+case covers hot activation without restarting Desktop or its sessions.
+
 ## App layout
 
 ### The model selector changed shape again (read 2026-09-19)
@@ -582,6 +763,25 @@ and has been absent from the live DOM since roughly 2026-08-26. Read the DOM
 with a probe plugin before trusting a selector; treat a bundle grep as a
 starting hypothesis.
 
+### Transcript scroll ownership (2026-10-10)
+
+The pinned frontend `index-Cuw5J4F9.js` renders the Code feed as
+`[data-testid="epitaxy-virtual-transcript"]` and its content as
+`[data-testid="transcript-sizer"]`. Both selectors were confirmed against the
+running page. The feed uses `overflow-anchor: none` and `contain: strict`.
+The follow hook in `shared-4-DKPmNySq.js` observes content changes, writes scroll
+corrections, and can unpin on upward scroll events. Its passive wheel handler
+records gesture direction; Chromium still performs default wheel scrolling.
+
+`transcript-scroll` retains a separate bottom-follow latch during streaming and
+coalesces cancelable vertical wheel input into one immediate position write per
+animation frame. It leaves native event propagation intact so the virtualizer
+still sees the gesture. Nested scroll areas, horizontal input and Ctrl-wheel
+keep their native path. Upward/manual input releases the plugin latch; reaching
+the bottom rearms it. The narrow regression is `node tests/transcript-scroll.test.cjs`.
+A live synthetic wheel confirmed that the handler was installed. The inspected
+page was hidden, so that receipt does not establish visible smoothness.
+
 ### The remote UI has its own update channel (measured 2026-09-11)
 
 App 1.46388.4's live Code view was at `https://claude.ai/epitaxy/...` and still
@@ -930,6 +1130,18 @@ already a valid manager record while both `query` and `cliSessionId` are absent.
 inside that path. Integrations may require the Desktop id and manager record
 before sending, but requiring `query` or `cliSessionId` rejects the first turn
 that the manager is designed to create.
+
+Source-verified against app 2.9939.4 on 2026-10-05: `isCliProvablyIdle` is no
+longer a manager method. It became a module-local function, `cliLastTurnMessageWasResult
+=== true && pendingCycle === undefined && !interruptResultPending (unexpired) &&
+!heldSteers && !unexpiredPendingEchoes && !inputStream.hasPending()`. A plugin that
+feature-tests for the method silently sees every session as busy, which is how
+queue auto-send stopped firing. The surviving public wrapper is
+`hasAgentRunInProgress(sessionId)`: once `cliAtTurnBoundaryHint` is set it returns
+`!idle`; before that it returns `pendingCycle !== undefined || pendingEchoes/
+heldSteers/input`. Pair it with `cliLastTurnMessageWasResult === true` to keep the
+old meaning. `sendMessage(id, text, images, { initiator })` is unchanged and still
+defers a send it judges mid-turn, so a slightly loose idle test cannot inject.
 
 Every send and its queue removal are one main-process operation. Successful
 removal flushes `queue.json` synchronously so a restart cannot resurrect and
@@ -3127,6 +3339,73 @@ modes. A Desktop-owned Claude Code 2.1.260 loopback probe emitted
 `model_refusal_no_fallback` with category `cyber`, rendered the built-in cyber
 safeguards message, and made no diagnostic replay.
 
+### Claude Code 2.1.284 adds a mid-stream refusal retry
+
+Read from the Desktop-owned 2.1.284 binary and compared against 2.1.245,
+2.1.257 and 2.1.260 on 2026-10-16. The permanent stop and the apparent "half
+refusal" are separate mechanisms.
+
+The permanent stop is the explicit `EndConversation` tool. A valid main-thread
+call appends an `ended-by-model` transcript marker, sets the live
+`endedByModel` state and aborts the turn. Later prompt, compaction and
+background entry points refuse with `Claude ended this conversation. Start a
+new session (or /clear) to continue.`
+
+A safeguard retry starts from structured API data, not a scan of generated
+prose. Its detector accepts an assistant API-error message whose
+`message.stop_reason === "refusal"`. Unless the query is auxiliary or
+`CLAUDE_CODE_DISABLE_REFUSAL_RETRY` is set, 2.1.284 constructs this local row:
+
+```
+<model>'s safeguards stopped the response above · continuing once with that noted
+```
+
+It also injects a meta user companion into the retry context:
+
+```
+Your response above was stopped by a safety classifier — this is not a tool or
+API error. The rest of it was withheld, and tool calls in it that had not
+finished did not run. Do not produce that content again, even reworded.
+```
+
+If a tool call had started, Claude Code appends the exact sentence `Exception: a
+tool call whose result reads "Interrupted" was already running when the response
+was stopped; it may have partially or fully completed.` Unstarted calls receive
+synthetic error results saying the safety classifier stopped the response.
+
+The stream retractor explains why this looks like a refusal in the middle of an
+answer. It closes an open content block with a synthetic `message_delta`
+carrying `stop_reason:"refusal"`, emits `message_stop`, tombstones the refused
+assistant messages, retains eligible text, and sends
+`refusal_continuation {phase:"begin", salvageText, join:"exact", replacesUuids}`
+before retrying the same or fallback model. The renderer evicts those UUIDs and
+uses the retained text as the continuation seam; `phase:"end"` clears it when
+the chain ends. The continuation/retraction primitives existed in
+2.1.245/257/260, but `refusal_same_model_retry` and the notice text are new in
+2.1.284. Transcript search found the injected companion across affected
+Desktop sessions.
+
+The native CLI refusal module has no content-regex trigger. The local router has
+one provider-specific conversion: `router/openai.mjs` matches the observed
+ChatGPT error sentence `flagged for possible cybersecurity risk` and translates
+it to the same Anthropic cyber-refusal terminal. Native Anthropic traffic
+arrives with the structured stop reason upstream. The UI's literal `Claude Code
+notice` prefix occurs in neither CLI binary and remains renderer framing rather
+than a proven CLI string.
+
+In literal bypass mode the visible informational notice and transcript records
+remain untouched, but the retry companion above must not become provider
+instructions. `bypass-for-real` publishes the live bypass CLI session IDs to an
+atomic, 15-second lease in ignored `.state/bypass-sessions.json`; it refreshes
+that lease every five seconds and clears it on mode exit or unload. The router
+reads the lease at request start and, only on agent requests with a non-empty
+tool surface, replaces an exact whole-message R5n/Djr companion with the neutral
+user turn `Continue.` before any provider translation or token count. Exact
+matching keeps quoted discussion, mixed-content messages, ordinary user text,
+other modes and tool-less control calls byte-equivalent. The local transcript
+and renderer never see the provider copy, so the user still sees every safeguard
+hit. An expired lease fails closed to unchanged context after a process crash.
+
 ## The task pane's auto-open is the Plan pane, one-shot per session (2026-09-05)
 
 The pane that throws itself open the first time a session produces tasks is the
@@ -4353,7 +4632,62 @@ live: 94-96% cached after a load vs 0% when the tool joined `tools[]`). There is
 no removal item; rewriting the earlier item would break the cache, so a removal
 is announced as developer text.
 
-## Bypass mode still raises cards; one broker method raises all of them (2026-09-29)
+## Official Codex tooling can drive the native pane (verified 2026-10-16)
+
+Measured on Desktop 2.9939.4 / CLI 2.1.284 with the installed Codex
+`@oai/cua-repl` 0.1.0 and `@oai/browser-desktop` 0.1.1.
+`src/plugins/codex-browser/` supplies that actual runtime with a scoped native
+backend; setup, usage, evidence and unsupported operations are in
+[`codex-browser.md`](codex-browser.md).
+
+Contracts that cost live debugging:
+
+- The Codex MCP root uses JSONL with an actual LF. Its backend pipe uses a
+  four-byte little-endian byte length followed by UTF-8 JSON-RPC. Calls need
+  `x-codex-turn-metadata` with session and user-turn identity. A tool-use ID is
+  not a user-turn ID. `CODEX_CLI_PATH` must still point to the installed official
+  CLI; omitting it silently loses backend discovery when preferences fail.
+- The native preview module's test registry and CDP class are not exported.
+  Resolve semantic preview function exports from the loaded bundle, then capture
+  the exact WebContents capability inside an admitted native dispatch. Guessing
+  a minified alias or mocking an unavailable test export proves nothing live.
+- Electron `web-contents-created` callbacks do not inherit the JavaScript
+  `AsyncLocalStorage` scope that invoked native tab creation. Observe the one
+  blank WebContents created during the native operation, match the returned
+  owned tab, and reject ambiguity. Do not blindly replay a failed create.
+- A fresh native pane uses an internal placeholder document, not necessarily
+  literal `about:blank`. Its exported `describeOriginlessPreviewTab` is the
+  authority for blank classification; it recognizes the native placeholder set.
+  Normalize only that classification for Codex bootstrap. Treating every
+  `data:` URL as blank would incorrectly bypass content admission. This was
+  verified by closing the whole pane, creating a new one through actual Codex,
+  loading a public page and closing it again.
+- On blank-to-page navigation, Chromium's `Page.frameNavigated` arrives while
+  native `checkToolAccessGate` still describes `about:blank` as `needs-grant`.
+  Dropping it makes the real Codex navigation waiter time out even after the
+  page loaded. Buffer observed navigation events during the native handler and
+  release only the final admitted document's events after it succeeds. The
+  red-to-green regression checks that `frameNavigated` precedes the real load
+  event; no completion event is synthesized.
+- Codex input coordinates are CSS pixels. Native `computer` coordinates are
+  screenshot pixels; its dispatch rounds and clamps them back to the viewport.
+  Calibrate using the actual native screenshot frame before the native guard.
+- Raw `Page.captureScreenshot` can hang on a hidden native view. Route through
+  native `computer:screenshot`, which owns Claude's parked/hidden capture logic,
+  and transcode its actual image for Codex. That native path can itself return
+  a rendering timeout under occlusion; do not represent a stale image as fresh.
+- `Query.setMcpServers` retains existing SDK transports by name. Replace only
+  the owned `cua_repl` entry through remove/re-add while preserving the full map.
+  A configuration ack can precede `mcpServerStatus: pending`; record the acked
+  map even before the transport reports `connected`. Use the real native
+  isolation predicate when calling `sealForSdk`.
+- This SDK's MCP client initializes with `capabilities: {}` and exposes no
+  generic elicitation callback. Codex's origin-access form maps to the real
+  `createPreviewOriginPermissionHandler`, so native policy (including bypass)
+  remains authoritative without a second approval UI. Other forms fail unless
+  the actual calling client negotiated form elicitation.
+
+## Bypass asks and the browser classifier floor (verified 2026-10-16)
 
 Claude Code 2.1.284 keeps some asks under `bypassPermissions`: the rm checks
 ("possibly-empty variable path") fire when a target can expand to `/`, `/*` or
@@ -4370,13 +4704,46 @@ which is where the card is emitted. The session is
 `this.config.getSession(id)`; its live mode is `.permissionMode`
 (enum value `"bypassPermissions"`).
 
-`src/plugins/bypass-for-real/main.js` wraps that prototype method and answers
-`{behavior:"allow", updatedInput}` when the mode is bypass and the tool is one
-of the CLI built-ins Bash, PowerShell, Edit, Write, MultiEdit, NotebookEdit.
-Desktop consent cards (the `$s` force-ask set) still show. Being on the
-prototype, it covers live and
-new sessions with no per-Query work. Verified live: `rm -f "$L"/*.cuimodprobe`
-with `L=''` was answered by the wrapper and no card appeared.
+Claude Code 2.1.260's `Nx` computes a per-tool effective mode. In bypass, Auto,
+and bypass-capable Plan it first consults
+`toolPermissionContext.mcpPermissionModeOverrides[serverName]`. Without an
+override it floors Claude Preview / Claude Browser to effective Auto when the
+classifier is available, and does the same for Claude in Chrome when
+`chromeClassifierFloorEnabled` is true. The special identities are
+`Claude Preview`, `Claude Browser`, `claude-in-chrome`, `Claude in Chrome`, plus
+`remote-devices` tools whose names begin `Claude_Browser__`,
+`claude-in-chrome__`, or `Claude_in_Chrome__`.
+
+The supported SDK call is
+`Query.setMcpPermissionModeOverride(serverName, mode)`. It sends control subtype
+`set_mcp_permission_mode_override` with `mode` restricted to `default`, `auto`,
+or `null`; the CLI stores an override even when that exact server has not
+connected yet. Desktop assigns the new Query to `session.query`, then calls
+`setupQueryHandlers(query, sessionId)` before enqueueing the first prompt.
+Desktop mode changes use `manager.setPermissionMode`, which delegates to the
+same Query before updating `.permissionMode` locally.
+
+`src/plugins/bypass-for-real/main.js` leaves `createCanUseTool` intact, wraps
+only `handleToolPermission`, and answers every ask reaching that method when
+the live mode is exactly bypass. It sets `default` for all browser identities
+above, which makes their asks reach the broker instead of the classifier, and
+clears the overrides before a manager-driven switch to any other mode. Mode
+transitions are serialized against reconciliation; after the native change
+returns or throws, the plugin derives the override from the session's actual
+mode, so a failed transition cannot leave bypass unfloored or weaken another
+mode. It covers existing Queries by reconciliation and new Queries at
+`setupQueryHandlers`; symbol-owned wrappers and override records transfer to a
+replacement host generation without a restore/reinstall gap, while a real
+unload restores the methods and sends `null` for every override. It also owns
+the short-lived bypass-session registry consumed by the provider-context filter;
+hot reload transfers that lease with the same global state, while a process
+crash lets it expire instead of leaving bypass authority on disk. The focused
+node test covers browser and Desktop-hosted asks, default/Auto delegation,
+pre-broker denial preservation, successful and failed mode changes, partial
+control-write cleanup, in-flight transitions racing reconciliation and each
+other, mode cleanup, new Query ordering, hot reload, and real unload. The earlier live rm probe (`L=''`) verified the broker path;
+the browser override path is source- and regression-test-verified, not live-UI
+verified.
 
 ## A live model switch is gated on a 5-second API probe
 
@@ -4441,6 +4808,28 @@ gpt-6.1-sol, capability env              speed fast, state on
 gpt running, flag fastMode only          no speed, state off
 gpt running, flag fastMode + env patch   speed fast, state on
 ```
+
+On 2026-10-15, a live GPT-6.1-Sol session reported
+`fastModeDisabledReason: "extra_usage_disabled"` while another session on the
+same model reported fast on without a reason. Desktop 2.9939.4's worker status
+reader copies `fast_mode_disabled_reason` into the session, and
+`formatSessionForEvent` forwards it unchanged. The pinned frontend's `Bf` calls
+`Hf(sessionMeta.fastModeDisabledReason)` and disables the switch before its
+`setFastMode` IPC. `extra_usage_disabled` produces the extra-usage/organization
+message; `preference` produces the organization-disabled message. Neither path
+checks the selected provider. Whether the affected worker retained the reason
+from Claude or recomputed it under GPT was not captured.
+
+`fast-mode/main.js` projects out only Anthropic account/billing reasons
+(`extra_usage_disabled`, `preference`, `free`, `not_first_party`) in that native
+serializer for models whose Codex cache advertises a priority tier. It leaves
+the raw session report intact, so a switch back to Claude restores the gate.
+Environment, model, and unknown restrictions remain visible. Attaching or
+removing the wrapper emits fresh metadata for affected sessions, including
+already-mounted controls. Live verification confirmed the affected session's
+raw reason remained `extra_usage_disabled` and its serialized reason was absent.
+`tests/fast-mode.test.js` covers projection, unsupported models, provider
+switches, overlapping reloads, and disposal.
 
 Desktop workers report `fast_mode_disabled_reason: sdk_opt_in_required` until
 the fast flag setting is pushed; the switch's own push clears it.
@@ -4568,3 +4957,573 @@ Search, exchange reads and handoff byte baselines now await that read; handoff
 checks its captured CLI ID again before sending. Tests cover partial SFTP reads,
 UTF-8 pagination, deadlines, late-handle cleanup, stale local copies and identity
 changes. WSL remains unsupported by this reader.
+
+## Remote session images: the native roots miss a Windows guest's deliveries (2026-10-04)
+
+Read from Desktop 2.9939.4 `.vite/build/index.chunk-yciyIejk.js`, class with
+`remoteRootRealpathCache`. For a session with `backend.remoteTarget`,
+`readSessionImageAsDataUrl` goes to `readRemoteSessionImageAsDataUrl`, whose
+`resolveContainedRemoteSessionPath` admits only `cwd`, `originCwd`,
+`worktreePath`, `collectContainmentAdditionalDirectories`, the uploads dir under
+`remoteHome`, and `/tmp/claude-<uid>`. Anything else throws "Remote image path
+could not be resolved" on the automatic preview and returns null on click; the
+pane shows that as "can't load file". On a Windows guest whose SSH user is Administrator
+while the files live under another profile (`C:\Users\<owner>`), so neither `remoteHome` nor the
+`/tmp` rule covers them. `file-pane-access/remote-image.js` wraps the method
+and admits any drive-absolute image on an already-connected Windows guest.
+
+## Assistant rewind uses an inclusive CLI checkpoint (2026-10-14)
+
+Source-verified on Desktop 2.9939.4 and CLI 2.1.284. `LocalSessions.rewindV2`
+accepts `(desktopSessionId, userMessageUuid)`. The manager requires text from
+that user record, walks its raw `parentUuid` chain to the preceding top-level
+assistant, rejects a dead branch, stops the session, and records that assistant
+UUID as `pendingRewindTo`. The next send uses `--resume-session-at` inclusively.
+Passing an assistant UUID directly fails the user-text check; mapping it to its
+owning user prompt drops the very reply the user wanted to retain.
+
+`assistant-rewind` calls the existing manager transition through an invocation-
+local proxy. Only its two transcript reads gain a virtual user boundary directly
+after the chosen assistant. The manager and its disk reader are never patched;
+no synthetic row is written to a file or the live message buffer. Inserting the
+boundary adjacent to the checkpoint, rather than at the end, preserves native
+active-chain and refusal-fallback ordering. Native stop, file-restore warnings,
+crash pruning, undo markers and next-send bookkeeping still run. The undo
+marker's prefill is emptied before `session_updated` is broadcast; the composer
+is left alone. Conversation rewind does not restore files.
+
+The pinned frontend folds several API responses into one assistant entry.
+Live-probed text row props carry `entry`, `item`, and `sessionRef`; `item.id` is
+`<API message.id>-t<N>`. Resolve that ID and the exact `item.text` against saved
+top-level assistant text records. A later tool block can share `message.id`
+while having a different UUID, so the turn's `sourceUuid` or last same-ID record
+is not the text checkpoint. Ambiguous or unpersisted text fails closed.
+
+Completed turns can use one `data-perf-row="assistant"` row containing multiple
+ordinary text/status items between tool calls. Their text components carry
+`item` and `sessionRef` without `entry` on the same fiber; a live paragraph's
+text owner was 17 hops up and the enclosing entry was 22. Selecting only
+`assistant_text`, or requiring `entry` and `item` together, loses these updates.
+Discovery walks each native `data-cds="Prose"` node to its nearest item and marks
+only main-session text-component wrappers. Each wrapper receives a separate
+control outside the Markdown subtree. Preparation carries that specific item ID
+and revalidates it against the current fiber, so recycling or grouping cannot
+silently turn an intermediate update into a whole-turn checkpoint. Tool-output
+items are excluded.
+
+A rendered thinking/status checkpoint uses an `assistant_thinking` row. Its
+fiber item is `{ kind: "thinking", id: "<API message.id>-th<N>", text }` on the
+`group/thinking` wrapper; it is not a Prose node and the row itself does not own
+that item. The persisted API block is `type: "thinking"` with the same visible
+string in `thinking`, including the last status before a refusal notice. Resolve
+both `-t<N>`/`text.text` and `-th<N>`/`thinking.thinking` by exact item text and
+API message ID. The native checkpoint is still the distinct top-level assistant
+UUID; later tool blocks sharing the same API message ID remain excluded.
+
+The bundled index-Cuw5J4F9 release's `c06cf64bb-DagteQMi.js` exports the native
+transcript store. Its `buckets[desktopSessionId].messages.getSnapshot()` and
+`truncateAfterMessage(sessionId, assistantUuid)` provide the visible half of the
+rewind. Validate that store and UUID before stopping anything; after native
+success, truncate inclusively without navigating or clearing the draft. Match
+the native consumer's cleanup too: `ca80fca8d-BP9S5wB3.js:jo.clearReviewFindings`,
+`shared-0-CIbzJMAO.js:ed.getState().clearSession` (tracked diffs), and
+`c5da7eb42-BvmVoK40.js:mn` (session pane caches). Those exports are preflighted
+before the native transition.
+Unsupported native implementations and missing frontend checkpoints produce an
+explicit error instead of falling back to a user-message target.
+
+Focused checks: `node --test tests/assistant-rewind.test.cjs tests/assistant-rewind-renderer.test.cjs`.
+The running native rewind method was also exercised against an in-memory fake
+manager: a direct assistant target returned null, while the scoped adapter
+reached a stop sentinel without touching a real process. A second sandbox ran
+the full native method with its real pure chain/marker helpers and mocked all
+process, persistence and telemetry effects; it retained the exact selected UUID,
+original session identity, empty prefill and native undo marker. Read-only live
+row description, saved UUID resolution and all frontend preflights passed. A
+real conversation rewind/resume remains a separate end-to-end check.
+
+## Remote generation-rate telemetry follows the execution host (2026-10-06)
+
+Verified on Desktop 2.9939.4 against the native SSH backend. The guest's
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8789` refers to its own router. Querying
+that address from Desktop's main process reads the PC's telemetry instead.
+`throughput` now selects `Symbol.for('cuimod.remote.router-source')` using both
+Desktop and CLI identity. Cache keys include the remote RPC generation; remote
+failures never fall through to local telemetry. Scope `all` means the selected
+execution host's sessions.
+
+The native controller returned by `connectForRemoteSpawn` holds `ssh2Client`.
+Its `config.privateKey` is the authenticated connection's raw key buffer, and
+`_protocol._hostVerifier` is the configured verification callback. The private
+router source uses those in a separate, pooled telemetry-only SSH connection.
+It opens direct-tcpip channels to guest loopback 8789, starts no process, opens
+no local listener and leaves the session's RPC connection untouched. Polls
+share the telemetry connection; disposal and idle expiry close only that one.
+
+SSH forwarding policy is fixed at connection establishment. Changing the
+server policy and reloading its listener leaves accepted SSH children alive,
+but those connections retain their old policy. Verified on Win32-OpenSSH
+9.5p2: the listener changed PID, both existing daemon processes and the accepted
+SSH children retained their PID and creation time, and five native session RPC
+connections remained connected and unchanged. New forwarding to 8789 succeeded;
+8788 remained administratively prohibited. The separate telemetry connection
+avoids a forced reconnect of the session transport.
+
+The throughput join reads the exact native transcript mirror when supplied,
+and scans both nested local and flat mirrored agent transcripts. The renderer
+passes Desktop identity on every read, clears session history on navigation,
+and rejects replies from a retired visit, including A → B → A navigation.
+
+## Desktop's SSH transcript mirror: flat, no sidecars, rewritten mtimes (2026-10-05)
+
+Read from app-2.9939.4 (`index.chunk-C1iYcdEp.js`) and measured on a 217-agent
+remote session (`ff55f517`).
+
+- **Layout.** A remote session's transcripts are mirrored into
+  `~/.claude/projects/ssh-<cliSid>/`, flat: `<cliSid>.jsonl` and every
+  `agent-<id>.jsonl` side by side, no `<cliSid>/subagents/` level. Desktop's own
+  reader tries `{nested, flat}` in that order.
+- **Only `agent-*.jsonl` is copied.** The copy filter is
+  `e.startsWith("agent-")&&e.endsWith(".jsonl")`. The `agent-<id>.meta.json`
+  sidecars stay on the remote host, which is the only place a nested agent's
+  `name`, `parentAgentId` and `spawnDepth` are recorded. The subagents panel
+  reads them through the session's live `sshLiveProcess.rpcClient`
+  (`files.list` + `files.read` on
+  `<configDir>/projects/<cwd slug>/<cliSid>/subagents`), published to public
+  plugins as `globalThis[Symbol.for('cuimod.remote.transcript-source')]`.
+  217 sidecars, 176 with a parent.
+- **mtimes are the mirror's, not the CLI's.** A resync rewrites every file; 217
+  files carried mtimes within ~40 s of each other, hours after their agents
+  ended. Anything that compares a file mtime against a transcript event time
+  is wrong on a mirror. The subagents resume test read mtime and listed 87
+  completed agents as running. It now uses the newest `timestamp` inside the
+  transcript. Local sessions had the same defect in a milder form: the CLI
+  appends untimestamped `last-prompt` records to agents that ended weeks
+  earlier.
+
+## Fireworks DeepSeek V4.1 Flash: the prompt it builds and how to count it (measured 2026-10-06)
+
+Fireworks serves Anthropic Messages natively at `/inference/v1/messages` but has
+no `count_tokens` (404). Sending `raw_output: true` returns the prompt it built
+(`raw_output.prompt_fragments`) and its ids (`prompt_token_ids`), and on every
+request measured `input_tokens + cache_read_input_tokens == len(prompt_token_ids)`.
+That makes the count reproducible locally; `router/deepseek-v41.mjs` does it and
+`tests/fixtures/deepseek-v41-fireworks.json` holds 80 synthetic raw_output captures.
+
+Measured: 98/98 byte-exact prompts and id-for-id ids (80 synthetic + 18 real
+Claude Code 2.1.260 requests); live through 8789, 18/18 real requests and a
+774,833-token request counted exactly what Fireworks billed.
+
+- **Tokenizer.** The checkpoint's `tokenizer.json` (HF rev `2cba9e42`, sha256
+  `c90dfa01…476b`), the `PreTrainedTokenizerFast` the reference
+  `inference/generate.py` loads. Engram's compressed id map is derived from this
+  same tokenizer at model load and does not change ids. `tokenizers@1.0.0-rc.2`
+  matched Python `tokenizers` 0.21.4 on 745,935 tokens in 16 ms; kitoken 0.11.0
+  matched in 261 ms, tokenizers 0.23.2 in 1136 ms, `@huggingface/tokenizers` 0.2.0
+  in 1744 ms. Loading costs ~0.4 s, so the worker loads it before taking traffic.
+- **Format.** `encoding.py` thinking mode, `Reasoning Effort: 75` header always,
+  thinking kept on every assistant turn when tools exist and dropped before the
+  last user turn when they do not.
+- **Fireworks' Anthropic adapter, not encoding.py:** system blocks join `\n`;
+  all-text content joins `\n`, but content containing an image stays a block
+  list joined `\n\n`; consecutive user turns join `\n\n`; a mid-conversation
+  `system` message becomes `<system>…</system>` appended with `\n` to the user
+  text before it, else its own user turn; tool results lead their turn, sorted by
+  call order; `is_error` prefixes `Error: `; assistant thinking blocks join `\n`,
+  text blocks join with nothing; `redacted_thinking` is dropped; `document`
+  blocks are a 400.
+- **Tools.** Rendered `{"name", "description"?, "parameters"}`, Python
+  `json.dumps` spacing. `additionalProperties: {}` reached through the root,
+  `properties` or `items` becomes `false`, and exactly the nodes on the path to
+  it come back key-sorted; `anyOf` and `$defs` are not walked.
+- **Deferred tools.** With a tool search tool (`ToolSearch` or `tool_search`)
+  and any `defer_loading` tool, Fireworks drops the deferred tools, appends its
+  own `tool_use_tool`, renders a `tool_reference` as compact key-sorted JSON of
+  `{description, input_schema, name}` (an unknown name as the bare name), and
+  renders a later call to a deferred tool as `tool_use_tool(tool, arguments)`.
+  DeepSeek does not use that dispatcher. It writes invoke names only from its
+  tool list, and Claude Code's ToolSearch description says a fetched tool is
+  callable like one at the top of the prompt. A real session looped on
+  `ToolSearch select:TaskCreate` nine times. Replaying its request at the loop
+  point (raw_output `grammar: null`, so Fireworks constrains no tool names)
+  gave 0 of 9 direct calls: 1 via `tool_use_tool`, 4 re-searches, 4 placeholder
+  calls to other tools such as `Agent` and `spawn_task`. The router now lists
+  every tool loaded by `tool_reference` or `tool_addition` as a plain tool, and
+  drops the deferred tools that are not loaded, `tool_removal` included
+  (`listLoadedDeepSeekV41Tools`). With no deferred tool left, Fireworks adds no
+  `tool_use_tool`. The same request then gave 8 of 8 direct calls, and 3 of 3
+  through 8789. The count stayed exact on all of them. A tool_reference
+  outside deferred mode still renders as the schema JSON. The cost is one
+  prefix cache miss per tool load, because encoding.py can declare tools only
+  in the system turn.
+- **Images.** One `<｜deepseek_image｜>` (id 129264) in the text; ids expand to
+  129280, rows of 129281 closed by 129282, then 129283 —
+  `rows * (columns + 1) + 2` from `image_processor.py` with 14 px patches, 3x3
+  aligner, 295,936 px floor and 1024-token cap. Verified from 1x1 to 5000x40 and
+  40x5000, PNG and JPEG.
+- **Control tokens in text.** Fireworks 400s any request whose text contains
+  the image placeholder (`Message content contains image special token`), and
+  a session that once read such a file fails every later turn. Every other
+  fullwidth-bar control token in text is accepted but tokenized as the live
+  control id. The router rewrites all 856 of them to ASCII bars (`<|User|>`) in
+  system and message strings on this route; those spell ordinary tokens.
+- **Numbers.** Python float repr (`1e-05`). JS cannot see a `1.0` literal or an
+  integer past 2^53; Claude Code serializes through JS and sends neither.
+- **Effort.** Fireworks maps `reasoning_effort` (an integer 1-100, a name, or
+  `none` for chat mode) and `output_config.effort` (low 50, medium/high 75,
+  xhigh/max 100) onto the budget; `thinking: disabled` is chat mode; nothing set
+  is 75. Chat mode drops the effort header, writes `</think>` after every
+  assistant header and drops history reasoning; `<｜System｜>` then appears only
+  for a leading system turn. The picker offers low 25 / medium 50 / high 75 /
+  max 100. Claude Code's selector only accepts effort ids low, medium, high,
+  xhigh and max (`kE` in the pinned frontend), and an entry carrying any other
+  id (an earlier `none` stop) lost its effort control entirely; chat mode is
+  reachable as a `:none` model suffix instead. The router
+  sends the tier as `reasoning_effort` via the catalogue's `effortField` and
+  `effortValues`, taking a `:tier` model suffix over the slider's
+  `output_config.effort` over `defaultEffort`.
+
+## Fireworks deferred-tool deployment drift (verified 2026-10-12)
+
+Desktop **2.9939.4**, CLI **2.1.284**: a remote session repeatedly searched for
+IDA tools, then called the unrelated Docs `batch` tool with document-creation
+arguments. Its captured `effectiveTools` still marked the loaded IDA tools
+`defer_loading: true`. The remote router had the counter and text neutralizer,
+but neither `listLoadedDeepSeekV41Tools` nor its request-path invocation. The
+local checkout and running local worker already had both. A local fix does not
+update a separately deployed router.
+
+`tests/fireworks-deferred-tools.test.mjs` now checks the actual
+`prepareCompatibleBody` path, exact loaded schemas, rendered tool declarations,
+removals, literal history names and provider isolation. Against the remote base
+it passed four checks and failed the two loaded-tool checks; the candidate
+passed all six. Listing requires both `provider === 'fireworks'` and the
+`deepseek-v4.1-fireworks` counter. Counter-only text neutralization retains its
+prior behavior.
+
+The live synthetic count fixture distinguished the remote legacy dispatcher
+prompt (677 tokens) from the corrected direct-tool prompt (519 tokens). After
+health-gated worker replacement, both hosts counted 519 and each returned the
+requested synthetic tool name with `{}`, `stop_reason: tool_use`, and a terminal
+`message_stop`. No returned tool was executed. The original session was not
+replayed, and these checks do not certify every model-generated tool choice.
+The deployment replaced workers only; the supervisor retained the prior worker
+for existing streams. No listener, Desktop or CLI restart was requested.
+
+## Fireworks GLM 5.3: the prompt it builds and how to count it (measured 2026-10-13)
+
+`accounts/fireworks/models/glm-5p3` runs the same `raw_output` method as
+DeepSeek: `input_tokens + cache_read_input_tokens == len(prompt_token_ids)` on
+every capture. Fireworks feeds GLM's own `chat_template.jinja` (HF `zai-org/GLM-5.3`
+rev `c5087a76`). `router/glm-53.mjs` rebuilds it; `tests/fixtures/glm-53-fireworks.json`
+holds 189 accepted and 39 rejected captures (the 80 DeepSeek fixture bodies plus
+GLM-specific edges), all byte-exact and id-for-id. Live through 8789, 7 of 7
+requests counted exactly what Fireworks billed.
+
+- **Control tokens.** Fireworks tokenizes only the template's own control tokens
+  as control ids. Text runs, from any field, are plain BPE: `<think>` or
+  `<|user|>` in a message is ordinary text. No neutralization is needed, but the
+  counter must not match added tokens. The pinned `tokenizers` binding cannot
+  disable that per call and loads only from a file, so the router derives a copy
+  of `tokenizer.json` with `added_tokens: []` into `%TEMP%`, keyed by the
+  vendored file's hash.
+- **Effort.** Header `Reasoning Effort: Low|High|Max`. Fireworks maps
+  `low`/`minimal` to Low, `medium`/`high` to High, `xhigh`/`max`/an integer/unset
+  to Max; `reasoning_effort` wins over `output_config.effort`; names are
+  case-sensitive. The model is thinking-only: `none` or `thinking: disabled`
+  is a 400. The picker offers exactly low, high and max.
+- **Adapter, same as DeepSeek:** system blocks and mid-conversation
+  `<system>` folding, `Error: ` prefixes, compact key-sorted tool_reference
+  JSON, the `additionalProperties: {}` schema rewrite, and in deferred mode
+  `tool_use_tool` with the deferred tools dropped. The router's loaded-tool
+  listing now applies to every Fireworks model; with it, GLM called a loaded
+  deferred tool by its own name live.
+- **Adapter, different from DeepSeek:** empty text blocks are dropped before
+  every `\n` join and an empty system message vanishes; consecutive user turns
+  stay separate `<|user|>` turns; tool results lead their message, consecutive
+  ones form one `<|observation|>` sorted by the latest call order with unknown
+  ids last; assistant text (prefill included) is Python-`strip()`ped, thinking
+  is not; every assistant turn carries `<think>…</think>`, empty if none; a
+  missing tool description renders `null`; images and `document` blocks are
+  400s; a non-object `tool_use.input` is a 400.
+- **Numbers.** Tool schemas go through serde_json: an integer literal inside
+  [-2^63, 2^64-1] stays an int, anything else becomes a Python float
+  (`1.8446744073709552e+19`). Tool-call arguments keep unbounded ints. A
+  tool_reference keeps the request's own literals (`1e-7`).
+
+## Fireworks balance: the gateway, its lag, and the live figure (measured 2026-10-06)
+
+Fireworks' REST API has no balance: `/v1/accounts/{id}/balance`, `billing/balance`,
+`credits` and the rest 404, and `:getBalance` over REST is 403 for an API key.
+The figure `firectl account get` prints comes from gRPC
+`gateway.Gateway/GetBalance` on `gateway.fireworks.ai`, with the API key in
+`x-api-key`, request `{1: "accounts/<id>"}`, reply `{1: Money{1 currency, 2
+units, 3 nanos}}`. `ListInvoices` on the same gateway lists invoices
+`{2 amount, 6 paid {1 seconds}, 7 state}`; state 2 is paid. Found via
+github.com/steveafrost/fireworks-app; `router/fireworks-billing.mjs` speaks it
+over node:http2 with hand-framed protobuf.
+
+- **GetBalance lags.** It moves in batched steps minutes behind spend (a step
+  arrived ~2.5 min after the last traffic; another after 8+). It floors at 0
+  while the account is overdrawn: a $5.00 top-up then read 4.90034, settling the
+  hidden ~$0.10 debt. An overdrawn account is intermittently refused with HTTP
+  412 "Account ... is suspended" until the top-up propagates.
+- **billing/summary is not live-usable.** With `startTime`/`endTime` it returns
+  rated line items whose unit amounts match published pricing to the nanodollar,
+  but consecutive reads flip between replicas ($0.879, $1.007, once $0).
+- **The live figure** is the reported balance minus the exact cost of responses
+  not yet deducted; each step down settles the oldest pending costs first. One
+  settlement spans every router on the account: this PC pulls the peer router's spend
+  log over ssh (`.state/fireworks-billing-peers.json`), and a peer response first
+  seen more than 3 min after it finished counts toward burn only. Burn is exact
+  spend plus unattributed deductions over the last hour. The merged peer log
+  feeds the live rate and activity too, so the drain meter is the whole account
+  -- every peer machine -- not just this one. A peer that records tokens
+  contributes them; one whose state file predates the field does not, and
+  `activity.tokensExact` says when the token sum is partial.
+- **The drain meter's rate is decayed, not windowed.** `snapshot()` also reports
+  `burn.smoothedPerHour`, a rate over the last two hours of spend where each cost
+  is weighted `e^(-age/5min)` and the denominator is the decayed length of the
+  observed span -- so an idle gap lowers the rate and a burst raises it within
+  minutes, without inventing spend. The runout is the live balance over that
+  rate. `burn.usdPerHour` stays the flat hour for the dashboard. The popover
+  polls `GET /fireworksz` every second while it is open; that route returns
+  `snapshot()` from memory and never reaches the gateway, because GetBalance is
+  minutes behind spend and has nothing to say at one hertz.
+
+## Persistent inference transports (verified 2026-10-10)
+
+Established on the dev rig with Node 24.12.0 / Undici 7.16.0. The local worker
+uses `openai-websocket.mjs` for ChatGPT OAuth `/backend-api/codex/responses`;
+other HTTPS endpoints and the existing HTTP/h2c fixtures retain their original
+transport. The socket sends full-history `response.create` with
+`OpenAI-Beta: responses_websockets=2026-02-06`, matching the official Codex
+`core/src/client.rs` and `codex-api/src/endpoint/responses_websocket.rs`. It does
+not send incremental `previous_response_id`. Two capped `gpt-6-luna` low-effort
+turns both completed with 5 output tokens, through one authenticated socket.
+The WebSocket endpoint accepted `max_output_tokens: 512` in those smoke requests;
+this does not change the ordinary router's deliberate output-budget mapping.
+
+Socket reuse is partitioned by URL and a hash of every upgrade header, including
+OAuth/account/thread/turn-state identity. Concurrent requests lease separate
+sockets, including concurrent requests with identical headers. Terminal events
+release a healthy socket; early cancellation or transport loss destroys the
+lease and never replays a sent request. Metadata (`codex.rate_limits`,
+`codex.response.metadata`, `responsesapi.websocket_timing`) and created/in-progress
+preludes do not commit HTTP 200 before a provider error can retain its status.
+`response.failed` still travels through the existing translator, including its
+refusal semantics. WS `ttfb` is admission of the first non-prelude event, not a
+new per-turn TLS handshake; do not compare it to HTTP response-header latency.
+First-token and terminal throughput observations keep their existing event path.
+
+Node's native WebSocket *does* accept custom headers in its second-argument
+`WebSocketInit`. Its public API exposes neither upgrade rejection status/headers
+nor the socket's abort/unref lifecycle. The small RFC6455 client exists for
+those boundaries, not for missing header support. It offers no compression,
+validates the upgrade accept key and frame lengths/UTF8, masks outgoing frames,
+and responds to ping. Idle sockets are unref'ed and reclaimed after 5 minutes;
+sockets rotate before 30 minutes and the pool is capped at 64 connections.
+This leaves headroom inside the server's one-hour connection lifetime for a long
+reasoning turn. Age uses a monotonic clock. Authentication and rate-limit
+responses are preserved.
+
+The server caps one `response.create` text message at 16 MiB (measured
+2026-10-11 against chatgpt.com with a rejected junk field, so no inference ran):
+16,777,216 bytes got a reply, 16,777,217 got close 1009 with an empty reason. The
+HTTP endpoint parsed 24 MiB bodies. The router's own 32 MiB frame bound let such
+turns through, and the post-send no-replay rule turned each into a 529
+`upstream WebSocket closed`. Because the request was deterministic, every client
+retry failed and the session was dead. A remote gpt-6-astra session died this way
+after three ~1 MB PNG Reads.
+
+### WebSocket-only since 2026-10-11 (owner requirement)
+
+ChatGPT inference has no HTTP leg. Three server facts, measured the same day
+with gpt-6-luna over one socket (store:false), make that workable:
+
+- `generate:false` uploads chain through `previous_response_id`. Three chunks
+  answered `PELICAN-7731, teal, OTTER` from content in the first two, and the
+  upload chunks reported 0 output tokens.
+- Each `response.create` validates alone. A chunk ending in a function_call
+  without its output is refused: `No tool output found for function call`.
+- A response id lives on its socket only until an error. A new socket answered
+  `Invalid previous_response_id`, and after a refused chunk the same socket
+  answered `previous_response_not_found`.
+
+`openai-websocket.mjs` follows Codex (`core/src/client.rs`
+get_incremental_items). Each socket remembers the last completed request (every
+field but `input`, plus the serialized input) and that response's id and output
+items. The next request on the session may send only its new items with
+`previous_response_id` when all of the following hold:
+
+- every other field is byte-identical;
+- the input starts with the previous input;
+- the following assistant-side items match the remembered output. Reasoning is
+  skipped, assistant text is concatenated, and call arguments are compared as
+  canonical JSON, because that is what survives Claude Code's round trip.
+
+Acquire prefers an idle socket whose chain matches. Any other request is a cold
+send. Above 16 MiB, a cold send becomes `generate:false` chunks cut only where
+no call is open, each under 16 MiB less a 64 KiB margin, with the final chunk
+generating. A single call/output group or message over the limit is answered
+413 unsent.
+
+The transport resends on a fresh socket for `previous_response_not_found`,
+`websocket_connection_limit_reached`, and for one loss before any non-prelude
+event reached the consumer. Nothing was forwarded in those cases, so no tool
+can run twice. A 5xx handshake is retried up to three attempts, with backoff.
+A loss after content still reaches Claude Code, which decides its own retry.
+
+Verified through the live router:
+
+- Two follow-up turns went out as warm deltas and answered from turn-one
+  context (`HERON-4412`, then its reversed digits).
+- A 17.6 MiB, 41-item request went out as one chunked cold send and answered
+  `MARMOT` from image 3, which was in the first chunk.
+
+`/healthz.transports.openai.sends` counts warm, cold, chunked and resent sends.
+Gates: `tests/provider-openai-continuation.test.mjs` (red on the HTTP-fallback
+router at its first check) and the rewritten `provider-transport-recovery`,
+which asserts zero HTTP POSTs.
+
+Fireworks' authenticated Messages upgrade returned HTTP 405. Its Responses
+upgrade returned 101 without `Sec-WebSocket-Accept`, followed immediately by
+EOF, both with and without the Responses beta header. No inference was sent
+through either upgrade. Those endpoints supplied no usable WebSocket contract.
+The Fireworks inference arm instead uses `fireworks-transport.mjs`: persistent
+HTTP/2 sessions partitioned by origin and credential hash, with independent
+streams for parallel turns. Two `deepseek-v4p1-flash` requests capped at 64 output
+tokens each completed with 2 output tokens each through one TLS/H2 session.
+The prepared Messages body is serialized once for logging and transmission.
+A `message_stop` releases only that stream without awaiting HTTP EOF or exposing
+trailing frames. GOAWAY retires a session for new requests while active streams
+drain. A submitted POST is never replayed by this transport, even on a reset
+before response headers. HTTP status/Retry-After and decoded gzip/deflate/br
+response bytes retain the previous fetch semantics. Sessions have a 5-minute
+idle bound and a 55-minute age bound, with a 16-session cap and at most 100 reserved
+streams per session (also bounded by the peer's advertised limit).
+
+`/healthz.transports` reports protocol, cumulative connections opened, current
+connections/sessions and active leases, never credentials or hashed identities.
+These pools belong to worker generations. The stable supervisor and its old
+HTTP responses are unchanged; a normal source swap drains the previous worker.
+This verification was local. It does not certify any separately deployed checkout.
+
+Narrow red-to-green gates, also included in `npm run check:public`:
+
+```text
+node tests/provider-openai-websocket.test.mjs
+  base: fetch failed (unknown ws scheme)
+  candidate: 16 offline framing/reuse/isolation/translation/cancellation checks
+node tests/fireworks-transport.test.mjs
+  base: expected HTTP/2, received HTTP/1.1
+  candidate: 9 offline negotiation/reuse/multiplex/status/cancellation/GOAWAY checks
+node tests/fireworks-terminal.test.mjs
+  base: message_stop was forwarded but downstream never ended without HTTP EOF
+  candidate: terminal release, no trailing frames, exact usage, no listener leak
+```
+
+The offline fixtures set endpoint/auth/state environment **before** importing
+router modules and refuse all non-loopback fetch/HTTPS/HTTP2 traffic. Loading
+`openai.mjs` first caches its endpoint/auth constants; an initial fixture did
+that incorrectly and made one unintended live Astra request. The guarded tests
+prevent recurrence even if an import is later moved above fixture setup.
+
+The small paired A/B on the same dev rig used identical tiny prompts and caps,
+excluded one warmup per arm, and alternated request order. Output budgets were
+32 for Luna-low and 16 for Flash; every response completed, with identical token
+counts and zero cache hits across arms. These are trends, not latency gates:
+
+```text
+condition                         existing HTTP         persistent candidate
+Luna low, 5 pairs, first text      714.34 +/- 42.40 ms    641.93 +/- 48.86 ms
+Luna low, 5 pairs, terminal        767.95 +/- 52.23 ms    698.82 +/- 52.03 ms
+Flash, 3 pairs, first text         673.98 +/- 20.26 ms    599.47 +/- 15.97 ms
+Flash, 3 pairs, terminal           674.22 +/- 20.06 ms    599.62 +/- 15.93 ms
+4,550,093-byte serialization       19.74 +/- 0.53 ms      12.52 +/- 0.36 ms
+long-context / parallel live       not run               not run
+40-hour real-time soak             not run               not run
+```
+
+Numbers are median +/- MAD. WS first-text latency improved in four of five
+pairs; the remaining WS sample was a 1,352.03 ms outlier. Both candidate pools
+opened one connection for the entire warmup-plus-paired run. The serialization
+comparison was local-only on a synthetic coding prompt, ten measured iterations
+after warmup. Baseline Fireworks waited for HTTP EOF, preserving its existing
+fetch keep-alive behavior; the candidate stopped at message_stop. The benchmark
+did not deliberately destroy baseline HTTP/1.1 connections between samples.
+
+`node tests/provider-transport-recovery.test.mjs` fails the pre-hardening
+candidate on a rejected WS upgrade (503 instead of transparent HTTP success).
+The hardened candidate checks handshake fallback/cooldown/WS restoration,
+403 preservation, explicit connection-limit recovery, no replay on ambiguous
+post-submission loss, HTTP fallback 429/Retry-After, age rotation, active-lease
+survival and 48 accelerated hourly idle/reconnect cycles. Only clocks and pool
+idle callbacks are accelerated; network I/O and handshake deadlines remain real.
+That exercises recovery logic and resource counts, not a real-time 48-hour soak
+or a guarantee against every future provider/network failure.
+
+## A native Claude model newer than the CLI is capped at 200K (measured 2026-10-11)
+
+CLI 2.1.284 decides a model's raw window from its built-in model table
+(`context: { window, native_1m }` per row). `claude-haiku-5-5` has no row there,
+so the CLI treats it as unknown and assumes `eK = 200000`. Every override
+(`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, settings, clientdata, experiment) is
+`Math.min`-clamped to that raw window. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` applies
+only to non-`claude-*` ids, and `CLAUDE_CODE_MODEL_CAPABILITIES` carries
+capability flags with no window. The `[1m]` id tag is the only lever.
+
+Measured both ways. Bare `claude-haiku-5-5`: a Desktop session auto-compacted at
+168,417 tokens, and a 260K `-p` prompt was refused client-side
+(`terminal_reason: blocking_limit`, no API call). Tagged
+`claude-haiku-5-5[1m]`: a subagent sent a 735,568-token request that
+succeeded. Desktop launches the CLI with `--model <picker row id>`, so
+provider-picker `page.js` serves the native row under its tagged id
+(`NATIVE_1M`). When a newer CLI lists the model natively, drop it from that set.
+
+## GPU resets turn hardware acceleration off for good (app 2.9939.4, measured 2026-10-16)
+
+Two independent fallbacks put the window on ANGLE/WARP (`--use-angle=d3d11-warp-webgl`,
+`gpu_compositing: disabled_software`). On a 1920×1080 240 Hz display the GPU
+process then averaged ~1.1 cores while in use, and the UI stalled for seconds.
+
+- **Desktop `[gpu-recovery]`** (main chunk `index.chunk-C1iYcdEp.js`). The
+  `app.on("child-process-gone")` handler returns early for
+  `type !== "GPU" || reason === "clean-exit"`. Otherwise it counts the death
+  (the counter resets after 5 min with no deaths) and writes the count to
+  `%APPDATA%\Claude\gpu-crash-streak`. At 3 it calls
+  `saveHardwareAccelerationSetting(true, {auto: true})`, which persists
+  `isHardwareAccelerationDisabled` + `isHardwareAccelerationAutoDisabled` in
+  `claude_desktop_config.json`, and shows a "Graphics problems detected"
+  dialog. At startup a marker ≥ 3 does the same before
+  `D_().isHardwareAccelerationDisabled && app.disableHardwareAcceleration()`.
+  `index.pre.js`'s `applyPreReadyAppConfig` also appends `--disable-gpu` from
+  the same flag. Both run inside `require("./index.js")`, before the appended
+  main hook, so no plugin can influence the launch that reads them. The flag
+  stays set until the Help-menu checkbox is cleared.
+- **Chromium** `GpuProcessHost::RecordProcessCrash` falls back to the next GPU
+  mode after recent crashes reach the fallback limit, unless
+  `--disable-gpu-process-crash-limit` is on
+  `CommandLine::ForCurrentProcess()` *at crash time*. It is in `claude.exe`, so
+  appending it after ready works.
+- The config namespace (`appConfig`, `saveHardwareAccelerationSetting`, …) is
+  exported from the main chunk under a per-build letter (`vW` here). Find it by
+  shape in `require.cache`.
+- Red/green: `taskkill` of the GPU process wrote `gpu-crash-streak` = 1
+  without the guard. With `gpu-accel-guard` loaded, the same kill left it at 1,
+  and later listeners received `reason: "clean-exit"`.
+- Windows logged nvlddmkm TDRs (System 4101) on 10-04, 10-07, 10-08 and
+  10-11. Desktop's own `logs/main.log` has not been written since 2026-09-02,
+  so which TDR tripped the flag is not recorded.
+
+## The session manager is still restoring when the sidebar draws
+
+Source-read against app 2.9939.4 on 2026-10-20: after a Desktop restart the
+main process fills `claudeCodeSessionManager.sessions` asynchronously (the
+`[Restore]` directory loader, and sessions parked until account resolution),
+while the claude.ai sidebar already draws rows. A main-process read in that
+window answers with ages missing for rows that exist. sidebar-sections treated a
+missing age as "old" and froze each project's placement from it, so every
+project sat under "quieter projects" until the window had been hidden for five
+minutes. A missing age now means "not restored yet": the row stays visible and
+the project is not placed until all of its rows have ages.

@@ -1139,7 +1139,7 @@ async function refresh() {
     const forSid = cliSid;
     try {
         const [r, live] = await Promise.all([
-            cuimod.rpc('subagents.list', { cliSid: forSid }),
+            cuimod.rpc('subagents.list', { cliSid: forSid, desktopSessionId: cuimod.desktopSessionId }),
             backgroundActivity(),
         ]);
         // A poll in flight when the session changes answers for the session it
@@ -1176,7 +1176,7 @@ async function loadDetail(id) {
     const forSid = cliSid;
     try {
         const d = await cuimod.rpc('subagents.detail', {
-            cliSid: forSid, agentId: id, maxTurns: MAX_TURNS, gapMs: GAP_MS,
+            cliSid: forSid, desktopSessionId: cuimod.desktopSessionId, agentId: id, maxTurns: MAX_TURNS, gapMs: GAP_MS,
         });
         if (forSid !== cliSid) return;
         if (d && d.ok) { details.set(id, d); render(); }
@@ -1199,7 +1199,7 @@ async function loadChat(id, beforeId) {
     chatBusy = true;
     try {
         const r = V.mock ? mockThread(id) : await cuimod.rpc('subagents.thread', {
-            cliSid: forSid, agentId: id, limit: CHAT_PAGE, beforeId,
+            cliSid: forSid, desktopSessionId: cuimod.desktopSessionId, agentId: id, limit: CHAT_PAGE, beforeId,
         });
         if (seq !== chatSeq || forSid !== cliSid || id !== detailId || !r || !r.ok) return;
         const byMsg = new Map(chatItems.map((m) => [m.id, m]));

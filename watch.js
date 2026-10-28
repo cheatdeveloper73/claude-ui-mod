@@ -60,7 +60,7 @@ function attempt(reason) {
     }
     if (!newest) return;
 
-    if (P.isPatched(newest)) {
+    if (P.isCurrent(newest)) {
         if (lastState !== 'patched') { log('patched  ' + newest.name + ' (' + reason + ')'); lastState = 'patched'; }
         return;
     }

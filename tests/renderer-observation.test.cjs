@@ -249,7 +249,10 @@ function usageHarness() {
     let holdLimits = false;
     const cuimod = {
         eipc: () => 'context-channel', contextCountInfo: () => ({ exact: true, description: 'exact' }),
-        onSessionChange: fn => h.sessionCallbacks.push(fn),
+        onSessionChange(fn) {
+            h.sessionCallbacks.push(fn);
+            return () => { const at = h.sessionCallbacks.indexOf(fn); if (at !== -1) h.sessionCallbacks.splice(at, 1); };
+        },
         appInvoke(_channel, id) { const call = { id, ...deferred() }; contextCalls.push(call); return call.promise; },
         async rpc(method, params) {
             if (method === 'usage-bar.native') return { model: selectedModel, label: selectedModel, limits: [] };
@@ -504,7 +507,10 @@ function autoHarness() {
     h.registry.set = (_plugin, key, value) => { if (key === 'sessionOverrides') { stored = value; writes.push(value); } };
     h.registry.get = () => ({ sessionOverrides: stored });
     const cuimod = {
-        eipc: () => 'context-channel', onSessionChange: fn => h.sessionCallbacks.push(fn),
+        eipc: () => 'context-channel', onSessionChange(fn) {
+            h.sessionCallbacks.push(fn);
+            return () => { const at = h.sessionCallbacks.indexOf(fn); if (at !== -1) h.sessionCallbacks.splice(at, 1); };
+        },
         get sessionId() { return cliSessionId; },
         appInvoke(_channel, id) { const call = { id, ...deferred() }; applyCalls.push({ type: 'observe', ...call }); return call.promise; },
         rpc(method, params) {
@@ -746,6 +752,7 @@ function brandingHarness() {
         }
         return [];
     };
+    h.document.head.querySelectorAll = selector => selector === 'link[rel~="icon"]' ? [favicon] : [];
     h.context.getComputedStyle = node => node.computed || {
         display: 'block', visibility: 'visible', opacity: '1', color: '', fill: '',
     };

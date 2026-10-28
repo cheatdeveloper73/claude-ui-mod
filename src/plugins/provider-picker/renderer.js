@@ -62,6 +62,8 @@ let accountBusy = false;
 let accountRemoving = null;
 let accountUsageBusy = false;
 let accountUsageQueued = false;
+let accountResetConfirm = null;
+let accountResetBusy = null;
 let poolPinState = { supported: null, accounts: [], mode: 'auto', targetAccountId: null, appliedAccountId: null, applied: false, error: null };
 let poolPinBusy = false;
 let poolPinFlight = null;
@@ -116,6 +118,8 @@ function mergeAccountState(value) {
         ...account,
         ...(account.usage ? {} : usage.has(account.id) ? { usage: usage.get(account.id) } : {}),
     })) };
+    if (accountResetConfirm && !accountState.accounts.some(account => account.id === accountResetConfirm.id))
+        accountResetConfirm = null;
 }
 
 function mergeAccountUsage(value) {
@@ -126,6 +130,17 @@ function mergeAccountUsage(value) {
         ...account,
         ...(usage.has(account.id) ? { usage: usage.get(account.id) } : {}),
     })) };
+    if (accountResetConfirm) {
+        const current = accountState.accounts.find(account => account.id === accountResetConfirm.id);
+        if (!current || current.usage?.observedAt !== accountResetConfirm.observedAt
+            || current.usage?.resetCredits !== accountResetConfirm.credits) accountResetConfirm = null;
+    }
+}
+
+function markAccountUsageError(id, message) {
+    accountResetConfirm = null;
+    accountState = { ...accountState, accounts: (accountState.accounts || []).map(account => account.id === id
+        ? { ...account, usage: { error: message } } : account) };
 }
 
 function resetDate(value) {
@@ -136,7 +151,7 @@ function resetDate(value) {
 }
 
 async function refreshAccountUsage(force = false) {
-    if (!accountPanel) return;
+    if (!accountPanel || accountResetBusy !== null) return;
     if (accountUsageBusy) { accountUsageQueued = true; return; }
     accountUsageBusy = true;
     try {
@@ -177,6 +192,55 @@ function accountAction(text, disabled, run, danger = false) {
         } catch (err) {
             accountState = { ...accountState, login: { phase: 'error', message: err?.message || 'OpenAI account action failed' } };
         } finally { accountBusy = false; paintAccountPanel(); }
+    });
+    return button;
+}
+
+function accountResetButton(account, disabled, armed) {
+    const credits = account.usage?.resetCredits;
+    const label = Number.isFinite(credits) ? `${credits.toLocaleString()} reset${credits === 1 ? '' : 's'}` : '—';
+    const button = accountButton(accountResetBusy === account.id ? 'Applying' : label, disabled, armed);
+    button.style.cssText += ';position:relative;padding:0 0 0 18px;border:0;background:transparent;font-size:9px;font-weight:600;line-height:14px;letter-spacing:.06em;text-transform:uppercase;font-variant-numeric:tabular-nums;color:'
+        + (armed ? 'hsl(var(--danger-100))' : Number.isFinite(credits) && credits > 0 ? 'hsl(var(--cui-accent,14 62% 60%))' : 'hsl(var(--text-500))');
+    const icon = document.createElement('span');
+    icon.style.cssText = 'position:absolute;left:0;top:50%;transform:translateY(-50%);width:14px;height:14px;pointer-events:none';
+    icon.innerHTML = '<svg width="14" height="14" viewBox="2 2 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.64 6.36M3 4v7h7"/></svg>';
+    button.append(icon);
+    button.title = Number.isFinite(credits) ? 'Double-click to spend one reset credit for ' + accountName(account) : 'Reset-credit count unavailable';
+    button.setAttribute('aria-label', Number.isFinite(credits) ? `${credits} reset credits for ${accountName(account)}; double-click to confirm` : 'Reset-credit count unavailable');
+    button.addEventListener('click', event => {
+        if (event.detail !== 1 || button.disabled || accountBusy || accountUsageBusy || accountResetBusy !== null) return;
+        const current = accountState.accounts.find(value => value.id === account.id);
+        if (!Number.isFinite(current?.usage?.resetCredits) || current.usage.resetCredits < 1) return;
+        accountResetConfirm = { id: account.id, observedAt: current.usage.observedAt, credits: current.usage.resetCredits };
+        // Keep this node alive for the native double-click event. Replacing it
+        // after the first click breaks the browser's click-count sequence.
+        button.textContent = 'Confirm';
+        button.append(icon);
+        button.style.color = 'hsl(var(--danger-100))';
+    });
+    button.addEventListener('dblclick', async () => {
+        if (button.disabled || disposed || accountBusy || accountUsageBusy || accountResetBusy !== null) return;
+        const current = accountState.accounts.find(value => value.id === account.id);
+        if (!current || accountResetConfirm?.id !== account.id
+            || current.usage?.observedAt !== accountResetConfirm.observedAt
+            || current.usage?.resetCredits !== accountResetConfirm.credits) {
+            accountResetConfirm = null;
+            paintAccountPanel();
+            return;
+        }
+        accountResetConfirm = null;
+        accountResetBusy = account.id;
+        paintAccountPanel();
+        try {
+            const result = await cuimod.rpc('provider-picker.accountResetCredit', { id: account.id });
+            mergeAccountUsage({ accounts: [{ id: account.id, usage: result?.usage }] });
+        } catch (error) {
+            markAccountUsageError(account.id, error?.message || 'Reset-credit usage unavailable');
+        } finally {
+            accountResetBusy = null;
+            paintAccountPanel();
+        }
     });
     return button;
 }
@@ -222,9 +286,15 @@ function paintAccountPanel() {
         } else {
             usage.textContent = account.usage?.error || (accountUsageBusy ? 'Reading weekly usage…' : 'Weekly usage unavailable');
         }
-        copy.append(usage);
-        const locked = accountBusy || login.phase === 'waiting';
+        const resetCredits = account.usage?.resetCredits;
+        const locked = accountBusy || accountResetBusy !== null || accountUsageBusy || login.phase === 'waiting';
         const armed = accountRemoving === account.id;
+        const creditLine = accountResetButton(account,
+            locked || armed || !Number.isFinite(resetCredits) || resetCredits < 1, accountResetConfirm?.id === account.id);
+        copy.append(usage);
+        const actions = document.createElement('div');
+        actions.style.cssText = 'flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:5px;min-width:54px';
+        actions.append(creditLine);
         // The x only arms removal; the destructive click is the red button that
         // replaces Switch, so a stray double-click on the x cannot delete.
         const remove = document.createElement('button');
@@ -246,14 +316,15 @@ function paintAccountPanel() {
         });
         row.append(remove, copy);
         if (armed) {
-            row.append(accountAction('Remove', locked, async () => {
+            actions.append(accountAction('Remove', locked, async () => {
                 try { return await cuimod.rpc('provider-picker.accountRemove', { id: account.id }); }
                 finally { accountRemoving = null; }
             }, true));
         } else {
-            row.append(accountAction(account.active ? 'Active' : 'Switch', locked || account.active,
+            actions.append(accountAction(account.active ? 'Active' : 'Switch', locked || account.active,
                 () => cuimod.rpc('provider-picker.accountSwitch', { id: account.id })));
         }
+        row.append(actions);
         accountPanel.append(row);
     }
     if (!accounts.length) {
@@ -263,7 +334,7 @@ function paintAccountPanel() {
         accountPanel.append(empty);
     }
     accountPanel.append(accountAction(login.phase === 'waiting' ? 'Finish sign-in in your browser…' : 'Sign in to another OpenAI account',
-        accountBusy || login.phase === 'waiting', () => cuimod.rpc('provider-picker.accountLogin')));
+        accountBusy || accountResetBusy !== null || login.phase === 'waiting', () => cuimod.rpc('provider-picker.accountLogin')));
     if (login.phase === 'error' && login.message) {
         const error = document.createElement('div');
         error.textContent = login.message;
@@ -607,7 +678,7 @@ const spec = {
     defaults: DEFAULTS, immediateSave: true,
     controls: [
         { key: 'openAIAccounts', type: 'custom', label: 'ChatGPT OAuth accounts', group: 'OpenAI account', wide: true,
-          hint: 'Add paid ChatGPT accounts and choose which one supplies the next GPT request. The × beside an account arms removal, which deletes its stored login; removing the active one selects another, and removing the last signs the Codex CLI out.', node: accountControl },
+          hint: 'Double-click an account’s reset-credit count to confirm spending one credit. Its weekly usage and remaining credits update from the API automatically. The × arms login removal; removing the active account selects another, and removing the last signs Codex out.', node: accountControl },
         { key: 'autoSwitchAccounts', type: 'toggle', label: 'Automatically switch accounts', group: 'OpenAI account',
           hint: 'When the active account reaches the weekly threshold, select the eligible account with the lowest main-model weekly usage.' },
         { key: 'autoSwitchWeeklyThreshold', type: 'number', label: 'Weekly switch threshold', min: 1, max: 100, group: 'OpenAI account',

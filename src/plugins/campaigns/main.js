@@ -367,8 +367,15 @@ module.exports = function (ctx) {
             (name, input, meta) => { ensure(state.api, 'campaign plugin unavailable'); return state.api.invoke(sid, name, input, meta); }));
         return state.servers.get(sid);
     }
+    // App 2.9939.4 made isCliProvablyIdle module-local; hasAgentRunInProgress
+    // plus the turn-result flag is the public equivalent (docs/internals.md).
+    function cliIdle(m, session) {
+        if (typeof m?.isCliProvablyIdle === 'function') return m.isCliProvablyIdle(session) === true;
+        if (typeof m?.hasAgentRunInProgress !== 'function' || !session.sessionId) return false;
+        return session.cliLastTurnMessageWasResult === true && !m.hasAgentRunInProgress(session.sessionId);
+    }
     function idle(session) {
-        if (!session?.query || !manager()?.isCliProvablyIdle(session)) return false;
+        if (!session?.query || !cliIdle(manager(), session)) return false;
         const tasks = session.activeBackgroundTasks;
         if (Array.isArray(tasks) && tasks.some(value => !['completed', 'failed', 'killed'].includes(value.status))) return false;
         if (tasks instanceof Map && tasks.size) return false;
@@ -469,6 +476,12 @@ module.exports = function (ctx) {
         m.on('event', state.listener);
     }
     function onEvent(event) {
+        // Streaming deltas and successful results do not change campaign state.
+        // Most sessions have no campaign: do not scan persisted campaigns, or
+        // broadcast a renderer refresh, for every token in every native chat.
+        if (event.type !== 'close' && !(event.type === 'message'
+            && ((event.message?.type === 'system' && event.message.subtype === 'init')
+                || (event.message?.type === 'result' && event.message.subtype !== 'success')))) return;
         const id = binding(event.sessionId);
         if (!id) return;
         const c = store.get(id);

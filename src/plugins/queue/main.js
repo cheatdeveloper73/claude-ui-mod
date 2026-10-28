@@ -476,11 +476,26 @@ module.exports = function (ctx) {
         return false;
     }
 
+    /* App 2.9939.4 moved isCliProvablyIdle off the manager into a module-local
+     * function (cliLastTurnMessageWasResult === true && no pending cycle, no
+     * pending interrupt result, no held steers or unechoed input). Its surviving
+     * public wrapper is hasAgentRunInProgress(sessionId), which is !idle once the
+     * CLI has reported a turn boundary. Before the first boundary it only checks
+     * the pending cycle and echoes, so the result flag is checked here as well.
+     * Erring loose is harmless: sendMessage defers a send it judges mid-turn. */
+    function idlePredicate(mgr) {
+        if (typeof mgr?.isCliProvablyIdle === 'function') return (sid, sess) => mgr.isCliProvablyIdle(sess);
+        if (typeof mgr?.hasAgentRunInProgress === 'function')
+            return (sid, sess) => sess.cliLastTurnMessageWasResult === true && !mgr.hasAgentRunInProgress(sid);
+        return null;
+    }
+
     function idleSession(sid) {
         const mgr = sessionManager();
         const sess = mgr?.sessions.get(sid);
-        if (!sess?.query || typeof mgr.isCliProvablyIdle !== 'function') return null;
-        try { return mgr.isCliProvablyIdle(sess) ? { mgr, sess } : null; }
+        const idle = idlePredicate(mgr);
+        if (!sess?.query || !idle) return null;
+        try { return idle(sid, sess) ? { mgr, sess } : null; }
         catch (_) { return null; }
     }
 
@@ -601,7 +616,7 @@ module.exports = function (ctx) {
         const mgr = sessionManager();
         return {
             manager: { found: !!mgr, sendMessage: typeof mgr?.sendMessage === 'function',
-                idlePredicate: typeof mgr?.isCliProvablyIdle === 'function' },
+                idlePredicate: !!idlePredicate(mgr) },
             queues: Object.fromEntries(Object.entries(read()).filter(([, value]) => Array.isArray(value) && value.length)
                 .map(([key, value]) => [key, value.length])),
             ready: [...readyAt.keys()],

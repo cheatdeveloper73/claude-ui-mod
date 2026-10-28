@@ -153,11 +153,39 @@ module.exports = function (ctx) {
         }
     }
 
+    // The native serializer forwards the CLI's Anthropic account gate even on
+    // GPT. The composer disables the switch before setFastMode can reach us.
+    // Project only billing/login reasons for Codex priority models; keep the raw
+    // worker report so switching back to Claude restores its restriction.
+    const billingReasons = new Set(['extra_usage_disabled', 'preference', 'free', 'not_first_party']);
+    const metadataGuards = new Map();
+    let priorityModels = new Set();
+    function billingGate(session) {
+        const model = String(session?.model || '').trim().toLowerCase().replace(/\[1m\]/g, '')
+            .replace(/:(none|minimal|low|medium|high|xhigh|max|ultra|pro)$/, '').replace(/^(?:claude-)+/, '');
+        return priorityModels.has(model) && billingReasons.has(session?.fastModeDisabledReason);
+    }
+    function guardMetadata(manager) {
+        const current = manager.formatSessionForEvent;
+        if (typeof current !== 'function' || metadataGuards.get(manager)?.wrapper === current) return;
+        const original = current.__cuimodFastMetadataOriginal || current;
+        const wrapper = function (session, ...rest) {
+            const result = original.call(this, session, ...rest);
+            return result && billingGate(session) ? { ...result, fastModeDisabledReason: undefined } : result;
+        };
+        wrapper.__cuimodFastMetadataOriginal = original;
+        manager.formatSessionForEvent = wrapper;
+        metadataGuards.set(manager, { original, wrapper });
+        for (const session of manager.sessions.values()) if (billingGate(session)) manager.emitSessionUpdated?.(session);
+    }
+
     // manager -> { original, wrapper }
     const wrapped = new Map();
     function attach() {
+        priorityModels = new Set(require('../provider-routing/main').codexFastSlugs());
         for (const manager of managers()) {
             guardCredits(manager);
+            guardMetadata(manager);
             const current = manager.setFastMode;
             if (wrapped.get(manager)?.wrapper === current) continue;
             // A newer host generation is built before this one is disposed;
@@ -191,6 +219,12 @@ module.exports = function (ctx) {
         for (const [manager, guards] of creditGuards) for (const [key, { original, wrapper }] of guards)
             if (manager[key] === wrapper) manager[key] = original;
         creditGuards.clear();
+        for (const [manager, { original, wrapper }] of metadataGuards) {
+            if (manager.formatSessionForEvent !== wrapper) continue;
+            manager.formatSessionForEvent = original;
+            for (const session of manager.sessions.values()) if (billingGate(session)) manager.emitSessionUpdated?.(session);
+        }
+        metadataGuards.clear();
     });
 
     function session(sessionId) {

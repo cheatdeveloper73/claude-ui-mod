@@ -68,13 +68,41 @@ function independent(campaign, task) {
 }
 function audit(campaign, kind, data) { campaign.events.push({ at: new Date().toISOString(), kind, ...data }); }
 
+const fileVersion = stat => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+
 class Store {
-    constructor(root) { this.root = root; }
+    constructor(root) { this.root = root; this.cached = new Map(); this.directoryVersion = null; this.ids = []; }
     filename(id) { ensure(/^[a-f0-9]{16}$/.test(id), 'invalid campaign id'); return path.join(this.root, id, 'campaign.json'); }
-    get(id) { return JSON.parse(fs.readFileSync(this.filename(id), 'utf8')); }
+    get(id) {
+        const file = this.filename(id);
+        // Stat on every access: external edits and atomic replacements are owner
+        // controls, not data we may hide behind a polling TTL or last-good value.
+        const version = fileVersion(fs.statSync(file, { bigint: true }));
+        let cached = this.cached.get(id);
+        if (!cached || cached.version !== version) {
+            this.cached.delete(id);
+            cached = { version, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
+            this.cached.set(id, cached);
+        }
+        // Callers mutate their snapshot before write/change; they must never
+        // mutate the cached persisted state through a borrowed nested object.
+        return structuredClone(cached.value);
+    }
     list() {
-        if (!fs.existsSync(this.root)) return [];
-        return fs.readdirSync(this.root).filter(id => /^[a-f0-9]{16}$/.test(id)).map(id => {
+        let version;
+        try { version = fileVersion(fs.statSync(this.root, { bigint: true })); }
+        catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+            this.directoryVersion = null; this.ids = []; this.cached.clear();
+            return [];
+        }
+        if (version !== this.directoryVersion) {
+            const ids = fs.readdirSync(this.root).filter(id => /^[a-f0-9]{16}$/.test(id));
+            const present = new Set(ids);
+            for (const id of this.cached.keys()) if (!present.has(id)) this.cached.delete(id);
+            this.ids = ids; this.directoryVersion = version;
+        }
+        return this.ids.map(id => {
             try { return this.get(id); } catch (error) { return { id, title: id, mode: 'unreadable', error: error.message }; }
         });
     }
@@ -83,6 +111,7 @@ class Store {
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.writeFileSync(file + '.new', JSON.stringify(campaign, null, 2));
         fs.renameSync(file + '.new', file);
+        this.cached.delete(campaign.id);
         return campaign;
     }
     change(id, fn) {

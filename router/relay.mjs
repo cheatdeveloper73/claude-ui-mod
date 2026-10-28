@@ -518,6 +518,7 @@ async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage,
     let buffer = '';
     let responseId = null;
     let duplicateTool = null;
+    let terminal = false;
 
     const prepareFrame = frame => {
         if (!frame) return null;
@@ -561,6 +562,12 @@ async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage,
         const prepared = prepareFrame(frame);
         if (!prepared) return false;
         const event = prepared.event;
+        if (options.stopOnMessageStop && event?.type === 'message_stop')
+        {
+            await writePrepared(prepared);
+            terminal = true;
+            return true;
+        }
         if (!stopOnDuplicateToolCall || !event)
         {
             await writePrepared(prepared);
@@ -639,6 +646,14 @@ async function pipeAnthropicBody(upstream, res, clientModel, streaming, onUsage,
     finally { downstream.dispose(); }
 
     if (downstream.canceled()) return null;
+    if (terminal)
+    {
+        // message_stop owns the completed turn. Cancel only this HTTP/2 stream;
+        // waiting for EOF can hold up tools or admit a late transport failure.
+        try { await reader.cancel(); } catch (_) {}
+        res.end();
+        return null;
+    }
 
     if (!duplicateTool)
     {

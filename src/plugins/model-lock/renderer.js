@@ -14,10 +14,25 @@
 
 // Both the root ModelSelector popup and its nested "More models" submenu carry
 // model rows, and a pick from either is a pick.
+//
+// The 2026-09-19 frontend moved the root onto the generic CDS Menu and stopped
+// emitting data-model-id on its rows (see provider-picker/renderer.js), so a row
+// no longer says whether it is a model or an effort choice. Matching only
+// data-model-id rows meant no model pick ever armed, and every provider-to-Claude
+// switch was refused as reconciliation. A pick anywhere in the selector -- the
+// root opened from the composer, or any nested submenu -- now authorizes both
+// writes on the visible session, the same as /model. Reconciliation fires with
+// no menu open, which is the only distinction the main half needs.
 const MENU = '[role="menu"]';
-const ROW = '[role="menuitemradio"][data-model-id]';
 const RADIO = '[role="menuitemradio"]';
 const REFRESH_MS = 4000;
+
+function selectorMenu(menu) {
+    if (!menu?.querySelector(RADIO)) return false;
+    if (menu.querySelector('[data-model-id]') || menu.hasAttribute('data-nested')) return true;
+    const trigger = document.getElementById(menu.getAttribute('aria-labelledby') || '');
+    return !!trigger?.closest?.('.epitaxy-prompt');
+}
 
 let enabled = true;
 const lastArm = new Map();
@@ -39,29 +54,20 @@ function arm(kind, reason) {
     cuimod.rpc('model-lock.arm', { sessionId, kind }).catch(() => { /* host reloading; the next one retries */ });
 }
 
-function menuKinds() {
-    const kinds = new Set();
-    for (const menu of document.querySelectorAll(MENU)) {
-        if (menu.querySelector(ROW)) kinds.add('model');
-        else if (menu.hasAttribute('data-nested') && menu.querySelector(RADIO)) kinds.add('effort');
-    }
-    return kinds;
-}
-
-ctx.every(500, () => { for (const kind of menuKinds()) arm(kind, 'menu'); });
+ctx.every(500, () => {
+    if (![...document.querySelectorAll(MENU)].some(selectorMenu)) return;
+    arm('model', 'menu'); arm('effort', 'menu');
+});
 
 // pointerdown, not click: it precedes the app's own handler, so the arming RPC
-// is already in flight by the time the invoke is built. Model and effort picks
-// authorize only their own write on the session currently visible in this view.
+// is already in flight by the time the invoke is built. Only the session
+// currently visible in this view is authorized.
 ctx.track(document, 'pointerdown', (e) => {
     const row = e.target.closest?.(RADIO);
-    if (!row) return;
-    const menu = row.closest?.(MENU);
-    const kind = row.matches(ROW) ? 'model' : menu?.hasAttribute('data-nested') ? 'effort' : null;
-    if (!kind) return;
+    if (!row || !selectorMenu(row.closest?.(MENU))) return;
     const sessionId = desktopSessionId();
-    if (sessionId) lastArm.delete(sessionId + ':' + kind);
-    arm(kind, 'row');
+    if (sessionId) { lastArm.delete(sessionId + ':model'); lastArm.delete(sessionId + ':effort'); }
+    arm('model', 'row'); arm('effort', 'row');
 }, true);
 
 // /model never opens the popup. The command deliberately owns the complete

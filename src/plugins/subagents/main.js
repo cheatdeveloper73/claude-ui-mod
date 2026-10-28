@@ -76,7 +76,18 @@ module.exports = function (ctx) {
     // The project slug is derived from the cwd, so rather than reproduce that
     // mangling, look for the session that lives in it.
     const projCache = new Map();   // cliSid -> { dir, at }
-    function projectDirFor(cliSid) {
+    // A remote session is read from Desktop's mirror of it, which is flat: the
+    // parent and every agent-*.jsonl sit together in projects/ssh-<cliSid>.
+    // Whatever runs remote sessions registers the source; with none, every
+    // session is local.
+    const remoteSource = () => globalThis[Symbol.for('cuimod.remote.transcript-source')] || null;
+    function nativeDirFor(cliSid, desktopSessionId) {
+        const source = remoteSource();
+        return desktopSessionId && source ? source.directory(cliSid, desktopSessionId) : null;
+    }
+    function projectDirFor(cliSid, desktopSessionId) {
+        const native = nativeDirFor(cliSid, desktopSessionId);
+        if (native) return fs.existsSync(native) ? native : null;
         const hit = projCache.get(cliSid);
         if (hit && Date.now() - hit.at < 60000) return hit.dir;
         let dirs = [];
@@ -255,18 +266,24 @@ module.exports = function (ctx) {
      * transcript that says `stopped` is more specific than the notification.
      *
      * The one way back to running is the transcript being written after the
-     * notification, which is precisely a resume - hence the mtime comparison
+     * notification, which is precisely a resume - hence the time comparison
      * rather than a flag. The second of slack absorbs the ordering of the
      * agent's final write against the notification of it; anything larger would
      * hold a resumed agent dead for that long, and it is only a poll away
      * either way.
      *
+     * "Written" is the newest timestamp inside the transcript, not the file's
+     * mtime. Desktop's mirror of a remote session rewrites every agent file on
+     * a resync, which stamped 87 long-finished agents as resumed at once, and
+     * the CLI appends untimestamped records to agents that ended long ago.
+     *
      * `failed` and `killed` both land on 'stopped'. Only `completed` is an
      * agent that reached its own end. */
     const MTIME_SLACK = 1000;
+    const writtenAt = (row, st) => (Number.isFinite(row.lastMs) ? row.lastMs : st.mtimeMs);
     function applyEnd(row, st, end) {
         if (!end || row.state !== 'inflight') return;
-        if (end.at < st.mtimeMs - MTIME_SLACK) return;
+        if (end.at < writtenAt(row, st) - MTIME_SLACK) return;
         row.state = end.status === 'completed' ? 'done' : 'stopped';
         row.endedAt = end.at;
         row.endStatus = end.status;
@@ -303,6 +320,9 @@ module.exports = function (ctx) {
 
         const first = head[0];
         const last = tail.length ? tail[tail.length - 1] : first;
+        let lastMs = NaN;
+        for (let i = tail.length - 1; i >= 0 && !Number.isFinite(lastMs); i--) lastMs = Date.parse(tail[i].timestamp);
+        if (!Number.isFinite(lastMs)) lastMs = Date.parse(first.timestamp);
 
         // Most recent signals, walked backwards: what it said last, and what
         // tool it reached for last (which is "what it is doing" for a live one).
@@ -329,7 +349,8 @@ module.exports = function (ctx) {
             size: st.size,
             mtime: st.mtimeMs,
             startedAt: first.timestamp || null,
-            lastAt: last.timestamp || null,
+            lastAt: Number.isFinite(lastMs) ? new Date(lastMs).toISOString() : (last.timestamp || null),
+            lastMs: Number.isFinite(lastMs) ? lastMs : null,
             attribution: null,
             model,
             effort,
@@ -348,19 +369,49 @@ module.exports = function (ctx) {
         return row;
     }
 
-    function listAgents(cliSid) {
-        const proj = projectDirFor(cliSid);
+    /* The mirror copies agent-*.jsonl only and leaves the meta sidecars on the
+     * remote host, so a remote session's nested agents had no parent and no
+     * name and were listed flat beside the agents that spawned them. They are
+     * fetched from the host instead: one flight per session, only while an
+     * agent is unresolved, and an id the host has no sidecar for is not asked
+     * about again. */
+    const remoteMeta = new Map();   // cliSid -> { metas, absent, flight }
+    function nativeMeta(cliSid, desktopSessionId, ids) {
+        let entry = remoteMeta.get(cliSid);
+        if (!entry) remoteMeta.set(cliSid, entry = { metas: new Map(), absent: new Set(), flight: null });
+        const known = new Set([...entry.metas.keys(), ...entry.absent]);
+        if (!entry.flight && ids.some((id) => !known.has(id))) {
+            const asked = ids.filter((id) => !known.has(id));
+            entry.flight = Promise.resolve()
+                .then(() => remoteSource()?.readSubagentMeta(cliSid, desktopSessionId, known))
+                .then((out) => {
+                    if (!out) return;
+                    for (const [id, meta] of Object.entries(out.metas)) entry.metas.set(id, meta);
+                    const present = new Set(out.present);
+                    for (const id of asked) if (!present.has(id)) entry.absent.add(id);
+                })
+                .catch(() => { /* link loss keeps what was read; the next poll asks again */ })
+                .finally(() => { entry.flight = null; });
+        }
+        return entry.metas;
+    }
+
+    function listAgents(cliSid, desktopSessionId) {
+        const proj = projectDirFor(cliSid, desktopSessionId);
         if (!proj) return { ok: false, reason: 'no project dir for ' + cliSid };
-        const dir = path.join(proj, cliSid, 'subagents');
+        const flat = path.basename(proj) === 'ssh-' + cliSid;
+        const dir = flat ? proj : path.join(proj, cliSid, 'subagents');
         let names = [];
         try { names = fs.readdirSync(dir); } catch (_) { names = []; }
+        // Desktop's own filter. In a flat mirror the parent sits here too.
+        names = names.filter((n) => n.startsWith('agent-') && n.endsWith('.jsonl'));
+        const remote = flat ? nativeMeta(cliSid, desktopSessionId, names.map((n) => n.slice(6, -6))) : null;
 
         const parent = parentTable(path.join(proj, cliSid + '.jsonl'));
         const join = parent.spawns;
         const now = Date.now();
         const rows = [];
         for (const n of names) {
-            if (!n.endsWith('.jsonl')) continue;
             const file = path.join(dir, n);
             let st = null;
             try { st = fs.statSync(file); } catch (_) { continue; }
@@ -370,7 +421,7 @@ module.exports = function (ctx) {
             const row = { ...cachedRow };
             applyEnd(row, st, parent.ended.get(row.agentId));
             const j = join.get(row.agentId) || {};
-            const meta = metaFor(file) || {};
+            const meta = metaFor(file) || (remote && remote.get(row.agentId)) || {};
             rows.push(Object.assign(row, {
                 name: meta.name || j.name || null,
                 description: meta.description || j.description || null,
@@ -381,11 +432,12 @@ module.exports = function (ctx) {
                 isolation: j.isolation || null,
                 outputFile: j.outputFile || null,
                 spawnedAt: j.spawnedAt || row.startedAt,
-                idleFor: now - st.mtimeMs,
+                idleFor: now - writtenAt(row, st),
             }));
         }
         // Newest first inside each group; the view groups by active.
-        rows.sort((a, b) => b.mtime - a.mtime);
+        const order = (r) => (Number.isFinite(r.lastMs) ? r.lastMs : r.mtime);
+        rows.sort((a, b) => order(b) - order(a));
         return { ok: true, cliSid, dir, agents: rows, spawned: join.size,
             named: rows.filter((r) => r.name).length, at: now };
     }
@@ -442,9 +494,10 @@ module.exports = function (ctx) {
         const o = opts || {};
         const gapMs = Number(o.gapMs) || 90000;
         const maxTurns = Number(o.maxTurns) || 400;
-        const proj = projectDirFor(cliSid);
+        const proj = projectDirFor(cliSid, o.desktopSessionId);
         if (!proj) return { ok: false, reason: 'no project dir' };
-        const file = path.join(proj, cliSid, 'subagents', 'agent-' + agentId + '.jsonl');
+        const dir = path.basename(proj) === 'ssh-' + cliSid ? proj : path.join(proj, cliSid, 'subagents');
+        const file = path.join(dir, 'agent-' + agentId + '.jsonl');
         let state;
         try { state = details.read(file, String(gapMs)); }
         catch (_) { return { ok: false, reason: 'no transcript' }; }
@@ -538,7 +591,7 @@ module.exports = function (ctx) {
     ctx.method('list', (p) => {
         const sid = p && p.cliSid;
         if (typeof sid !== 'string' || !SESSION_RE.test(sid)) return { ok: false, reason: 'bad session id' };
-        return listAgents(sid);
+        return listAgents(sid, p.desktopSessionId);
     });
 
     ctx.method('detail', (p) => {
@@ -554,14 +607,14 @@ module.exports = function (ctx) {
         const id = p && p.agentId;
         if (typeof sid !== 'string' || !SESSION_RE.test(sid)) return { ok: false, reason: 'bad session id' };
         if (typeof id !== 'string' || !/^[0-9a-z]{4,40}$/i.test(id)) return { ok: false, reason: 'bad agent id' };
-        const list = listAgents(sid);
+        const list = listAgents(sid, p.desktopSessionId);
         if (!list.ok) return list;
         const agent = list.agents.find((a) => a.agentId === id);
         if (!agent) return { ok: false, reason: 'no agent transcript' };
         const parentId = agent.parentAgentId && /^[0-9a-z]{4,40}$/i.test(agent.parentAgentId)
             ? agent.parentAgentId : null;
         const parent = parentId && list.agents.find((a) => a.agentId === parentId);
-        const proj = projectDirFor(sid);
+        const proj = projectDirFor(sid, p.desktopSessionId);
         const aliases = new Map();
         for (const a of list.agents) if (a.name) aliases.set(a.name, (aliases.get(a.name) || 0) + 1);
         let brief = '';
@@ -590,5 +643,5 @@ module.exports = function (ctx) {
         try { ctx.electron.shell.showItemInFolder(f); return true; } catch (_) { return false; }
     });
 
-    ctx.onDispose(() => { projCache.clear(); joins.clear(); details.clear(); rowCache.clear(); metaCache.clear(); conversations.clear(); defsCache = null; });
+    ctx.onDispose(() => { projCache.clear(); remoteMeta.clear(); joins.clear(); details.clear(); rowCache.clear(); metaCache.clear(); conversations.clear(); defsCache = null; });
 };

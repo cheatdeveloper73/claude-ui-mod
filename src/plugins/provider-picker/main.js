@@ -217,6 +217,7 @@ module.exports = function (ctx) {
     ctx.method('catalogue', () => { const value = refreshCatalogue(); return { models: value.models, providers: value.providers }; });
     ctx.method('accountStatus', () => accounts.status());
     ctx.method('accountUsage', p => accounts.usage(p?.force === true));
+    ctx.method('accountResetCredit', p => accounts.consumeResetCredit(p?.id));
     ctx.method('accountSwitch', p => accounts.switchAccount(p?.id));
     ctx.method('accountRemove', p => accounts.removeAccount(p?.id));
     ctx.method('accountLogin', () => accounts.startLogin());

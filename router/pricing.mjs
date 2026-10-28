@@ -56,6 +56,23 @@ const RATES = {
           input: 0.20, cacheRead: 0.02, cacheWrite5m: 0.25, cacheWrite1h: 0.25, output: 1.20 },
     ],
 
+    // Fireworks serverless, standard tier. Verified against
+    // docs.fireworks.ai/serverless/pricing on 2026-10-06 and against Fireworks'
+    // own billing/summary unit amounts for the same day ($0.30 / $0.006 / $1.20
+    // per 1M, to the nanodollar). Fireworks charges nothing for cache writes.
+    'fireworks/accounts/fireworks/models/deepseek-v4p1-flash': [
+        { from: null, to: null,
+          input: 0.30, cacheRead: 0.006, cacheWrite5m: 0.30, cacheWrite1h: 0.30, output: 1.20 },
+    ],
+
+    // Fireworks serverless GLM 5.3 (accounts/fireworks/models/glm-5p3), standard
+    // tier, from fireworks.ai/models/fireworks/glm-5p3 on 2026-10-13. Fireworks
+    // charges nothing for cache writes. Not yet checked against billing/summary.
+    'fireworks/accounts/fireworks/models/glm-5p3': [
+        { from: null, to: null,
+          input: 1.40, cacheRead: 0.26, cacheWrite5m: 0, cacheWrite1h: 0, output: 4.40 },
+    ],
+
     // Anthropic first-party API. Verified against
     // docs.claude.com/en/docs/about-claude/pricing on 2026-09-03. Cache reads
     // bill at 0.1x input -- 0.025x on Fable 5.1, 0.05x on Opus 5.5 -- and cache

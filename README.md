@@ -21,7 +21,7 @@ relay. Optional; see [voice-agent/README.md](voice-agent/README.md).
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![platform: Windows](https://img.shields.io/badge/platform-Windows-0078d4.svg)](#requirements)
-[![version: 1.2.0](https://img.shields.io/badge/version-1.2.0-informational.svg)](CHANGELOG.md)
+[![version: 1.3.0](https://img.shields.io/badge/version-1.3.0-informational.svg)](CHANGELOG.md)
 [![node: >=18](https://img.shields.io/badge/node-%3E%3D18-339933.svg)](#requirements)
 
 > Unofficial and unaffiliated with Anthropic. It rewrites files inside your

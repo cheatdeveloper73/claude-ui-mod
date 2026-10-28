@@ -15,8 +15,8 @@ const body = { model: 'claude-gpt-5.6-sol[1m]', output_config: { effort: 'high' 
 
 test('GPT-6 Sol and Luna use the verified catalogue contract', () => {
     assert.equal(CODEX_CLIENT_VERSION, '0.159.0');
-    assert.deepEqual(OPENAI_MODELS.slice(0, 4).map(model => model.id), [
-        'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+    assert.deepEqual(OPENAI_MODELS.slice(0, 5).map(model => model.id), [
+        'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
     ]);
     const next = OPENAI_MODELS.find(entry => entry.id === 'gpt-6.1-sol');
     assert.deepEqual(next.efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
@@ -37,6 +37,22 @@ test('GPT-6 Sol and Luna use the verified catalogue contract', () => {
     }
     assert.deepEqual(parseOpenAIModel('claude-gpt-6-sol[1m]:ultra'), {
         id: 'gpt-6-sol', effort: 'medium', known: true, rejectedEffort: 'ultra',
+    });
+});
+
+test('GPT-6.1 Terra is selectable and routes with its supported effort', () => {
+    const catalogue = JSON.parse(fs.readFileSync(new URL('../src/plugins/provider-picker/catalogue.json', import.meta.url)));
+    const picker = catalogue.find(model => model.id === 'gpt-6.1-terra');
+    assert.equal(picker?.name, 'GPT-6.1-Terra');
+    assert.equal(picker?.provider, 'openai');
+    assert.equal(picker?.context, 1050000);
+    assert.deepEqual(picker?.efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.equal(picker?.defaultEffort, 'low');
+    const route = OPENAI_MODELS.find(model => model.id === picker?.id);
+    assert.equal(route?.context, picker?.context);
+    assert.equal(route?.maxOutput, picker?.maxOutput);
+    assert.deepEqual(parseOpenAIModel('claude-gpt-6.1-terra[1m]:max'), {
+        id: 'gpt-6.1-terra', effort: 'max', known: true, rejectedEffort: null,
     });
 });
 

@@ -160,43 +160,6 @@ const CSS = `
 .tip .more:hover { background: color-mix(in srgb, hsl(var(--accent-100, 210 71% 52%)) 22%, transparent); }
 `;
 
-// ---------------------------------------------------------------- composer
-
-function visible(el) {
-    const r = el.getBoundingClientRect();
-    return r.width > 40 && r.height > 20 && r.bottom > 0 && r.top < innerHeight;
-}
-
-function findComposer() {
-    const eds = Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible);
-    if (!eds.length) return null;
-    // The prompt input is the bottom-most editable region on the page.
-    eds.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
-    let node = eds[0];
-    const base = node.getBoundingClientRect();
-    // Climb to the visual box the editor sits in: the nearest ancestor that has
-    // a real rounded border and is not dramatically wider than the editor.
-    for (let i = 0, p = node.parentElement; i < 6 && p; i++, p = p.parentElement) {
-        const r = p.getBoundingClientRect();
-        if (r.width > base.width * 1.8 || r.height > base.height + 240) break;
-        const cs = getComputedStyle(p);
-        if (parseFloat(cs.borderTopLeftRadius) >= 8) node = p;
-    }
-    return node;
-}
-
-function sidebarRight() {
-    // The desktop shell's session sidebar. It is collapsible, so a hit that is
-    // not a tall left-anchored panel is treated as "no sidebar".
-    for (const el of document.querySelectorAll('.dframe-sidebar, aside, nav')) {
-        const r = el.getBoundingClientRect();
-        if (r.left > 2 || r.width < 100 || r.width > innerWidth * 0.5) continue;
-        if (r.height < innerHeight * 0.5) continue;
-        return r.right;
-    }
-    return 0;
-}
-
 // ---------------------------------------------------------------- render
 
 function taskRow(t, expanded) {
@@ -246,8 +209,7 @@ function taskRow(t, expanded) {
 
 function install(cuimod, ctx) {
     // A stale host from a previous generation would double-render.
-    const stale = document.getElementById('cuimod-host');
-    if (stale) stale.remove();
+    for (const stale of document.querySelectorAll('#cuimod-host')) stale.remove();
 
     const host = document.createElement('div');
     host.id = 'cuimod-host';
@@ -590,73 +552,42 @@ function install(cuimod, ctx) {
     let composer = null;
     let baseH = 0;   // composer height with an empty prompt
 
-    function place() {
-        // Re-find every pass. The app re-renders its composer, and the old node
-        // can stay *connected* while no longer being the real input — caching on
-        // isConnected parks the rail on a ghost with no way back.
-        const found = findComposer();
+    const schedulePlace = ctx.layout((layout) => {
+        // Shell invalidation re-evaluates every editable candidate, including a
+        // still-connected old input. isConnected alone is not an identity test.
+        const hosts = layout.queryAll('#cuimod-host');
+        const found = layout.railComposer();
         if (found !== composer) { composer = found; baseH = 0; }
-        if (!composer) { rail.classList.remove('show'); return; }
-
-        // A generation that failed to dispose would leave a second, frozen rail.
-        const hosts = document.querySelectorAll('#cuimod-host');
-        if (hosts.length > 1) for (const el of hosts) { if (el !== host) el.remove(); }
-        const r = composer.getBoundingClientRect();
-        if (r.width < 40) { rail.classList.remove('show'); return; }
-
-        // Centre the rail in the gutter between the app sidebar and the composer.
-        const gl = sidebarRight() + GAP;
-        const gr = r.left - GAP;
-        const avail = gr - gl;
-        if (avail < MIN_WIDTH) { rail.classList.remove('show'); return; }
+        if (!composer) return null;
+        const r = layout.rect(composer);
+        if (r.width < 40) return null;
+        const gl = layout.sidebarRight() + GAP;
+        const avail = r.left - GAP - gl;
+        if (avail < MIN_WIDTH) return null;
         const w = Math.min(WIDTH, avail);
-        const left = Math.round(gl + (avail - w) / 2);
-
-        // Bottom edge flush with the composer box. Collapsed, the rail takes the
-        // composer's exact height so both boxes share top and bottom edges;
-        // expanded it grows upward from that same bottom edge.
-        // The composer grows upward as a prompt wraps. Collapsed, the rail
-        // matches the *empty* composer instead of following it up the screen —
-        // the smallest height seen since the last resize is that baseline.
         const ch = Math.round(r.height);
         if (ch >= 24 && (!baseH || ch < baseH)) baseH = ch;
-
         const bottom = Math.max(8, innerHeight - r.bottom);
         const h = collapsed ? (baseH || ch) : 0;
-        const maxH = Math.min(460, innerHeight - bottom - 24);
-
-        // expanded/collapsed live in localStorage and are untouched by hiding,
-        // so the panel returns in the state it left in.
-        rail.classList.toggle('show', tasks.length > 0 || Date.now() < holdUntil);
-
+        return { hosts, left: Math.round(gl + (avail - w) / 2), bottom, w, h,
+            maxH: Math.min(460, innerHeight - bottom - 24),
+            show: tasks.length > 0 || Date.now() < holdUntil };
+    }, (value) => {
+        if (!value) { rail.classList.remove('show'); return; }
+        for (const stray of value.hosts) if (stray !== host) stray.remove();
+        rail.classList.toggle('show', value.show);
         const set = (prop, val) => { if (rail.style[prop] !== val) rail.style[prop] = val; };
-        set('left', left + 'px');
-        set('bottom', bottom + 'px');
-        set('width', w + 'px');
+        set('left', value.left + 'px'); set('bottom', value.bottom + 'px'); set('width', value.w + 'px');
         if (!tweening) {
-            set('height', h ? h + 'px' : '');
-            set('maxHeight', h ? '' : maxH + 'px');
+            set('height', value.h ? value.h + 'px' : '');
+            set('maxHeight', value.h ? '' : value.maxH + 'px');
         }
-    }
-
-    let raf = 0;
-    function schedulePlace() {
-        if (raf) return;
-        raf = requestAnimationFrame(() => { raf = 0; place(); });
-    }
-
-    // All via ctx so a hot reload disposes them; leaking these into a
-    // long-running window is what makes naive reloading unsafe.
+    });
+    // Interactive height tweens need their target immediately; background shell
+    // invalidations use the shared read-before-write frame instead.
+    function place() { schedulePlace.flush(); }
     ctx.track(window, 'resize', () => { baseH = 0; schedulePlace(); }, { passive: true });
-    ctx.track(window, 'scroll', schedulePlace, { passive: true, capture: true });
-    // A hidden window throttles both rAF and timers, so its geometry goes stale;
-    // re-place the moment it comes back rather than waiting for the next tick.
-    ctx.track(document, 'visibilitychange', schedulePlace);
-    ctx.observe(document.documentElement, { childList: true, subtree: true }, schedulePlace);
-    // rAF is throttled to zero in a hidden/occluded window, so the periodic
-    // tick calls place() directly rather than through the rAF coalescer.
-    ctx.every(1000, place);
-    ctx.onDispose(() => { if (raf) cancelAnimationFrame(raf); host.remove(); });
+    ctx.onDispose(() => host.remove());
 
     // ---- data ----
     async function load() {
@@ -686,11 +617,8 @@ install(cuimod, ctx);
 (function dashboardPanel() {
     const sheet = new CSSStyleSheet();
 
-    function railRoots() {
-        return [...document.querySelectorAll('#cuimod-host')]
-            .map((h) => h.shadowRoot)
-            .filter((r) => r);
-    }
+    const root = document.getElementById('cuimod-host')?.shadowRoot;
+    function railRoots() { return root ? [root] : []; }
     function attach() {
         for (const root of railRoots()) {
             if (!root.adoptedStyleSheets.includes(sheet)) {
@@ -761,9 +689,7 @@ ${sel} .pv-r.d { color: hsl(var(--text-500, 48 5% 57%)); text-decoration: line-t
         cuimod.rpc('task-rail.autoOpen', { suppress: v.blockNativeAutoOpen !== false }).catch(() => {});
     }
 
-    // The rail's host is created once at install, but a reload can race it and
-    // a future generation may rebuild it, so re-attach on a slow tick.
-    ctx.every(2000, attach);
+    // This generation owns one stable host and its adopted sheets.
     ctx.onDispose(detach);
 
     const spec = {

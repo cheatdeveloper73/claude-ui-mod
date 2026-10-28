@@ -1,0 +1,10 @@
+Files from https://huggingface.co/zai-org/GLM-5.3-Flash
+at revision 46a050bec13002ad29ee795c16e61cf4fa3c4a9c, unmodified.
+30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1 *LICENSE
+2614a3c896d53e265f564c23701173c0049f985dacfbae79fc4bcd9f5ba083f4 *chat_template.jinja
+aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed *processor_config.json
+19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d *tokenizer.json
+98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc *tokenizer_config.json
+
+GLM-5.3-Flash is MIT licensed; see LICENSE. tokenizer.json is byte-identical to glm-5.3/tokenizer.json.
+Used by router/adapters/abstract for exact counts.

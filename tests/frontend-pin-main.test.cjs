@@ -44,6 +44,9 @@ class FakeDebugger extends EventEmitter {
         const call = { method, params, ...(sessionId ? { sessionId } : {}) };
         this.commands.push(call);
         this.emit('command', call);
+        if (method === 'Runtime.evaluate') {
+            return { result: { type: 'boolean', value: this.page?.pinnedPage === true && params.expression.includes('index-Cuw5J4F9.js') } };
+        }
         if (method === 'Fetch.getResponseBody') {
             return { body: Buffer.from(this.documentBody, 'utf8').toString('base64'), base64Encoded: true };
         }
@@ -58,15 +61,20 @@ class FakeWebContents extends EventEmitter {
         this.url = url;
         this.dead = false;
         this.reloads = 0;
+        this.loads = [];
         this.mainFrame = { id: 'frame-' + id };
         this.debugger = new FakeDebugger(debuggerAttached, raceOnAttach);
+        this.debugger.page = this;
     }
     getURL() { return this.url; }
     getType() { return 'window'; }
     isDestroyed() { return this.dead; }
     isLoadingMainFrame() { return this.loading === true; }
     reload() { this.reloads++; }
+    loadURL(url) { this.loads.push(url); return Promise.resolve(); }
     async executeJavaScript(code) {
+        // Electron defers executeJavaScript until a loading main frame stops.
+        if (this.deferScripts) return new Promise(() => {});
         return this.pinnedPage === true && code.includes('index-Cuw5J4F9.js');
     }
 }
@@ -311,6 +319,109 @@ test('arms a newly created Code view before its document finishes', async () => 
     await h.settle();
 });
 
+// 8 of 19 cold launches (2026-10-11..20) loaded the live release for 3-13 s
+// because the document request started before Fetch.enable returned.
+test('a Code navigation that started before the gate was armed is re-issued once', async () => {
+    const contents = [];
+    const h = harness(contents);
+    const wc = new FakeWebContents(14, 'about:blank');
+    contents.push(wc);
+    h.app.emit('web-contents-created', {}, wc);
+    const url = 'https://claude.ai/epitaxy?coldLaunch=1';
+    wc.url = url;
+    wc.emit('did-start-navigation', {}, url, false, true);
+    await h.settle();
+    assert.deepEqual(wc.loads, [url]);
+
+    wc.emit('did-start-navigation', {}, url, false, true);
+    await h.settle();
+    assert.deepEqual(wc.loads, [url]);
+    const release = await beginRelease(h, wc);
+    assert.equal(release.method, 'Fetch.fulfillRequest');
+    assert.deepEqual(wc.loads, [url]);
+    h.dispose();
+});
+
+// 2026-10-20 05:41: the second logout of a session came back up live and
+// stayed live for ten minutes because the live-page recovery was one-shot.
+test('every live page in a view gets its recovery reload, not only the first', async () => {
+    const wc = new FakeWebContents(15, 'https://claude.ai/epitaxy/local_relogin');
+    const h = harness([wc]);
+    await h.settle();
+    const relogin = async () => {
+        wc.url = 'https://claude.ai/login?from=logout';
+        wc.emit('did-start-navigation', {}, wc.url, false, true);
+        wc.emit('did-finish-load');
+        await h.settle();
+        wc.url = 'https://claude.ai/epitaxy';
+        wc.emit('did-start-navigation', {}, wc.url, true, true);
+        await h.settle();
+        return h.methods.get('reloadLive')({}, { sender: wc, senderFrame: wc.mainFrame });
+    };
+
+    assert.equal(await relogin(), true);
+    await h.settle();
+    assert.equal(wc.reloads, 1);
+    await beginRelease(h, wc);
+    wc.mainFrame = { id: 'frame-15-pinned' };
+    wc.emit('did-finish-load');
+    assert.equal(h.methods.get('healthy')({ ready: true, timeOrigin: 5000 },
+        { sender: wc, senderFrame: wc.mainFrame }), true);
+    assert.equal(await relogin(), true);
+    await h.settle();
+    assert.equal(wc.reloads, 2);
+    h.dispose();
+});
+
+// 2026-10-20 16:43: one fail-open left the view live until a host reload
+// happened to create a fresh generation.
+test('a failed view re-arms the gate after a backoff', async () => {
+    const wc = new FakeWebContents(16, 'https://claude.ai/epitaxy/local_retry');
+    const h = harness([wc]);
+    await h.settle();
+    for (let i = 0; i < 2; i++) {
+        wc.emit('did-start-navigation', {}, wc.url, false, true);
+        await h.settle();
+        wc.emit('did-finish-load');
+        await h.settle();
+    }
+    assert.equal(wc.debugger.isAttached(), false);
+    assert.match(h.methods.get('status')({}, { sender: wc }).failed, /did not see the document response/);
+
+    for (const interval of h.intervals) interval();
+    await h.settle();
+    assert.equal(wc.debugger.isAttached(), false);
+
+    const realNow = Date.now;
+    Date.now = () => realNow() + 16000;
+    try { for (const interval of h.intervals) interval(); }
+    finally { Date.now = realNow; }
+    await h.settle();
+    assert.equal(wc.debugger.isAttached(), true);
+    assert.equal(h.methods.get('status')({}, { sender: wc }).failed, null);
+    assert.equal(h.methods.get('reloadLive')({}, { sender: wc, senderFrame: wc.mainFrame }), true);
+    await h.settle();
+    assert.equal(wc.reloads, 2);
+    h.dispose();
+});
+
+// A failed load commits an error page, which fires did-finish-load like any
+// document; it is not the release gate missing a Code document.
+test('a failed document load leaves the gate armed instead of counting a miss', async () => {
+    const wc = new FakeWebContents(17, 'https://claude.ai/epitaxy?coldLaunch=1');
+    const h = harness([wc]);
+    await h.settle();
+    wc.emit('did-start-navigation', {}, wc.url, false, true);
+    await h.settle();
+    wc.emit('did-fail-load', {}, -106, 'ERR_INTERNET_DISCONNECTED', wc.url, true);
+    wc.emit('did-finish-load');
+    await h.settle();
+    assert.equal(wc.reloads, 0);
+    assert.equal(h.methods.get('status')({}, { sender: wc }).failed, null);
+    assert.equal(wc.debugger.isAttached(), true);
+    h.dispose();
+});
+
 test('does not open a release transaction for in-page navigation', async () => {
     const wc = new FakeWebContents(5, 'https://claude.ai/epitaxy/local_route');
     const h = harness([wc]);
@@ -417,6 +528,44 @@ test('a new generation adopts an already-open pinned page for bootstrap refetche
     const untouched = await boot(liveView, 'untouched');
     assert.deepEqual(untouched, { method: 'Fetch.continueRequest', params: { requestId: 'untouched' } });
     h.dispose();
+});
+
+// 2026-10-21 18:48:08: a generation that attached during the cold launch let a
+// bootstrap through before its adopt probe resolved, and the pinned page ran
+// on live flags until the next refetch.
+test('a generation that has not adopted the open page yet still pins its bootstrap', async () => {
+    const wc = new FakeWebContents(18, 'https://claude.ai/epitaxy?coldLaunch=1');
+    wc.loading = true;
+    wc.pinnedPage = true;
+    wc.deferScripts = true;
+    const h = harness([wc]);
+    await h.settle();
+    wc.debugger.documentBody = JSON.stringify({ org_growthbook: { features: { 3413676205: { defaultValue: true } } } });
+    wc.debugger.emit('message', {}, 'Fetch.requestPaused', {
+        requestId: 'early-boot', resourceType: 'Fetch', responseStatusCode: 200, responseHeaders: [],
+        request: { url: 'https://claude.ai/edge-api/bootstrap/org-1/app_start?x=1' },
+    });
+    await h.settle();
+    await h.settle();
+    const call = wc.debugger.commands.find((item) => item.params?.requestId === 'early-boot' && item.method !== 'Fetch.getResponseBody');
+    assert.equal(call.method, 'Fetch.fulfillRequest');
+    const out = JSON.parse(Buffer.from(call.params.body, 'base64').toString('utf8'));
+    assert.deepEqual(out.org_growthbook.features[3413676205], { defaultValue: false });
+
+    const live = new FakeWebContents(19, 'https://claude.ai/epitaxy/local_live');
+    const h2 = harness([live]);
+    await h2.settle();
+    live.debugger.documentBody = JSON.stringify({ org_growthbook: { features: {} } });
+    live.debugger.emit('message', {}, 'Fetch.requestPaused', {
+        requestId: 'live-boot', resourceType: 'Fetch', responseStatusCode: 200, responseHeaders: [],
+        request: { url: 'https://claude.ai/edge-api/bootstrap/org-1/app_start?x=1' },
+    });
+    await h2.settle();
+    await h2.settle();
+    const passed = live.debugger.commands.find((item) => item.params?.requestId === 'live-boot' && item.method !== 'Fetch.getResponseBody');
+    assert.deepEqual(passed, { method: 'Fetch.continueRequest', params: { requestId: 'live-boot' } });
+    h.dispose();
+    h2.dispose();
 });
 
 test('leaves the document live without a reload when it lacks a release sheet', async () => {

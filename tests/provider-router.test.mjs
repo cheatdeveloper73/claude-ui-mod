@@ -89,9 +89,14 @@ const stubModel=(baseUrl=base+'/stub')=>({id:'Stub-Compat-agent',name:'Stub Comp
 fs.writeFileSync(catalogueFile,JSON.stringify([stubModel()]));
 fs.writeFileSync(secretsFile,JSON.stringify({stub:{apiKey:'stub-test-key-one'}}));
 const adapterDir=path.join(temp,'no-adapters');fs.mkdirSync(adapterDir,{recursive:true});
-Object.assign(process.env,{CODEX_AUTH_FILE:auth,CODEX_RESPONSES_URL:base+'/responses',MODEL_ROUTER_UPSTREAM:base+'/anthropic',MODEL_ROUTER_ADAPTER_DIR:adapterDir,MODEL_ROUTER_STATE_DIR:temp,MODEL_ROUTER_SETTINGS_FILE:path.join(temp,'settings.json'),MODEL_ROUTER_CATALOGUE_FILE:catalogueFile,MODEL_ROUTER_SECRETS_FILE:secretsFile});
+// A missing authority file keeps this suite off the live credential view.
+Object.assign(process.env,{MODEL_ROUTER_AUTHORITY_FILE:path.join(temp,'no-credential-authority.json'),CODEX_AUTH_FILE:auth,CODEX_RESPONSES_URL:base+'/responses',MODEL_ROUTER_UPSTREAM:base+'/anthropic',MODEL_ROUTER_ADAPTER_DIR:adapterDir,MODEL_ROUTER_STATE_DIR:temp,MODEL_ROUTER_BYPASS_SESSIONS_FILE:path.join(temp,'bypass-sessions.json'),MODEL_ROUTER_SETTINGS_FILE:path.join(temp,'settings.json'),MODEL_ROUTER_CATALOGUE_FILE:catalogueFile,MODEL_ROUTER_SECRETS_FILE:secretsFile});
 const {compactionStore,server,windowStore}=await import(pathToFileURL(path.join(root,'index.mjs')));
+const {bypassSessionsFile,filterBypassSafeguardContext,readBypassSessions}=await import(pathToFileURL(path.join(root,'bypass-context.mjs')));
 const {estimateOpenAIInput}=await import(pathToFileURL(path.join(root,'count-tokens.mjs')));
+const SAFEGUARD_COMPANION='Your response above was stopped by a safety classifier — this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.';
+const INTERRUPTED_SAFEGUARD_COMPANION=SAFEGUARD_COMPANION+' Exception: a tool call whose result reads "Interrupted" was already running when the response was stopped; it may have partially or fully completed.';
+const NEUTRAL_CONTINUATION='Continue.';
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const endpoint='http://127.0.0.1:'+server.address().port;
 let passed=0;
@@ -105,11 +110,50 @@ async function textAtMost(target) {
     return best;
 }
 try {
+    const helperSid='12345678-1234-4234-8234-123456789abc';
+    const helperBody={tools:[{name:'read_file'}],messages:[{role:'user',content:SAFEGUARD_COMPANION}]};
+    check('bypass context helper matches only exact agent companions',()=>{
+        const active=new Set([helperSid]);
+        assert.equal(filterBypassSafeguardContext(helperBody,helperSid,active).body.messages[0].content,NEUTRAL_CONTINUATION);
+        const interrupted={...helperBody,messages:[{role:'user',content:[{type:'text',text:INTERRUPTED_SAFEGUARD_COMPANION,cache_control:{type:'ephemeral'}}]}]};
+        assert.deepEqual(filterBypassSafeguardContext(interrupted,helperSid,active).body.messages[0].content,[{type:'text',text:NEUTRAL_CONTINUATION,cache_control:{type:'ephemeral'}}]);
+        const near={...helperBody,messages:[{role:'user',content:'Prefix: '+SAFEGUARD_COMPANION}]};
+        assert.equal(filterBypassSafeguardContext(near,helperSid,active).body,near);
+        const control={...helperBody,tools:[]};
+        assert.equal(filterBypassSafeguardContext(control,helperSid,active).body,control);
+        assert.equal(filterBypassSafeguardContext(helperBody,'other',active).body,helperBody);
+    });
+    check('bypass registry path and expiry fail closed',()=>{
+        const explicit=process.env.MODEL_ROUTER_BYPASS_SESSIONS_FILE;
+        const state=process.env.MODEL_ROUTER_STATE_DIR;
+        delete process.env.MODEL_ROUTER_BYPASS_SESSIONS_FILE;
+        process.env.MODEL_ROUTER_STATE_DIR=path.join(temp,'unrelated-state');
+        assert.equal(bypassSessionsFile(),path.resolve(root,'..','.state','bypass-sessions.json'));
+        process.env.MODEL_ROUTER_BYPASS_SESSIONS_FILE=explicit;
+        if(state===undefined)delete process.env.MODEL_ROUTER_STATE_DIR;else process.env.MODEL_ROUTER_STATE_DIR=state;
+        fs.writeFileSync(explicit,JSON.stringify({version:1,expiresAt:2000,sessions:[helperSid.toUpperCase()]}));
+        assert.deepEqual([...readBypassSessions(explicit,1000)],[helperSid]);
+        assert.equal(readBypassSessions(explicit,2000).size,0);
+    });
     for(const [slug,effort] of [['gpt-5.6-sol','max'],['gpt-5.6-luna','xhigh'],['gpt-5.5','high']]) {
         const model='claude-'+slug+'[1m]';
         const res=await send({model,stream:true,output_config:{effort}});const text=await res.text();const call=calls.at(-1);
         check(slug+' native effort reaches Responses',()=>{assert.equal(call.body.model,slug);assert.equal(call.body.reasoning.effort,effort);assert.equal(res.status,200);assert.equal(res.headers.get('x-cuimod-prompt-policy-id'),'preserve');assert.equal(res.headers.get('x-cuimod-prompt-policy-generation'),'1');assert.ok(text.includes(model));assert.ok(text.includes('MOCK_OPENAI'));assert.ok(text.includes('message_stop'));assert.equal(call.body.max_output_tokens,undefined);});
     }
+    const bypassContextSid='12345678-1234-4234-8234-123456789abc';
+    const ordinaryContextSid='abcdefab-cdef-4abc-8def-abcdefabcdef';
+    const refusalMessages=[{role:'user',content:'Original request'},
+        {role:'assistant',content:[{type:'text',text:'Partial answer'}]},
+        {role:'user',content:SAFEGUARD_COMPANION}];
+    fs.writeFileSync(path.join(temp,'bypass-sessions.json'),JSON.stringify({version:1,expiresAt:Date.now()+60000,sessions:[bypassContextSid]}));
+    await (await send({model:'claude-opus-5',stream:false,messages:refusalMessages,tools:[{name:'read_file',input_schema:{type:'object'}}]},bypassContextSid)).text();
+    check('bypass strips the safeguard companion before native Anthropic forwarding',()=>{const sent=calls.at(-1);assert.equal(sent.path,'/anthropic/v1/messages');assert.equal(sent.body.messages.at(-1).content,NEUTRAL_CONTINUATION);assert.equal(JSON.stringify(sent.body).includes(SAFEGUARD_COMPANION),false);});
+    await (await send({model:'claude-opus-5',stream:false,messages:refusalMessages,tools:[{name:'read_file',input_schema:{type:'object'}}]},ordinaryContextSid)).text();
+    check('non-bypass Anthropic context remains byte-equivalent',()=>{const sent=calls.at(-1);assert.equal(sent.body.messages.at(-1).content,SAFEGUARD_COMPANION);});
+    await (await send({model:'claude-gpt-5.6-sol[1m]',stream:true,messages:refusalMessages,tools:[{name:'read_file',input_schema:{type:'object'}}]},bypassContextSid)).text();
+    check('bypass strips the safeguard companion before Responses translation',()=>{const sent=calls.at(-1);const input=JSON.stringify(sent.body.input);const users=sent.body.input.filter(item=>item?.type==='message'&&item.role==='user');assert.equal(input.includes(SAFEGUARD_COMPANION),false);assert.equal(users.at(-1)?.content?.at(-1)?.text,NEUTRAL_CONTINUATION);});
+    await (await fetch(endpoint+'/v1/messages/count_tokens',{method:'POST',headers:{'content-type':'application/json','x-claude-code-session-id':bypassContextSid},body:JSON.stringify({model:'claude-opus-5',messages:refusalMessages,tools:[{name:'read_file',input_schema:{type:'object'}}]})})).text();
+    check('bypass strips the safeguard companion before native token counting',()=>{const sent=calls.at(-1);assert.equal(sent.path,'/anthropic/v1/messages/count_tokens');assert.equal(sent.body.messages.at(-1).content,NEUTRAL_CONTINUATION);});
     check('identity diagnostics use upstream metadata, not the requested label',()=>{const log=fs.readFileSync(path.join(temp,'bridge.log'),'utf8');assert.ok(log.includes('"reportedModel":"reported-model-fixture"'));assert.ok(log.includes('"requestedModel":"gpt-5.6-sol"'));assert.ok(log.includes('"reportedEffort":"low"'));assert.equal(log.includes(token),false);});
     const settingsFile=process.env.MODEL_ROUTER_SETTINGS_FILE;
     fs.writeFileSync(settingsFile,JSON.stringify({'provider-picker':{reasoningSummary:'detailed',logUpstreamIdentity:false}}));
@@ -368,6 +412,28 @@ try {
     // Anthropic, which would answer a Qwen-labelled request as Claude.
     const retiredBefore=calls.length;const retired=await send({model:'claude-Qwen3.8-Max-agent[1m]',stream:false});
     check('retired Qwen aliases fail closed instead of reaching Anthropic',()=>{assert.equal(retired.status,503);assert.equal(calls.length,retiredBefore);});
+    fs.writeFileSync(catalogueFile,JSON.stringify([{...stubModel(base+'/stub-next'),id:'Stub-Alias-agent',upstreamId:'accounts/stub/models/compat-1'}]));
+    const aliased=await send({model:'claude-Stub-Alias-agent[1m]',stream:false});const aliasedText=await aliased.text();
+    check('a compatible alias sends the provider its own upstream model name',()=>{assert.equal(aliased.status,200);assert.equal(calls.at(-1).body.model,'accounts/stub/models/compat-1');assert.ok(aliasedText.includes('claude-Stub-Alias-agent[1m]'));});
+    // A provider with no count_tokens endpoint gets an exact local count of the
+    // body it would be sent. 32 is Fireworks' own raw_output id count for this
+    // request (tests/fixtures/deepseek-v41-fireworks.json, case "plain").
+    fs.writeFileSync(catalogueFile,JSON.stringify([{...stubModel(base+'/stub-next'),id:'Stub-Counted-agent',counter:'deepseek-v4.1-fireworks'}]));
+    const countedBefore=calls.length;
+    const counted=await fetch(endpoint+'/v1/messages/count_tokens',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'claude-Stub-Counted-agent[1m]',system:'sys',messages:[{role:'user',content:'hi'}]})});
+    const countedBody=await counted.json();
+    check('a compatible provider with a local counter counts exactly without calling upstream',()=>{assert.equal(counted.status,200);assert.equal(countedBody.input_tokens,32);assert.equal(calls.length,countedBefore);assert.equal(counted.headers.get('x-cuimod-token-count-source'),'deepseek-v4.1-fireworks.local');assert.equal(counted.headers.get('x-cuimod-token-count-exact'),'true');});
+    const rejected=await fetch(endpoint+'/v1/messages/count_tokens',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'claude-Stub-Counted-agent[1m]',system:'sys',messages:[{role:'user',content:[{type:'document',source:{type:'text',media_type:'text/plain',data:'x'}}]}]})});
+    check('a block the provider rejects fails the local count with a 400',()=>{assert.equal(rejected.status,400);assert.equal(calls.length,countedBefore);});
+    // The picker's tier rides in the model id; the native slider sends
+    // output_config.effort; neither present means the catalogue default.
+    fs.writeFileSync(catalogueFile,JSON.stringify([{...stubModel(base+'/stub-next'),id:'Stub-Effort-agent',efforts:['low','high','max'],defaultEffort:'high',effortField:'reasoning_effort',effortValues:{none:'none',low:50,medium:75,high:75,xhigh:100,max:100}}]));
+    const effortOf=async(model,extra={})=>{await (await send({model,stream:false,...extra})).text();return calls.at(-1).body;};
+    const viaSuffix=await effortOf('claude-Stub-Effort-agent:none[1m]',{output_config:{effort:'max'}});
+    const viaSlider=await effortOf('claude-Stub-Effort-agent[1m]',{output_config:{effort:'low'}});
+    const viaChild=await effortOf('claude-Stub-Effort-agent[1m]',{output_config:{effort:'medium'}});
+    const viaDefault=await effortOf('claude-Stub-Effort-agent[1m]');
+    check('a compatible effort tier reaches the provider field from suffix, slider, or default',()=>{assert.equal(viaSuffix.reasoning_effort,'none');assert.equal(viaSlider.reasoning_effort,50);assert.equal(viaChild.reasoning_effort,75);assert.equal(viaDefault.reasoning_effort,75);assert.equal(viaSlider.output_config,undefined);assert.equal(viaSuffix.model,'Stub-Effort-agent');});
     fs.writeFileSync(catalogueFile,JSON.stringify([stubModel(base+'/stub-next')]));
     const listed=await (await fetch(endpoint+'/v1/models',{headers:{authorization:'Bearer fixture'}})).json();
     check('a compatible provider appears in the router model catalogue',()=>assert.ok(listed.data.some(entry=>entry.id==='Stub-Compat-agent')));

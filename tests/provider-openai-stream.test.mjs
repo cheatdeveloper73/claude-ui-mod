@@ -62,6 +62,22 @@ upstream.on('stream', (stream, headers) => {
             setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 20);
             return;
         }
+        if (mode === 'tool-parallel')
+        {
+            // Two calls in one response whose arguments arrive only on the
+            // completed item, which is how the backend sends parallel calls.
+            // A block opened at output_item.added would carry an empty input.
+            const events = [
+                created(),
+                { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_p0', name: 'Read' } },
+                { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_p1', name: 'Glob' } },
+                { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', call_id: 'call_p0', name: 'Read', arguments: '{"file_path":"alpha"}' } },
+                { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', call_id: 'call_p1', name: 'Glob', arguments: '{"pattern":"beta"}' } },
+                completed(),
+            ];
+            stream.end(events.map(frame).join(''));
+            return;
+        }
         if (mode === 'tool-idle')
         {
             const events = [
@@ -141,6 +157,15 @@ try
     assert.match(text, /event: message_stop/);
     assert.doesNotMatch(text, /event: error/);
 
+    mode = 'tool-parallel';
+    response = await send();
+    text = await response.text();
+    assert.match(text, /"stop_reason":"tool_use"/);
+    const parallelDeltas = text.match(/"type":"input_json_delta"/g) || [];
+    assert.equal(parallelDeltas.length, 2, 'each parallel tool call must emit exactly one complete input delta');
+    assert.match(text, /alpha/);
+    assert.match(text, /beta/);
+
     mode = 'tool-idle';
     const idleStarted = Date.now();
     response = await send();
@@ -168,7 +193,7 @@ try
     mode = 'thinking-loss';
     await assert.rejects(() => send().then(value => value.text()));
 
-    assert.equal(requests, 7);
+    assert.equal(requests, 8);
     console.log('PASS OpenAI HTTP/2 stream lifecycle: transport, heartbeat, tool recovery, terminal short-circuit');
 }
 finally

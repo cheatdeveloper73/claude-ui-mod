@@ -12,7 +12,13 @@ const SECRETS_FILE = process.env.MODEL_ROUTER_SECRETS_FILE
     || fileURLToPath(new URL('../.state/provider-secrets.json', import.meta.url));
 
 const ID = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
+// The name the provider itself knows the model by. Adapters claim id prefixes
+// ahead of this registry, so a provider serving a model an adapter already
+// claims needs its own catalogue alias and must still send its own name.
+const UPSTREAM_ID = /^[a-z0-9][a-z0-9._/-]{0,255}$/i;
 const HEADERS = new Set(['x-api-key', 'authorization']);
+// Local exact counters, for providers that have no count_tokens endpoint.
+const COUNTERS = new Set(['deepseek-v4.1-fireworks', 'glm-5.3-fireworks']);
 
 let catalogue = { raw: null, models: new Map(), providers: new Map() };
 let secrets = { raw: null, values: {} };
@@ -46,8 +52,22 @@ function parseCatalogue(raw)
         const route = backend(value.backend, value.provider);
         const prior = providers.get(value.provider);
         if (prior && JSON.stringify(prior.route) !== JSON.stringify(route)) throw new Error(`${value.provider}: models disagree on backend configuration`);
+        if (value.upstreamId !== undefined && (typeof value.upstreamId !== 'string' || !UPSTREAM_ID.test(value.upstreamId)))
+            throw new Error(`${value.id}: invalid upstreamId`);
+        if (value.counter !== undefined && !COUNTERS.has(value.counter)) throw new Error(`${value.id}: unknown counter ${value.counter}`);
+        // effortField names the request field the provider reads its reasoning
+        // budget from; effortValues maps each picker tier onto that field's value.
+        if (value.effortField !== undefined && (!/^[a-z_]{1,64}$/.test(value.effortField)
+            || !value.effortValues || typeof value.effortValues !== 'object'
+            || !Object.values(value.effortValues).every(v => typeof v === 'string' || Number.isInteger(v))))
+            throw new Error(`${value.id}: invalid effortField/effortValues`);
         const model = {
             id: value.id,
+            upstreamId: value.upstreamId || value.id,
+            counter: value.counter || null,
+            defaultEffort: typeof value.defaultEffort === 'string' ? value.defaultEffort : null,
+            effortField: value.effortField || null,
+            effortValues: value.effortField ? { ...value.effortValues } : null,
             name: typeof value.name === 'string' ? value.name : value.id,
             provider: value.provider,
             efforts: Array.isArray(value.efforts) ? value.efforts.filter((effort) => typeof effort === 'string') : [],
@@ -130,7 +150,12 @@ export function resolveCompatibleModel(raw)
         {
             const candidate = current.models.get(bare.slice(0, at).toLowerCase());
             const requested = bare.slice(at + 1).toLowerCase();
-            if (candidate?.efforts.includes(requested)) { model = candidate; effort = requested; }
+            // A tier can be valid without being a slider stop: the native
+            // selector rejects ids like `none`, so they live only in effortValues
+            // and arrive as a model suffix. Missing one here would fall through
+            // to Anthropic under this provider's label.
+            if (candidate?.efforts.includes(requested) || (candidate?.effortValues && Object.hasOwn(candidate.effortValues, requested)))
+            { model = candidate; effort = requested; }
         }
     }
 

@@ -880,7 +880,7 @@ test('the picker serializes model metadata and nothing routable', () => {
     const parsed = JSON.parse(raw);
     assert.ok(parsed.length, 'an empty catalogue would make every check below vacuous');
     assert.ok(parsed.some(model => model.backend), 'no entry carries a backend; the credential checks would not run');
-    const openaiIds = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna'];
+    const openaiIds = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-luna'];
     assert.deepEqual(parsed.filter(model => model.provider === 'openai').map(model => model.id), openaiIds);
     assert.deepEqual(catalogue.models.filter(model => model.provider === 'openai').map(model => model.id), openaiIds);
 

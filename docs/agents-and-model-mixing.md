@@ -51,9 +51,9 @@ Read the files named in the brief in full and answer with file:line citations.
 
 ```markdown
 ---
-name: deepseek-worker
+name: fireworks-deepseek-worker
 description: DeepSeek V4.1 Flash for tightly bounded edits.
-model: deepseek-v4.1-flash
+model: fireworks-deepseek-v4.1-flash[1m]:medium
 ---
 
 Make the change the brief describes, run its check, and report the result.
@@ -145,7 +145,7 @@ One way to spread a large change across providers:
 - **orchestrator:** the main session on Claude Opus. It plans and reviews.
 - **`gpt-reader` × 3:** read different subsystems in parallel on the ChatGPT
   plan's quota.
-- **`deepseek-worker`:** makes the mechanical edits on Command Code credits.
+- **`fireworks-deepseek-worker`:** makes the mechanical edits on Fireworks credits.
 - **`reviewer` on `claude-sonnet-5-5`:** checks the diff before the
   orchestrator accepts it.
 

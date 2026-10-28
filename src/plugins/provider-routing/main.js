@@ -379,6 +379,12 @@ module.exports = function (ctx) {
             // choice and wins over the per-provider tier.
             const tier = inheritedEnv.CLAUDE_CODE_SUBAGENT_MODEL ? null : subagentDefault(model, routed);
             if (tier) inheritedEnv.CLAUDE_CODE_SUBAGENT_MODEL = tier;
+            // Native advisor ranks only cover Claude ids. A session can switch
+            // to GPT without respawning, so its capability gate must be open at
+            // launch. This chooses no reviewer; explicit overrides still win.
+            if (!inheritedEnv.CLAUDE_CODE_DISABLE_ADVISOR_TOOL
+                && inheritedEnv.CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL === undefined)
+                inheritedEnv.CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL = '1';
             args = mergeLaunchSettings(args, launchSettings, selectedModel, inheritedEnv);
 
             const env = applyRegisteredModelEnvironment({ ...inheritedEnv,

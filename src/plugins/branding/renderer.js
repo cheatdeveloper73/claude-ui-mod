@@ -39,6 +39,13 @@ let keyColor = '#00FF66';
 let sceneHost = null;
 let disposed = false;
 let loadGeneration = 0;
+let brandingPath = location.pathname;
+let stillUri = '', movingUri = '', artUri = '';
+function rebuildUris() {
+    stillUri = helmetSource ? dataUri(helmetSource) : '';
+    movingUri = helmetSource ? dataUri(helmetSource.replace(STATIC_ACCENT, ANIMATED_ACCENT)) : '';
+    artUri = dataUri(sceneSource);
+}
 const touched = new Set();
 const favicons = new Map();
 
@@ -61,12 +68,11 @@ function dataUri(source) {
 }
 
 function svgUri(animated) {
-    if (!helmetSource) return '';
-    return dataUri(animated ? helmetSource.replace(STATIC_ACCENT, ANIMATED_ACCENT) : helmetSource);
+    return animated ? movingUri : stillUri;
 }
 
 function sceneUri() {
-    return dataUri(sceneSource);
+    return artUri;
 }
 
 function paintStyle() {
@@ -133,7 +139,7 @@ function mark(node, value) {
 function reconcileFavicons() {
     const applied = svgUri(false);
     if (!applied) return;
-    for (const link of document.querySelectorAll('link[rel~="icon"]')) {
+    for (const link of (document.head || document).querySelectorAll('link[rel~="icon"]')) {
         let record = favicons.get(link);
         if (!record) {
             record = { original: link.href, applied: null };
@@ -152,10 +158,8 @@ function removeScene() {
 
 function ensureScene() {
     if (sceneHost && !sceneHost.isConnected) sceneHost = null;
-    for (const node of document.querySelectorAll('#' + SCENE_ID)) {
-        if (node !== sceneHost) node.remove();
-    }
     if (sceneHost) return sceneHost;
+    for (const node of document.querySelectorAll('#' + SCENE_ID)) node.remove();
     sceneHost = document.createElement('div');
     sceneHost.id = SCENE_ID;
     sceneHost.setAttribute('aria-hidden', 'true');
@@ -163,12 +167,13 @@ function ensureScene() {
     return sceneHost;
 }
 
-function mainComposer() {
+function mainComposer(snapshot) {
     let best = null;
     let bestRect = null;
-    for (const prompt of document.querySelectorAll('.epitaxy-prompt')) {
+    for (const prompt of (snapshot ? snapshot.queryAll('.epitaxy-prompt') : document.querySelectorAll('.epitaxy-prompt'))) {
+        const rect = snapshot ? snapshot.rect(prompt) : prompt.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
         if (prompt.closest?.('.epitaxy-composer-width')) return prompt;
-        const rect = prompt.getBoundingClientRect();
         if (rect.width < 120) continue;
         if (!bestRect || rect.width > bestRect.width + 8 ||
             (Math.abs(rect.width - bestRect.width) <= 8 && rect.bottom > bestRect.bottom)) {
@@ -179,22 +184,23 @@ function mainComposer() {
     return best;
 }
 
-function reconcileScene() {
-    if (location.pathname !== '/epitaxy' || !sceneSource) {
-        removeScene();
-        return;
-    }
-    const composer = mainComposer();
-    if (!composer) {
-        removeScene();
-        return;
-    }
-    const box = composer.getBoundingClientRect();
-    if (box.width <= 0 || box.height <= 0) return;
-    const host = ensureScene();
-    host.style.left = Math.round(box.right - 124) + 'px';
-    host.style.top = Math.round(box.top - 34) + 'px';
+function measureScene(snapshot) {
+    if (!settings.enabled || location.pathname !== '/epitaxy' || !sceneSource) return null;
+    const composer = mainComposer(snapshot);
+    if (!composer) return null;
+    const box = snapshot ? snapshot.rect(composer) : composer.getBoundingClientRect();
+    return box.width > 0 && box.height > 0 ? { left: Math.round(box.right - 124) + 'px', top: Math.round(box.top - 34) + 'px' } : false;
 }
+function paintScene(box) {
+    if (box === null) { removeScene(); return; }
+    if (!box) return;
+    const host = ensureScene();
+    if (host.style.left !== box.left) host.style.left = box.left;
+    if (host.style.top !== box.top) host.style.top = box.top;
+}
+function reconcileScene() { paintScene(measureScene()); }
+const sceneLayout = typeof ctx.layout === 'function' ? ctx.layout(measureScene, paintScene) : null;
+function scheduleScene() { if (sceneLayout) sceneLayout(); else reconcileScene(); }
 
 function reconcile() {
     if (disposed) return;
@@ -221,6 +227,7 @@ async function loadHelmet() {
         helmetSource = value.source;
         sceneSource = typeof value.sceneSource === 'string' ? value.sceneSource : null;
         keyColor = value.keyColor;
+        rebuildUris();
         paintStyle();
         reconcile();
     } catch (_) {
@@ -228,8 +235,45 @@ async function loadHelmet() {
     }
 }
 
-ctx.observe(document.body, { childList: true, subtree: true }, reconcile);
-ctx.every(500, reconcile);
+function discoverMarks(root) {
+    if (!settings.enabled || !helmetSource || root?.nodeType !== 1) return;
+    if (root.matches('[data-cds="Spark"]')) mark(root, root.tagName === 'SPAN' ? 'spark-animated' : 'spark-static');
+    // Streamed text and ordinary tokens have no element subtree to inspect.
+    if (root.childElementCount) for (const node of root.querySelectorAll('[data-cds="Spark"]'))
+        mark(node, node.tagName === 'SPAN' ? 'spark-animated' : 'spark-static');
+}
+ctx.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-cds'] }, records => {
+    if (disposed) return;
+    let shell = false;
+    for (const record of records) {
+        if (record.type === 'attributes') {
+            if (record.target.matches('[data-cds="Spark"]')) discoverMarks(record.target);
+            else if (touched.delete(record.target)) record.target.removeAttribute(BRAND_ATTR);
+        } else {
+            for (const node of record.addedNodes) {
+                if (node.nodeType === 1 && node.id === SCENE_ID && node !== sceneHost) node.remove();
+                else discoverMarks(node);
+            }
+            if ([...record.removedNodes].some(node => node.nodeType === 1))
+                for (const node of touched) if (!node.isConnected) touched.delete(node);
+        }
+        const element = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (!element?.closest?.('[data-testid="epitaxy-virtual-transcript"], #' + SCENE_ID)) shell = true;
+    }
+    if (shell) scheduleScene();
+});
+ctx.observe(document.head || document.documentElement, { childList: true, subtree: true,
+    attributes: true, attributeFilter: ['href', 'rel'] }, records => {
+    if (!disposed && settings.enabled && records.some(record => record.type === 'attributes'
+        ? record.target.tagName === 'LINK'
+        : [...record.addedNodes].some(node => node.nodeType === 1 && (node.tagName === 'LINK' || node.querySelector?.('link[rel~="icon"]'))))) reconcileFavicons();
+});
+ctx.every(500, () => {
+    if (brandingPath !== location.pathname) { brandingPath = location.pathname; scheduleScene(); }
+    else if (!sceneLayout && location.pathname === '/epitaxy') reconcileScene();
+});
+ctx.track(window, 'resize', scheduleScene, { passive: true });
+ctx.track(document, 'visibilitychange', scheduleScene);
 ctx.onDispose(() => {
     disposed = true;
     loadGeneration++;
@@ -251,6 +295,7 @@ const spec = {
     ],
     apply(values) {
         settings = { ...DEFAULTS, ...values, accent: cleanColor(values?.accent) };
+        rebuildUris();
         paintStyle();
         reconcile();
     },

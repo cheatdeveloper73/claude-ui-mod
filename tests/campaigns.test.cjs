@@ -361,6 +361,32 @@ test('live adapter scopes guards and MCP tools only to campaign-owned native ses
     assert.equal(manager.listenerCount('event'), 0);
 });
 
+// App 2.9939.4 moved isCliProvablyIdle off the manager into a module-local
+// function; hasAgentRunInProgress(sessionId) is the surviving public wrapper.
+test('attach waits on a manager without isCliProvablyIdle instead of throwing', async t => {
+    const f = fixture(t);
+    const globalKey = Symbol.for('cuimod.campaigns'); delete globalThis[globalKey];
+    const SID = 'local_11111111-2222-3333-4444-555555555555';
+    const session = { sessionId: SID, query: {}, cliSessionId: 'cli', cliLastTurnMessageWasResult: true, busy: true };
+    const manager = Object.assign(new EventEmitter(), { sessions: new Map([[SID, session]]),
+        async buildStartSdkOptions() { return { sdkOptions: { hooks: {}, mcpServers: {} }, allMcpServers: {} }; },
+        hasAgentRunInProgress(sid) { return this.sessions.get(sid).busy; } });
+    const cached = path.join(f.root, 'manager-fixture-idle.js');
+    require.cache[cached] = { id: cached, filename: cached, loaded: true, exports: { claudeCodeSessionManager: manager } };
+    const methods = new Map(), disposers = [];
+    require(path.join(SOURCE, 'main'))({ boot: { MOD_DIR: f.root }, electron: {}, dir: SOURCE, log() {}, broadcast() {},
+        method(name, handler) { methods.set(name, handler); }, every() {}, onDispose(fn) { disposers.push(fn); } });
+    try {
+        const c = methods.get('create')({ title: 'Idle fixture', intent: 'Exercise only the idle gate.', cwd: f.cwd,
+            template: 'implementation', workspaces: [], references: [] });
+        assert.equal((await methods.get('attach')({ id: c.id, sessionId: SID })).pending, true, 'busy turn');
+        session.busy = false; session.cliLastTurnMessageWasResult = false;
+        assert.equal((await methods.get('attach')({ id: c.id, sessionId: SID })).pending, true, 'no turn result yet');
+    } finally {
+        disposers.reverse().forEach(fn => fn()); delete require.cache[cached]; delete globalThis[globalKey];
+    }
+});
+
 // Evidence files come from workers that may have been prompt-injected. A click
 // on one must never execute it.
 test('evidence opens only inert file types; executables are revealed instead', () => {

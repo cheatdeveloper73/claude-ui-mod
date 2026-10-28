@@ -47,6 +47,226 @@ function observe(node, opts, fn) {
     return mo;
 }
 
+// Opt-in placement work shares one invalidation source, discovery cache and read
+// phase. Legacy observe() callbacks retain their synchronous delivery semantics.
+const layoutClients = new Set();
+let layoutFrame = 0;
+let layoutTimer = null;
+let layoutDirty = true;
+let layoutDiscovery = new Map();
+let layoutRects = new Map();
+let layoutValues = new Map();
+let layoutResize = null;
+let layoutMutation = null;
+let layoutReading = null;
+let layoutFlushing = false;
+const layoutTransitions = new Set();
+const TRANSCRIPT_LAYOUT = '[data-testid="epitaxy-virtual-transcript"]';
+
+function inTranscript(node) {
+    const el = node?.nodeType === 1 ? node : node?.parentElement;
+    // The feed is size/layout contained. Its internal mutations and scrolling
+    // cannot move the shell's composer or sidebar; the feed's own box can.
+    return !!el?.closest?.(TRANSCRIPT_LAYOUT);
+}
+function ownLayoutHost(node) {
+    return !!node?.closest?.('[id^="cuimod-"]');
+}
+function queueLayout() {
+    if (disposed || layoutFrame || layoutTimer !== null || !layoutClients.size) return;
+    if (document.hidden) {
+        layoutTimer = setTimeout(() => { layoutTimer = null; flushLayout(); }, 0);
+    } else {
+        layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; flushLayout(); });
+    }
+}
+function invalidateLayout(discovery = false) {
+    if (discovery) layoutDiscovery = new Map();
+    layoutDirty = true;
+    for (const client of layoutClients) client.pending = true;
+    queueLayout();
+}
+function watchLayout(node) {
+    if (!node || !layoutReading || node.nodeType !== 1) return;
+    layoutReading.nodes.add(node);
+}
+function layoutQueryAll(selector, root = document) {
+    let cache = layoutDiscovery.get(root);
+    if (!cache) layoutDiscovery.set(root, cache = new Map());
+    if (!cache.has(selector)) cache.set(selector, [...root.querySelectorAll(selector)]);
+    return cache.get(selector);
+}
+function layoutRect(node) {
+    if (!node) return null;
+    watchLayout(node);
+    if (!layoutRects.has(node)) layoutRects.set(node, node.getBoundingClientRect());
+    return layoutRects.get(node);
+}
+function layoutValue(key, compute) {
+    if (!layoutValues.has(key)) layoutValues.set(key, compute());
+    const value = layoutValues.get(key);
+    // Cached discoveries still enroll their anchors in this client's RO set.
+    if (value?.nodeType === 1) watchLayout(value);
+    return value;
+}
+const layoutSnapshot = {
+    rect: layoutRect,
+    queryAll: layoutQueryAll,
+    query(selector, root = document) { return layoutQueryAll(selector, root)[0] || null; },
+    mainComposer() {
+        return layoutValue('mainComposer', () => {
+            let best = null, bestRect = null;
+            for (const p of layoutQueryAll('.epitaxy-prompt')) {
+                const r = layoutRect(p);
+                if (r.width < 120 || r.height <= 0) continue;
+                if (p.closest('.epitaxy-composer-width')) return p;
+                if (!bestRect || r.width > bestRect.width + 8 ||
+                    (Math.abs(r.width - bestRect.width) <= 8 && r.bottom > bestRect.bottom)) {
+                    best = p; bestRect = r;
+                }
+            }
+            return best;
+        });
+    },
+    railComposer() {
+        return layoutValue('railComposer', () => {
+            let editor = null, base = null;
+            for (const el of layoutQueryAll('[contenteditable="true"]')) {
+                const r = layoutRect(el);
+                if (r.width <= 40 || r.height <= 20 || r.bottom <= 0 || r.top >= innerHeight) continue;
+                if (!base || r.bottom > base.bottom) { editor = el; base = r; }
+            }
+            if (!editor) return null;
+            let node = editor;
+            for (let i = 0, p = editor.parentElement; i < 6 && p; i++, p = p.parentElement) {
+                const r = layoutRect(p);
+                if (r.width > base.width * 1.8 || r.height > base.height + 240) break;
+                if (parseFloat(getComputedStyle(p).borderTopLeftRadius) >= 8) node = p;
+            }
+            return node;
+        });
+    },
+    sidebarRight() {
+        return layoutValue('sidebarRight', () => {
+            for (const el of layoutQueryAll('.dframe-sidebar, aside, nav')) {
+                const r = layoutRect(el);
+                if (r.left > 2 || r.width < 100 || r.width > innerWidth * 0.5) continue;
+                if (r.height < innerHeight * 0.5) continue;
+                return r.right;
+            }
+            return 0;
+        });
+    },
+};
+function flushLayout() {
+    if (disposed || layoutFlushing) return;
+    if (layoutFrame) { cancelAnimationFrame(layoutFrame); layoutFrame = 0; }
+    if (layoutTimer !== null) { clearTimeout(layoutTimer); layoutTimer = null; }
+    layoutFlushing = true;
+    if (layoutDirty) {
+        layoutRects = new Map(); layoutValues = new Map(); layoutDirty = false;
+        for (const client of layoutClients) client.nodes.clear();
+    }
+    const writes = [];
+    try {
+        for (const client of layoutClients) {
+            if (!client.pending) continue;
+            client.pending = false;
+            layoutReading = client;
+            try { writes.push([client, client.read(layoutSnapshot)]); }
+            catch (e) { note('layout:read', e); }
+            finally { layoutReading = null; }
+        }
+        // Observe only current dependencies, not every anchor ever encountered.
+        if (layoutResize) {
+            const nodes = new Set();
+            for (const client of layoutClients) for (const node of client.nodes) nodes.add(node);
+            for (const node of layoutObserved) if (!nodes.has(node)) {
+                layoutResize.unobserve(node); layoutObserved.delete(node);
+            }
+            for (const node of nodes) if (!layoutObserved.has(node)) {
+                layoutResize.observe(node); layoutObserved.add(node);
+            }
+        }
+        for (const [client, value] of writes) {
+            if (!layoutClients.has(client)) continue;
+            try { client.write(value); } catch (e) { note('layout:write', e); }
+        }
+    } finally {
+        layoutFlushing = false;
+        for (const node of layoutTransitions) if (!node.isConnected) layoutTransitions.delete(node);
+        if (layoutTransitions.size && !document.hidden) invalidateLayout();
+    }
+}
+const layoutObserved = new Set();
+function startLayout() {
+    if (layoutMutation) return;
+    layoutMutation = observe(document.documentElement,
+        { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'hidden', 'contenteditable', 'aria-hidden', 'aria-label', 'id', 'data-testid'] },
+        (records) => {
+            for (const record of records) {
+                // Attributes on the feed itself can change its box; only its
+                // descendants and contained child-list updates are irrelevant.
+                if (inTranscript(record.target) && !(record.type === 'attributes' && record.target.matches?.(TRANSCRIPT_LAYOUT))) continue;
+                if (record.type === 'attributes' && record.oldValue === record.target.getAttribute(record.attributeName)) continue;
+                // Queue is an external placement dependency: its host may be
+                // mounted late or move without resizing the rail inside it.
+                if (ownLayoutHost(record.target) && !record.target.closest('#cuimod-queue')) continue;
+                if (record.type === 'childList') {
+                    const changed = [...record.addedNodes, ...record.removedNodes];
+                    if (changed.length && changed.every(n => n.nodeType === 1 && n.id?.startsWith('cuimod-') && n.id !== 'cuimod-queue' && n.id !== 'cuimod-host')) continue;
+                }
+                invalidateLayout(true);
+                return;
+            }
+        });
+    layoutResize = new ResizeObserver(guard('layout:resize', () => invalidateLayout()));
+    onDispose(() => { layoutResize.disconnect(); layoutObserved.clear(); });
+    track(window, 'resize', () => invalidateLayout(true), { passive: true });
+    track(window, 'scroll', event => {
+        if (!inTranscript(event.target) && !ownLayoutHost(event.target)) invalidateLayout();
+    }, { passive: true, capture: true });
+    track(document, 'visibilitychange', () => {
+        // A frame queued while visible will never run after occlusion. Transfer
+        // it to the hidden timeout path rather than stranding pending work.
+        if (layoutFrame) { cancelAnimationFrame(layoutFrame); layoutFrame = 0; }
+        invalidateLayout(true);
+    });
+    // Input may resize the editor before React publishes a shell mutation.
+    track(document, 'input', event => { if (!inTranscript(event.target) && !ownLayoutHost(event.target)) invalidateLayout(); }, true);
+    // Transforms move anchors without resizing them. Follow only while a real
+    // shell transform transition runs, never as a permanent frame/poll loop.
+    track(document, 'transitionrun', event => {
+        if (event.propertyName !== 'transform' || inTranscript(event.target) || ownLayoutHost(event.target)) return;
+        layoutTransitions.add(event.target); invalidateLayout();
+    }, true);
+    const endTransition = event => {
+        if (event.propertyName !== 'transform' || !layoutTransitions.delete(event.target)) return;
+        invalidateLayout();
+    };
+    track(document, 'transitionend', endTransition, true);
+    track(document, 'transitioncancel', endTransition, true);
+    onDispose(() => {
+        if (layoutFrame) cancelAnimationFrame(layoutFrame);
+        if (layoutTimer !== null) clearTimeout(layoutTimer);
+        layoutFrame = 0; layoutTimer = null; layoutClients.clear();
+        layoutDiscovery.clear(); layoutRects.clear(); layoutValues.clear(); layoutTransitions.clear();
+    });
+}
+function subscribeLayout(read, write, dispose) {
+    startLayout();
+    const client = { read, write, pending: true, nodes: new Set() };
+    layoutClients.add(client);
+    const invalidate = () => { client.pending = true; queueLayout(); };
+    invalidate.flush = () => { client.pending = true; flushLayout(); };
+    // Use for position changes inside another shadow root, which the document
+    // observer cannot see and a size-only ResizeObserver cannot establish.
+    invalidate.measure = () => invalidateLayout();
+    dispose(() => { layoutClients.delete(client); });
+    queueLayout();
+    return invalidate;
+}
+
 // ---------------------------------------------------------------- session id
 const seen = [];
 let sessionId = null;
@@ -263,6 +483,7 @@ for (const p of plugins) {
         every,
         track,
         observe,
+        layout: (read, write) => subscribeLayout(read, write, ctx.onDispose),
     };
     try {
         const factory = new Function('cuimod', 'ctx', p.source);
@@ -286,6 +507,7 @@ function observeLocation() {
     const now = locationKey();
     if (now === lastLoc) return;
     lastLoc = now;
+    if (layoutClients.size) invalidateLayout(true);
     resolveGeneration++;
     resolveFlight = null;
     resolveQueued = false;

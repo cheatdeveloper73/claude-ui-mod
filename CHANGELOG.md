@@ -6,8 +6,82 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-10-28
+
+### Performance
+
+- **Renderer work follows real changes** — plugin views (usage, branding,
+  goal, tasks, voice placement) were rescanning the document and reading
+  geometry on every transcript token. A shared layout coordinator now
+  batches measurements before writes and invalidates only on shell or anchor
+  changes. In the Chromium regression, unrelated transcript churn drops from
+  168 discovery queries and 648 rectangle reads to zero for these consumers.
+  Unchanged attributes, CSS and popover contents are no longer rewritten.
+- **Scroll follow without per-frame queries** — the follow loop ran at display
+  cadence and forced style recalculation even when nothing grew. It now
+  observes the native sizer and viewport. The unchanged-busy regression falls
+  from 120 callbacks and 360 geometry reads to zero. Follow intent stays
+  latched through token bursts, and wheel movement shares one frame with the
+  virtualizer (`transcript-scroll`).
+- **Less disk traffic** — streaming events no longer resolve campaigns or
+  refresh their UI unless campaign state changed, repeated list/feed reads
+  reuse stat-validated snapshots, and tracking state is flushed only when it
+  changes. Journal and acknowledgment fsyncs are unchanged.
+- **Send hooks no longer stack** — two plugins each re-wrapped the other's
+  `sendMessage` hook on a one-second sweep; a long-running window reached
+  20,000+ layers and one send blocked the main process for 15 s. Each now
+  recognises the other, and a running window recovers on hot reload.
+- **Warm inference connections** — OpenAI turns ride a persistent WebSocket
+  with Codex-style `previous_response_id` continuation; requests over the
+  server's 16 MiB message cap are uploaded in chunks instead of failing with
+  close 1009. Fireworks uses multiplexed HTTP/2. Fallback happens only when
+  inference provably never started.
+
+### Added
+
+- **GPU reset guard** (`gpu-accel-guard`) — Desktop permanently disables
+  hardware acceleration after three GPU process deaths in five minutes, and
+  the window then renders on WARP. The guard keeps acceleration on through
+  driver resets and clears a flag that was already persisted.
+- **Assistant rewind** (`assistant-rewind`) — rewind to assistant, status and
+  thinking checkpoints, not only to user turns, without duplicating Desktop's
+  own rewind transition.
+- **Codex browser tools** (`codex-browser`) — exposes an installed Codex
+  `cua_repl` against Claude Desktop's own browser pane, profile and sign-ins.
+  See `docs/codex-browser.md`.
+- **Native advisor for routed models** — the router runs Claude Code's
+  `advisor` server tool itself when the executor is a GPT model.
+- **Goal guard** — a failed, truncated or malformed `/goal` evaluator reply no
+  longer silently ends the goal. It becomes an explicit "unverified" verdict.
+- **Fireworks provider** — DeepSeek V4.1 Flash and GLM 5.3 through Fireworks'
+  native Messages endpoint, with exact local prompt counts from the models'
+  own tokenizers, effort sliders, deferred-tool listing, and a live prepaid
+  balance and runout in the usage circle.
+- **Models** — GPT-6.1-Terra, GPT-5.6-Terra, GPT-6-Sol and GPT-5.6-Sol on the OpenAI tab;
+  Haiku 5.5 offered under its `[1m]` id so sessions get the 1M window.
+- **File pane** — `SendUserFile` images from remote SSH sessions render
+  inline, including files outside the session's native roots.
+
 ### Fixed
 
+- Parallel GPT tool calls keep their own inputs (calls are emitted whole at
+  `output_item.done`).
+- DeepSeek control tokens in request text stay text.
+- A compatible model's non-slider effort suffix is resolved instead of leaking
+  into the model id.
+- Anthropic billing gates no longer lock the Codex priority (fast) controls.
+- Remote sessions' subagents are read from Desktop's mirror without inventing
+  agents; generation clocks come from the session's execution host.
+- Queue, campaigns and voice-agent find turn-end idleness on Desktop 2.9939.4.
+- Model lock recognises picks in the current model menu.
+- Dashboard reset credits stay scoped to the account that was clicked.
+- `patch.js apply` re-bakes when the baked loader differs from `src/`, not only
+  when it is unmarked. Desktop 2.31226.1 is an audited build for the
+  `SendMessage` unban.
+- Frontend pin: a fresh generation decides its bootstrap from the page itself,
+  recovery latches no longer leave the live release up, a live Code page is
+  reloaded instead of asking for a manual reload, and per-model minimum app
+  versions are cleared from pinned bootstraps.
 - **Frontend compatibility** — the approved Code frontend and its static asset
   graph now ship with the public mod. The pin is enabled by default and serves
   integrity-checked local bytes under the original URLs, including worker

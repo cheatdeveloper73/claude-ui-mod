@@ -15,6 +15,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { rescue } = require('./rescue');
+const { wrapRemoteImage, remotePool } = require('./remote-image');
 
 const SUFFIX = '_$_claude.web_$_LocalSessions_$_readSessionFileWithStatus';
 
@@ -22,6 +23,9 @@ function wrapHandler(original, onRescue, deps) {
     const wrapper = async (event, sessionId, filePath, options) => {
         const result = await original(event, sessionId, filePath, options);
         if (!result || result.status !== 'notFound') return result;
+        let session;
+        try { session = require('../desktop-mcp-bridge/desktop-adapter').discover().sessions.get(sessionId); } catch (_) {}
+        if (session?.sshConfig || session?.wslConfig || session?.backend?.remoteTarget) return result;
         let replacement = null;
         try { replacement = await rescue(sessionId, filePath, options, deps); } catch (_) {}
         if (!replacement) return result;
@@ -34,7 +38,7 @@ function wrapHandler(original, onRescue, deps) {
 
 module.exports = function (ctx) {
     const statusFile = path.join(ctx.boot.MOD_DIR, '.state', 'file-pane-access.json');
-    const status = { attached: 0, rescued: 0, last: null };
+    const status = { attached: 0, remoteAttached: 0, rescued: 0, last: null };
     function save() {
         try {
             fs.mkdirSync(path.dirname(statusFile), { recursive: true });
@@ -48,6 +52,7 @@ module.exports = function (ctx) {
     }
 
     const wrapped = new Map();
+    const remoteWrapped = new Map();
     function attach() {
         const all = ctx.electron.webContents.getAllWebContents();
         for (const wc of all) {
@@ -65,8 +70,21 @@ module.exports = function (ctx) {
             wrapped.set(wc, { registry, key, original, wrapper });
         }
         for (const [wc] of wrapped) if (wc.isDestroyed()) wrapped.delete(wc);
-        if (status.attached !== wrapped.size) {
+        const pool = remotePool();
+        if (pool) for (const item of Object.values(require.cache)) {
+            const reads = item.exports?.claudeCodeSessionManager?.sessionFileReads;
+            const current = reads?.readRemoteSessionImageAsDataUrl;
+            if (typeof current !== 'function' || remoteWrapped.get(reads)?.wrapper === current) continue;
+            // Remote images have their own binary path, and its roots miss the
+            // CLI scratchpad and every sibling of the cwd on the Windows guest.
+            const original = current.__cuimodRemoteImageOriginal || current;
+            const wrapper = wrapRemoteImage(original, session => pool(session.sshConfig || session.backend.remoteTarget), onRescue);
+            reads.readRemoteSessionImageAsDataUrl = wrapper;
+            remoteWrapped.set(reads, { original, wrapper });
+        }
+        if (status.attached !== wrapped.size || status.remoteAttached !== remoteWrapped.size) {
             status.attached = wrapped.size;
+            status.remoteAttached = remoteWrapped.size;
             save();
         }
     }
@@ -75,7 +93,10 @@ module.exports = function (ctx) {
     ctx.onDispose(() => {
         for (const { registry, key, original, wrapper } of wrapped.values())
             if (registry.get(key) === wrapper) registry.set(key, original);
+        for (const [reads, { original, wrapper }] of remoteWrapped)
+            if (reads.readRemoteSessionImageAsDataUrl === wrapper) reads.readRemoteSessionImageAsDataUrl = original;
         wrapped.clear();
+        remoteWrapped.clear();
     });
 };
 

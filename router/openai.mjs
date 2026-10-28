@@ -39,6 +39,13 @@ import crypto from 'node:crypto';
 import { readProviderSettings } from './settings.mjs';
 import { applyPromptPolicy, policyChangesCachePrefix } from './prompt-policy.mjs';
 import { stripFastMarker } from './fast-mode.mjs';
+import {
+    ADVISOR_TOOL_NAME,
+    advisorFeedbackText,
+    advisorFunctionTool,
+    isNativeAdvisorTool,
+    nativeAdvisorTool,
+} from './advisor.mjs';
 import { readerCredential, replaceCredential } from './credential-authority.mjs';
 
 const AUTH_FILE = process.env.CODEX_AUTH_FILE
@@ -105,6 +112,7 @@ const OUTPUT_LIMIT = 128000;
 
 export const OPENAI_MODELS = [
     { id: 'gpt-6.1-sol',   name: 'GPT-6.1-Sol',   efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'low',    context: 1050000, maxOutput: OUTPUT_LIMIT },
+    { id: 'gpt-6.1-terra', name: 'GPT-6.1-Terra', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'low',    context: 1050000, maxOutput: OUTPUT_LIMIT },
     { id: 'gpt-6-astra',   name: 'GPT-6-Astra',   efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium', context: 1050000, maxOutput: OUTPUT_LIMIT },
     { id: 'gpt-6-sol',     name: 'GPT-6-Sol',     efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium', context: 1050000, maxOutput: OUTPUT_LIMIT },
     { id: 'gpt-6-luna',    name: 'GPT-6-Luna',    efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium', context: 1050000, maxOutput: OUTPUT_LIMIT },
@@ -420,6 +428,14 @@ function toResponsesTools(tools)
             out.push(toResponsesWebSearchTool(t));
             continue;
         }
+        // Anthropic's server-side advisor. The router executes it (index.mjs), so the
+        // model sees an ordinary parameterless function and the declaration's own
+        // `model` never reaches the lead.
+        if (isNativeAdvisorTool(t))
+        {
+            out.push(advisorFunctionTool());
+            continue;
+        }
         if (!t?.name || t.defer_loading === true) continue;
         out.push(toResponsesTool(t));
     }
@@ -493,6 +509,12 @@ function toResponsesInput(messages, tools)
     const declared = new Map((Array.isArray(tools) ? tools : []).filter(t => t?.name).map(t => [t.name, t]));
     const deferred = name => (declared.get(name)?.defer_loading === true ? declared.get(name) : null);
     const loaded = new Set();
+    // A consultation the router ran in an earlier turn is stored by Claude Code as
+    // server_tool_use + advisor_tool_result in the assistant message. The executor
+    // saw it as a function call and its output, so that is what it is replayed as.
+    const advisorDeclared = nativeAdvisorTool(tools) !== null;
+    const advisorCalls = new Set();
+    const advisorAnswered = new Set();
     const loadTools = (definitions) => {
         const fresh = [];
         for (const def of definitions)
@@ -539,6 +561,27 @@ function toResponsesInput(messages, tools)
                 else if (b?.type === 'text' && b.text)
                 {
                     parts.push({ type: 'output_text', text: b.text });
+                }
+                else if (b?.type === 'server_tool_use' && b.name === ADVISOR_TOOL_NAME)
+                {
+                    if (!advisorDeclared || !b.id) continue;
+                    if (parts.length) { input.push({ type: 'message', role: 'assistant', content: parts.splice(0) }); }
+                    advisorCalls.add(b.id);
+                    input.push({ type: 'function_call', call_id: b.id, name: ADVISOR_TOOL_NAME, arguments: '{}' });
+                }
+                else if (b?.type === 'advisor_tool_result')
+                {
+                    if (advisorDeclared && advisorCalls.has(b.tool_use_id))
+                    {
+                        if (parts.length) { input.push({ type: 'message', role: 'assistant', content: parts.splice(0) }); }
+                        advisorAnswered.add(b.tool_use_id);
+                        input.push({ type: 'function_call_output', call_id: b.tool_use_id, output: advisorFeedbackText(b.content) });
+                    }
+                    else if (b.content?.type === 'advisor_result' && b.content.text)
+                    {
+                        parts.push({ type: 'output_text', text: `[Advisor feedback]
+${b.content.text}` });
+                    }
                 }
                 else if (b?.type === 'tool_use')
                 {
@@ -616,6 +659,15 @@ function toResponsesInput(messages, tools)
         flushAdditions();
         if (trailing.length) parts.push(...trailing);
         flushParts();
+    }
+
+    // A call with no stored result (the stream died between the two blocks) would
+    // be rejected upstream as a call without output.
+    for (const id of advisorCalls)
+    {
+        if (advisorAnswered.has(id)) continue;
+        const at = input.findIndex(item => item.type === 'function_call' && item.call_id === id);
+        if (at !== -1) input.splice(at + 1, 0, { type: 'function_call_output', call_id: id, output: advisorFeedbackText(null) });
     }
 
     return input;
@@ -723,6 +775,9 @@ export function buildResponsesRequest(body, settings = readProviderSettings(), p
         ...((options.fast ?? body.speed === 'fast') ? { service_tier: 'priority' } : {}),
     };
 
+    const format = policyBody.output_config?.format ?? policyBody.output_format;
+    if (format?.type === 'json_schema' && format.schema)
+        req.text = { format: { type: 'json_schema', name: 'response', strict: false, schema: format.schema } };
     const tools = toResponsesTools(policyBody.tools);
     if (tools) req.tools = tools;
 
@@ -746,6 +801,8 @@ export function buildResponsesRequest(body, settings = readProviderSettings(), p
 
     return {
         req, key, model, effort, restoration, webSearchMaxUses,
+        // The declaration the lead's `advisor` function stands for, or null.
+        advisor: nativeAdvisorTool(policyBody.tools),
         promptSurface: {
             system: sourceBody.system ?? null,
             tools: Array.isArray(sourceBody.tools) ? sourceBody.tools : [],
@@ -840,6 +897,100 @@ function messageTextAndCitations(item, fallbackText = '')
     return { text, citations };
 }
 
+// What one Responses response produced, in the form the next request replays it.
+// An advisor consultation is not a client tool round: Claude Code never sees the
+// call, so nothing re-sends the response's reasoning, its preamble text or the call
+// itself. The router has to, in order, or the lead resumes without its own train of
+// thought. Items are shaped exactly as toResponsesInput rebuilds them from the
+// stored message, so the live resume and the next turn's replay share a prompt
+// prefix.
+export class RoundRecorder
+{
+    constructor(options = {})
+    {
+        this.reasoningEnabled = options.reasoningEnabled !== false;
+        this.reset();
+    }
+
+    reset()
+    {
+        this.entries = [];
+        this.text = new Map();
+        this.args = new Map();
+        this.callIds = new Set();
+    }
+
+    observe(evt)
+    {
+        const oi = evt?.output_index ?? 0;
+        if (evt?.type === 'response.output_text.delta')
+        {
+            this.text.set(oi, (this.text.get(oi) || '') + (evt.delta || ''));
+            return;
+        }
+        if (evt?.type === 'response.function_call_arguments.delta')
+        {
+            this.args.set(oi, (this.args.get(oi) || '') + (evt.delta || ''));
+            return;
+        }
+        if (evt?.type !== 'response.output_item.done') return;
+
+        const item = evt.item || {};
+        if (item.type === 'reasoning')
+        {
+            if (this.reasoningEnabled && item.encrypted_content)
+                this.entries.push({ item: { type: 'reasoning', ...(item.id ? { id: item.id } : {}), summary: [], encrypted_content: item.encrypted_content } });
+        }
+        else if (item.type === 'message')
+        {
+            const { text } = messageTextAndCitations(item, this.text.get(oi) || '');
+            if (text) this.entries.push({ text, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] } });
+        }
+        else if (item.type === 'function_call')
+        {
+            const id = item.call_id || item.id;
+            this.callIds.add(id);
+            this.entries.push({ call: {
+                type: 'function_call', id, name: item.name || '',
+                ...(item.namespace ? { namespace: item.namespace } : {}),
+                arguments: typeof item.arguments === 'string' && item.arguments ? item.arguments : (this.args.get(oi) || ''),
+            } });
+        }
+    }
+
+    // True when the response also called something the client has to run.
+    hasOtherCalls(pending)
+    {
+        const mine = new Set((pending || []).map(call => call.call_id));
+        return [...this.callIds].some(id => !mine.has(id));
+    }
+
+    // `resolve(callId)` supplies the replay form of each call the router handled.
+    replay(resolve)
+    {
+        return this.entries.map(entry => (entry.item ? entry.item : resolve(entry.call.id))).filter(Boolean);
+    }
+
+    // Anthropic-shaped view for the reviewer. `skip(call)` hides model-only calls.
+    transcript(skip = () => false)
+    {
+        const blocks = [];
+        for (const entry of this.entries)
+        {
+            if (entry.text) blocks.push({ type: 'text', text: entry.text });
+            else if (entry.call && !skip(entry.call))
+            {
+                let input = {};
+                try { input = JSON.parse(entry.call.arguments || '{}'); } catch { input = {}; }
+                blocks.push({ type: 'tool_use', id: entry.call.id, name: entry.call.name, input });
+            }
+        }
+        return blocks;
+    }
+}
+
+export const ADVISOR_RESULT_EVENT = 'cuimod.advisor_result';
+
 // Maps the Responses event stream onto the Anthropic one.
 //
 // The shapes do not correspond one to one: Anthropic indexes content blocks and
@@ -859,6 +1010,8 @@ export class ResponsesToAnthropic
         // Anthropic message span several upstream responses while that happens.
         this.suppressCall = typeof options.suppressCall === 'function' ? options.suppressCall : null;
         this.deferFinish = options.deferFinish === true;
+        this.recorder = new RoundRecorder({ reasoningEnabled: this.reasoningEnabled });
+        this.advisorIterations = [];
         this.epoch = 0;
         this.suppressed = new Map();
         this.pendingCalls = [];
@@ -871,6 +1024,7 @@ export class ResponsesToAnthropic
         this.reasoningTextBuffers = new Map();
         this.nextIndex = 0;
         this.blocks = new Map();   // output_index -> { index, type }
+        this.toolCalls = new Map(); // slot -> { id, name, args } held until output_item.done
         this.started = false;
         this.stopReason = 'end_turn';
         this.usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -924,12 +1078,14 @@ export class ResponsesToAnthropic
     {
         for (const key of [...this.blocks.keys()]) this.blocks.delete(key);
         this.suppressed.clear();
+        this.toolCalls.clear();
         this.pendingCalls = [];
         this.webSearchCalls.clear();
         this.pendingWebSearchCalls = [];
         this.bufferedWebMessages.clear();
         this.reasoningTextSeen.clear();
         this.reasoningTextBuffers.clear();
+        this.recorder.reset();
         this.epoch++;
         this.terminal = false;
     }
@@ -939,6 +1095,27 @@ export class ResponsesToAnthropic
         const calls = this.pendingCalls;
         this.pendingCalls = [];
         return calls;
+    }
+
+    // Writes one finished advisor consultation as the native pair of blocks. The
+    // tool_use is announced with its (empty) input like any other, and the result
+    // arrives whole in its start event, as Anthropic's own server tool results do.
+    emitAdvisor({ call, content, iteration })
+    {
+        if (this.closed) return;
+        this.start();
+        this.hasAssistantContent = true;
+        const useIndex = this.nextIndex++;
+        this.write(enc('content_block_start', { type: 'content_block_start', index: useIndex,
+            content_block: { type: 'server_tool_use', id: call.call_id, name: ADVISOR_TOOL_NAME, input: {} } }));
+        this.write(enc('content_block_delta', { type: 'content_block_delta', index: useIndex,
+            delta: { type: 'input_json_delta', partial_json: '{}' } }));
+        this.write(enc('content_block_stop', { type: 'content_block_stop', index: useIndex }));
+        const resultIndex = this.nextIndex++;
+        this.write(enc('content_block_start', { type: 'content_block_start', index: resultIndex,
+            content_block: { type: 'advisor_tool_result', tool_use_id: call.call_id, content } }));
+        this.write(enc('content_block_stop', { type: 'content_block_stop', index: resultIndex }));
+        if (iteration) this.advisorIterations.push(iteration);
     }
 
     open(outputIndex, block)
@@ -1091,6 +1268,7 @@ export class ResponsesToAnthropic
     {
         const t = evt?.type;
         if (!t || this.closed) return;
+        this.recorder.observe(evt);
         if (t.startsWith('response.web_search_call.'))
         {
             this.webSearchLifecycle(evt);
@@ -1130,7 +1308,11 @@ export class ResponsesToAnthropic
                     break;
                 }
                 this.sawToolCall = true;
-                this.open(oi, { type: 'tool_use', id: item.call_id || item.id, name: item.name || '', input: {} });
+                // Held, not opened. Parallel calls interleave their argument
+                // deltas, and the backend sends arguments only on the completed
+                // item; a block opened here would emit an empty input. The whole
+                // call is emitted at output_item.done, once its args are known.
+                this.toolCalls.set(this.slot(oi), { id: item.call_id || item.id, name: item.name || '', args: '' });
             }
             else if (item.type === 'message')
             {
@@ -1171,8 +1353,11 @@ export class ResponsesToAnthropic
 
         case 'response.function_call_arguments.delta':
         {
-            const held = this.suppressed.get(this.slot(evt.output_index ?? 0));
+            const slot = this.slot(evt.output_index ?? 0);
+            const held = this.suppressed.get(slot);
             if (held) { held.arguments += evt.delta || ''; break; }
+            const call = this.toolCalls.get(slot);
+            if (call) { call.args += evt.delta || ''; break; }
             this.delta(evt.output_index ?? 0, { type: 'input_json_delta', partial_json: evt.delta || '' });
             break;
         }
@@ -1234,6 +1419,20 @@ export class ResponsesToAnthropic
                     // decrypt on the round that follows.
                     ...(sealed ? { encrypted_function_args: sealed } : {}),
                 });
+                break;
+            }
+
+            const call = this.toolCalls.get(this.slot(oi));
+            if (item.type === 'function_call' && call)
+            {
+                this.toolCalls.delete(this.slot(oi));
+                // The completed item is authoritative when it carries the
+                // arguments; otherwise use the deltas accumulated above.
+                const args = typeof item.arguments === 'string' && item.arguments ? item.arguments : call.args;
+                this.open(oi, { type: 'tool_use', id: call.id, name: call.name, input: {} });
+                this.delta(oi, { type: 'input_json_delta', partial_json: args });
+                this.close(oi);
+                this.completedToolCalls++;
                 break;
             }
 
@@ -1315,7 +1514,10 @@ export class ResponsesToAnthropic
         this.write(enc('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: this.stopReason, stop_sequence: null },
-            usage: this.stamp(this.usage),
+            // The reviewer's own tokens, in Anthropic's field, so Claude Code prices
+            // the consultation under the model that ran it.
+            usage: this.stamp(this.advisorIterations.length
+                ? { ...this.usage, iterations: this.advisorIterations } : this.usage),
         }));
         this.write(enc('message_stop', { type: 'message_stop' }));
     }
@@ -1473,6 +1675,7 @@ export function collectAnthropicMessage(model, events, options = {})
     let sawTool = false;
     let terminal = false;
     let failure = null;
+    const advisorIterations = [];
     const reasoningEnabled = options.reasoningEnabled !== false;
     const reasoningText = new Map();
     const addFailure = message => { failure ||= responseFailure({ message: `openai ${message}` }); };
@@ -1516,6 +1719,16 @@ export function collectAnthropicMessage(model, events, options = {})
     {
         if (terminal || failure) break;
         const oi = evt.output_index ?? 0;
+
+        // Injected by handleOpenAI after it ran an advisor consultation between two
+        // upstream responses; it stands where the consultation happened.
+        if (evt.type === ADVISOR_RESULT_EVENT)
+        {
+            content.push({ type: 'server_tool_use', id: evt.call_id, name: ADVISOR_TOOL_NAME, input: {} });
+            content.push({ type: 'advisor_tool_result', tool_use_id: evt.call_id, content: evt.content });
+            if (evt.iteration) advisorIterations.push(evt.iteration);
+            continue;
+        }
 
         if (String(evt.type || '').startsWith('response.web_search_call.'))
         {
@@ -1715,7 +1928,10 @@ export function collectAnthropicMessage(model, events, options = {})
         stop_reason: stopReason,
         stop_sequence: null,
         stop_details: stopDetails,
-        usage: ['fast', 'standard'].includes(options.speed) ? { ...usage, speed: options.speed } : usage,
+        usage: (() => {
+            const withIterations = advisorIterations.length ? { ...usage, iterations: advisorIterations } : usage;
+            return ['fast', 'standard'].includes(options.speed) ? { ...withIterations, speed: options.speed } : withIterations;
+        })(),
     };
 }
 

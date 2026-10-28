@@ -150,6 +150,32 @@ test('main-process drain releases every idle session without a focused renderer'
     } finally { f.close(); }
 });
 
+// App 2.9939.4 moved isCliProvablyIdle off the manager into a module-local
+// function; hasAgentRunInProgress(sessionId) is the surviving public wrapper.
+test('auto-send drains on a manager without isCliProvablyIdle', async () => {
+    const f = start({ [A]: [item('a1', 'after turn')] },
+        { enabled: true, autoSend: true, autoSendDelay: 0 }, { [A]: true });
+    try {
+        const mgr = require.cache[path.join(f.root, 'manager-fixture.cjs')].exports.claudeCodeSessionManager;
+        delete mgr.isCliProvablyIdle;
+        mgr.hasAgentRunInProgress = (sid) => f.sessions.get(sid).busy;
+        await settle();
+        assert.equal(f.sent.length, 0);
+
+        f.sessions.get(A).busy = false;
+        f.sessions.get(A).cliLastTurnMessageWasResult = false;
+        f.scan();
+        await settle();
+        assert.equal(f.sent.length, 0, 'a turn that has not reached its result is not idle');
+
+        f.sessions.get(A).cliLastTurnMessageWasResult = true;
+        f.scan();
+        await settle();
+        assert.deepEqual(f.sent.map(call => call.text), ['after turn']);
+        assert.equal(f.methods.get('status')().manager.idlePredicate, true);
+    } finally { f.close(); }
+});
+
 test('auto-send configuration and edit holds are enforced in main', async () => {
     const f = start({ [A]: [item('a1', 'held')] },
         { enabled: true, autoSend: false, autoSendDelay: 0 }, { [A]: false });

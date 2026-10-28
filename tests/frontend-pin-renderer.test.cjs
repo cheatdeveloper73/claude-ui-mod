@@ -81,6 +81,7 @@ function harness({ dashboard = true, statusEnabled = true, statusFailed = null, 
             };
             if (method === 'frontend-pin.finishCanary') return { ok: params.ok, failed: !params.ok };
             if (method === 'frontend-pin.healthy') return true;
+            if (method === 'frontend-pin.reloadLive') return true;
                         throw new Error('unexpected RPC ' + method);
         },
     };
@@ -143,10 +144,18 @@ test('Code compatibility warnings do not appear on sign-in or chat pages', async
     h.dispose();
 });
 
-test('a loaded live page is marked unpinned without reloading it', async () => {
+test('a loaded live page asks for the recovery reload instead of a toast', async () => {
     const h = harness({ dashboard: false, composer: true, pinned: false });
     await flush();
-    assert.match(h.warning(), /page is still on the live release/);
+    assert.equal(h.warning(), null);
+    assert.equal(h.calls.some((call) => call.method === 'frontend-pin.reloadLive'), true);
+    h.dispose();
+});
+
+test('a pinned page never asks for a reload', async () => {
+    const h = harness({ dashboard: false, composer: true, pinned: true });
+    await flush();
+    assert.equal(h.calls.some((call) => call.method === 'frontend-pin.reloadLive'), false);
     h.dispose();
 });
 

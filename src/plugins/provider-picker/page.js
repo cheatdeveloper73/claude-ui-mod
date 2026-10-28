@@ -38,6 +38,12 @@ const FAST_TOGGLE = { type: 'toggle', name: 'Fast mode', options: [
 // CLI 2.1.284's model catalogue gives these the fast_mode capability, and the
 // CLI sends speed:"fast" for them, but the server's ccd section omits the toggle.
 const NATIVE_FAST = new Set(['claude-opus-5-5']);
+// Native rows the server serves past 200K but CLI 2.1.284's built-in model table
+// does not list. An unlisted claude-* id gets the 200K default, every window
+// override is clamped to it, and only a `[1m]` id lifts it. Desktop passes the
+// row id to the CLI as --model, so the row itself carries the tag. Haiku 5.5
+// served a 735,568-token request through the tag (2026-10-11).
+const NATIVE_1M = new Set(['claude-haiku-5-5']);
 const entries = models.map(m => ({
     id: m.wireId, name: m.name, short_name: m.name, section: 'main',
     ...(Number.isFinite(m.context) ? { context_window: m.context, supports_1m_context: m.context >= 1000000 } : {}),
@@ -62,6 +68,13 @@ const fastTwins = new Map(entries.filter(e => e.fast_mode && /\[[^\]]+\]$/.test(
 const withFastTwins = list => list.concat(list.flatMap(e => fastTwins.has(e.id) ? [fastTwins.get(e.id)] : []));
 const twinIds = new Set([...fastTwins.values()].map(twin => twin.id));
 const withNativeFast = m => NATIVE_FAST.has(m.id) && !m.fast_mode ? { ...m, fast_mode: FAST_TOGGLE } : m;
+// The untouched row stays as a legacy twin: a session already on the bare id
+// still resolves its label and effort stops, and so does the footer's
+// tag-stripped lookup.
+const withNative1m = list => list.flatMap(m => !NATIVE_1M.has(m.id) ? [m] : [
+    { ...m, id: m.id + '[1m]', context_window: 1000000, supports_1m_context: true },
+    { ...m, section: 'legacy' },
+]);
 const queryClients = new Map();
 const scopes = new Map();
 // The 1.44121.4 model selector renders from the catalogue section it is handed,
@@ -106,7 +119,7 @@ function selected() {
 }
 
 function projectSection(section) {
-    const base = (natives.get(section.id) || section.models.filter(m => !ours(m.id))).map(withNativeFast);
+    const base = withNative1m((natives.get(section.id) || section.models.filter(m => !ours(m.id))).map(withNativeFast));
     // Catalogue entries keep their own provider, and one of them deliberately
     // shadows a native id, so the Claude tab is the native list plus our
     // claude-provider entries -- not the native list alone.

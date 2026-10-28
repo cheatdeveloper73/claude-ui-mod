@@ -49,7 +49,13 @@ Object.assign(process.env, {
     // No adapter, deliberately: this file has to pass identically in a tree
     // that ships one and a tree that does not.
     MODEL_ROUTER_ADAPTER_DIR: adapterDir,
+    // Nor the machine's own catalogue and credentials: a configured compatible
+    // provider would otherwise be polled for real from a test.
+    MODEL_ROUTER_CATALOGUE_FILE: path.join(temp, 'catalogue.json'),
+    MODEL_ROUTER_SECRETS_FILE: path.join(temp, 'provider-secrets.json'),
 });
+fs.writeFileSync(process.env.MODEL_ROUTER_CATALOGUE_FILE, '[]');
+fs.writeFileSync(process.env.MODEL_ROUTER_SECRETS_FILE, '{}');
 const { server } = await import('../router/index.mjs?provider-dashboard-test');
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;

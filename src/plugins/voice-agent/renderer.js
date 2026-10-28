@@ -347,18 +347,22 @@ function stateText() {
 }
 
 function paint() {
-    pageStyle.textContent = pageRules();
+    const rules = pageRules();
+    if (pageStyle.textContent !== rules) pageStyle.textContent = rules;
     host.style.setProperty('--voice-accent', String(V.accent || DEF.accent));
     const connected = status?.connected === true;
     const attr = V.enabled === false ? null : busy ? 'busy' : recording ? 'recording' : connected ? 'ready' : null;
-    if (attr) document.documentElement.setAttribute(ATTR, attr);
-    else document.documentElement.removeAttribute(ATTR);
+    if (document.documentElement.getAttribute(ATTR) !== attr) {
+        if (attr) document.documentElement.setAttribute(ATTR, attr);
+        else document.documentElement.removeAttribute(ATTR);
+    }
     const view = V.enabled === false ? { text: '', kind: '' } : stateText();
     const telemetry = status?.service?.capture?.telemetry;
     const peak = Math.max(-60, Math.min(-8, Number(telemetry?.levelPeakDb) || -60));
     const lit = Math.ceil(((peak + 60) / 52) * meterBars.length);
     meterBars.forEach((bar, index) => bar.classList.toggle('lit', index < lit));
-    pill.className = 'pill' + (view.text ? ' on' : '') + (view.kind ? ' ' + view.kind : '');
+    const className = 'pill' + (view.text ? ' on' : '') + (view.kind ? ' ' + view.kind : '');
+    if (pill.className !== className) { pill.className = className; place(); }
 
     const service = status?.service;
     const capture = service?.capture;
@@ -401,26 +405,24 @@ function paint() {
     statusNode.textContent = lines.join('\n');
 }
 
-function place() {
-    const button = document.querySelector(`button[aria-label="${RECORD_LABEL}"]`);
-    const settings = document.querySelector(`button[aria-label="${SETTINGS_LABEL}"]`);
-    const prompt = document.querySelector('.epitaxy-prompt-input');
-    const view = pill.classList.contains('on');
-    if (!button || !settings || !prompt || !view) {
-        host.style.left = '-9999px';
-        notifyLayout();
-        return;
-    }
-    const promptRect = prompt.getBoundingClientRect();
+const place = ctx.layout((layout) => {
+    if (!pill.classList.contains('on')) return null;
+    const main = layout.mainComposer();
+    if (!main) return null;
+    const button = layout.query(`button[aria-label="${RECORD_LABEL}"]`, main);
+    const settings = layout.query(`button[aria-label="${SETTINGS_LABEL}"]`, main);
+    const prompt = layout.query('.epitaxy-prompt-input', main);
+    if (!button || !settings || !prompt) return null;
+    const promptRect = layout.rect(prompt);
     let row = button.parentElement;
     while (row) {
-        const rect = row.getBoundingClientRect();
+        const rect = layout.rect(row);
         if (rect.width >= promptRect.width && rect.height <= 40) break;
         row = row.parentElement;
     }
-    const rowRect = row?.getBoundingClientRect();
-    const settingsRect = settings.getBoundingClientRect();
-    const children = row ? [...row.children].map(node => ({ node, rect: node.getBoundingClientRect() })) : [];
+    const rowRect = row ? layout.rect(row) : null;
+    const settingsRect = layout.rect(settings);
+    const children = row ? [...row.children].map(node => ({ node, rect: layout.rect(node) })) : [];
     const right = children.filter(entry => entry.rect.width > 0 && entry.rect.left > settingsRect.right + 20)
         .sort((a, b) => a.rect.left - b.rect.left)[0] || null;
     let leftEdge = rowRect?.left || settingsRect.right;
@@ -431,19 +433,18 @@ function place() {
     const left = leftEdge + 8;
     const rightEdge = right?.rect.left || promptRect.right;
     const available = rightEdge - left - 8;
-    if (rowRect && available >= 120) {
-        host.style.maxWidth = available + 'px';
-        host.style.left = left + 'px';
-        host.style.top = rowRect.top + Math.max(0, (rowRect.height - pill.getBoundingClientRect().height) / 2) + 'px';
-        notifyLayout();
-        return;
-    }
-    host.style.maxWidth = Math.min(260, promptRect.width) + 'px';
-    const width = pill.getBoundingClientRect().width;
-    host.style.left = Math.max(8, promptRect.right - width) + 'px';
-    host.style.top = Math.max(8, promptRect.top - pill.getBoundingClientRect().height - 6) + 'px';
+    const pillRect = layout.rect(pill);
+    if (rowRect && available >= 120) return { maxWidth: available + 'px', left: left + 'px',
+        top: rowRect.top + Math.max(0, (rowRect.height - pillRect.height) / 2) + 'px' };
+    return { maxWidth: Math.min(260, promptRect.width) + 'px',
+        left: Math.max(8, promptRect.right - Math.min(pillRect.width, 260, promptRect.width)) + 'px',
+        top: Math.max(8, promptRect.top - pillRect.height - 6) + 'px' };
+}, (value) => {
+    const set = (key, val) => { if (host.style[key] !== val) host.style[key] = val; };
+    if (!value) set('left', '-9999px');
+    else { set('maxWidth', value.maxWidth); set('left', value.left); set('top', value.top); }
     notifyLayout();
-}
+});
 
 async function refreshStatus() {
     try {
@@ -463,7 +464,6 @@ async function refreshStatus() {
 }
 
 ctx.every(250, refreshStatus);
-ctx.every(250, place);
 ctx.every(100, () => { if (syncRoute().changed) bind(); });
 ctx.every(1000, bind);
 bind();

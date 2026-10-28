@@ -240,7 +240,14 @@ module.exports = function (ctx) {
         if (!session || typeof manager.sendMessage !== 'function') throw new Error('target Desktop session is unavailable');
         const options = { initiator: 'user' };
         try {
-            if (typeof manager.isCliProvablyIdle === 'function' && !manager.isCliProvablyIdle(session)) options.priority = 'next';
+            if (typeof manager.isCliProvablyIdle === 'function') {
+                if (!manager.isCliProvablyIdle(session)) options.priority = 'next';
+            } else if (typeof manager.hasAgentRunInProgress === 'function') {
+                // App 2.9939.4 made isCliProvablyIdle module-local; this pair is the
+                // public equivalent (docs/internals.md).
+                if (session.cliLastTurnMessageWasResult !== true
+                    || manager.hasAgentRunInProgress(binding.desktopSessionId)) options.priority = 'next';
+            }
         } catch (_) { options.priority = 'next'; }
         const result = await manager.sendMessage(binding.desktopSessionId, text, undefined, options);
         if (result?.delivered === false) throw new Error(result.reason || 'voice prompt delivery failed');

@@ -1,0 +1,9 @@
+tokenizer.json from https://huggingface.co/zai-org/GLM-5.3
+at revision c5087a76d148760811ffbdedfe6ff9f194e46e38, unmodified.
+sha256 19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d
+
+GLM-5.3 is released under the GLM-5.3 License, Copyright (c) 2026 Z.AI; see LICENSE.
+Used by router/glm-53.mjs for exact Fireworks prompt counts.
+
+chat_template.jinja from https://huggingface.co/zai-org/GLM-5.3 at revision
+ba32f8c19c8738e2c57c71798c601d477a7bf844, unmodified (tokenizer.json unchanged at that revision).

@@ -82,6 +82,10 @@ export class ProviderLimits
         this.openAIUsageURL = options.openAIUsageURL;
         this.getOpenAIAuth = options.getOpenAIAuth;
         this.adapters = options.adapters || null;
+        // Providers whose limits come from the router itself rather than from an
+        // adapter: name -> (force) => snapshot, or undefined when that provider is
+        // not configured here, which leaves its key out entirely.
+        this.extra = options.extra || {};
         this.fetch = options.fetch || ((...args) => fetch(...args));
         // Provider accounts are metered and some are paid seats. Cache regular
         // reads so the dashboard and Desktop share one snapshot rather than
@@ -111,15 +115,20 @@ export class ProviderLimits
         if (!force && this.cache && Date.now() - this.cache.at < this.cacheMs) return this.cache.value;
         if (this.inflight) return this.inflight;
         this.inflight = (async () => {
-            const [openai, adapters] = await Promise.allSettled([
+            const extraNames = Object.keys(this.extra);
+            const [openai, adapters, ...extras] = await Promise.allSettled([
                 this.openAI(),
                 this.adapters ? this.adapters.limitSnapshots(force) : Promise.resolve({}),
+                ...extraNames.map(name => this.extra[name](force)),
             ]);
             const value = {
                 version: 1,
                 observedAt: new Date().toISOString(),
                 openai: openai.status === 'fulfilled' ? openai.value : { error: String(openai.reason?.message || openai.reason) },
                 ...(adapters.status === 'fulfilled' ? adapters.value : {}),
+                ...Object.fromEntries(extraNames.map((name, i) => [name,
+                    extras[i].status === 'fulfilled' ? extras[i].value : { error: String(extras[i].reason?.message || extras[i].reason) }])
+                    .filter(([, value]) => value !== undefined)),
             };
             this.cache = { at: Date.now(), value };
             return value;
